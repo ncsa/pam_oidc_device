@@ -1,0 +1,25 @@
+# LeakSanitizer suppressions — pam_oidc_device `make test-sanitize` gate ONLY.
+#
+# Every entry here documents *intentional, process-lifetime* third-party
+# memory that a standalone test binary would otherwise report as a leak at
+# exit. Each entry MUST be paired with a comment stating why it is not an
+# application defect. Add a new entry only when a false positive is
+# encountered; never use this file to suppress real application leaks.
+#
+# --- libcurl global state ---
+# src/http.c's oauth_http_global_init() -> init_curl_global_impl() calls
+# curl_global_init(CURL_GLOBAL_ALL) exactly once per process (via
+# pthread_once) and, by design, never calls curl_global_cleanup(). This is
+# the correct pattern for a long-lived PAM host (sshd): the PAM module is a
+# shared library loaded into a persistent login process, and tearing down
+# libcurl's global state in the middle of the process's life would break
+# other components and any subsequent PAM calls. The standalone test binary
+# links the same src/http.c translation unit and therefore always reports
+# this process-global allocation as a leak when the test process exits.
+# We anchor the suppression on our own frames (init_curl_global_impl /
+# oauth_http_global_init) plus the two libcurl entry points that allocate
+# the global state, so the suppression is stable across libcurl versions.
+leak:init_curl_global_impl
+leak:oauth_http_global_init
+leak:curl_global_init
+leak:Curl_init

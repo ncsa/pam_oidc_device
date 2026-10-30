@@ -1,0 +1,97 @@
+name: Build and Package Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  compile-matrix:
+    name: Compile & Test (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.compiler }} libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+
+      - name: Build shared module
+        run: make CC=${{ matrix.compiler }}
+
+      - name: Run unit test suite
+        run: make test CC=${{ matrix.compiler }}
+
+  # ASan/UBSan/LSan execution gate (B1/B3): `make test-sanitize` builds AND RUNS
+  # the CMocka suite under the sanitizers. The compile-only `make sanitize`
+  # target is NOT a CI gate; this job is the only sanitizer check enforced
+  # here, and it actually executes the tests, so heap overflow/underflow,
+  # use-after-free, undefined behavior, and memory leaks are detected and
+  # CI-enforced. clang is used for its first-class ASan/UBSan/LSan
+  # support. Known intentional third-party process-lifetime allocations (libcurl
+  # global state) are documented in tests/lsan.supp.
+  sanitize-test:
+    name: Sanitizer Build & Test (ASan/UBSan/LSan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+
+      - name: Build and run unit test suite under ASan/UBSan/LSan
+        run: make test-sanitize CC=clang
+
+  rpm-build:
+    name: Native ${{ matrix.distro.name }} RPM Package Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: "EL8"
+            image: "rockylinux/rockylinux:8"
+            config_pkg: "dnf-utils"
+            optional_repo: "powertools"
+          - name: "EL9"
+            image: "rockylinux/rockylinux:9"
+            config_pkg: "dnf-plugins-core"
+            optional_repo: "crb"
+          - name: "EL10"
+            image: "rockylinux/rockylinux:10"
+            config_pkg: "dnf-plugins-core"
+            optional_repo: "crb"
+    container:
+      image: ${{ matrix.distro.image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
+
+      - name: Enable optional repo and install build dependencies
+        run: |
+          dnf install -y ${{ matrix.distro.config_pkg }}
+          dnf config-manager --set-enabled ${{ matrix.distro.optional_repo }}
+          dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+
+      - name: Verify RPM creation and run %check tests
+        run: make rpm
+
+      - name: Verify generated RPM package
+        run: |
+          MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm")
+          dnf localinstall -y "$MAIN_RPM"
+          ls -la /lib64/security/pam_oidc_device.so
+          ls -la /etc/pam_oidc_device.conf
