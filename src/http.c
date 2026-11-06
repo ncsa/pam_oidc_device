@@ -157,10 +157,116 @@ int is_retryable_token_http_status(long status_code) {
 }
 
 /**
+ * @brief Classifies a parsed OIDC/OAuth discovery document as advertising S256 PKCE.
+ *
+ * Returns 1 when `doc` is a JSON object whose `code_challenge_methods_supported` member
+ * is an array of strings containing the exact value "S256" (case-sensitive, per RFC 7636).
+ * Malformed, missing, or non-conforming members conservatively classify as "not
+ * advertised". NOTE: this field is defined for the authorization-code flow; it is used
+ * here only as a heuristic hint for device-flow PKCE gating (see the header prototype).
+ */
+int discovery_json_advertises_s256(const struct json_object *doc) {
+    if (!doc || json_object_get_type(doc) != json_type_object) {
+        return 0;
+    }
+    struct json_object *arr = NULL;
+    if (!json_object_object_get_ex(doc, "code_challenge_methods_supported", &arr)) {
+        return 0;
+    }
+    if (json_object_get_type(arr) != json_type_array) {
+        return 0;
+    }
+    size_t len = json_object_array_length(arr);
+    for (size_t i = 0; i < len; i++) {
+        /* json-c's array index is a plain int; provider-supplied arrays cannot realistically
+         * exceed INT_MAX entries, and the array length bounds this loop. */
+        struct json_object *el = json_object_array_get_idx(arr, (int)i);
+        if (!el || json_object_get_type(el) != json_type_string) {
+            continue;
+        }
+        if (strcmp(json_object_get_string(el), "S256") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Probes a provider's discovery document once to decide device-flow PKCE gating.
+ *
+ * Decision matrix (logged on completion so operators can audit the suggestion):
+ * - S256 advertised AND `device_authorization_endpoint` present -> PKCE enabled.
+ * - S256 advertised but no device-authorization endpoint        -> PKCE disabled (warning).
+ * - S256 not advertised                                         -> PKCE disabled, with a
+ *   hint that device-flow PKCE is not advertised by standard discovery metadata and
+ *   `use_pkce = true` should be set manually once provider support is confirmed.
+ * Any transport, HTTP (non-200), or JSON parse failure returns -1 with *supported == 0;
+ * callers MUST treat that as "no PKCE" (fail-safe) so a discovery outage never blocks
+ * logins. The response body is scrubbed and freed via `free_http_response()`.
+ */
+int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, pam_handle_t *pamh) {
+    if (!url || !supported) {
+        return -1;
+    }
+    *supported = 0;
+
+    http_response_t resp = {0};
+    if (http_request("GET", url, NULL, NULL, 5000L, &resp, loglevel, pamh) != 0 || resp.status_code != 200 ||
+        !resp.body) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
+                      "PKCE auto-detection: discovery probe of %s failed (HTTP status %ld); continuing without "
+                      "PKCE for this attempt",
+                      url, resp.status_code);
+        free_http_response(&resp);
+        return -1;
+    }
+
+    struct json_object *doc = json_tokener_parse(resp.body);
+    free_http_response(&resp);
+    if (!doc || json_object_get_type(doc) != json_type_object) {
+        if (doc) {
+            json_object_put(doc);
+        }
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
+                      "PKCE auto-detection: discovery document at %s is not a JSON object; continuing without "
+                      "PKCE for this attempt",
+                      url);
+        return -1;
+    }
+
+    int s256 = discovery_json_advertises_s256(doc);
+    struct json_object *dev_ep = NULL;
+    int has_device_endpoint = json_object_object_get_ex(doc, "device_authorization_endpoint", &dev_ep) &&
+                              json_object_get_type(dev_ep) == json_type_string;
+
+    if (s256 && has_device_endpoint) {
+        *supported = 1;
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_INFO,
+                      "PKCE auto-detection: provider metadata advertises S256 PKCE and a device-authorization "
+                      "endpoint; enabling PKCE (RFC 7636) for this attempt. Device-flow PKCE is not advertised "
+                      "by a dedicated standard discovery field - re-verify with your provider's documentation");
+    } else if (s256) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
+                      "PKCE auto-detection: provider metadata advertises S256 PKCE but no "
+                      "device_authorization_endpoint; continuing without PKCE for this attempt");
+    } else {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_INFO,
+                      "PKCE auto-detection: provider metadata does not advertise S256 PKCE support; continuing "
+                      "without PKCE for this attempt. If your provider supports device-flow PKCE (see "
+                      "examples/README.md), set use_pkce = true to enable it");
+    }
+
+    json_object_put(doc);
+    return 0;
+}
+
+/**
  * @brief Executes an HTTP GET or POST request using libcurl.
  *
  * Configures headers (`Content-Type`, `Accept`, `Authorization: Bearer`), enforces
- * TLS/HTTPS protocol restrictions, disables signal handling for multi-threaded safety,
+ * strict TLS/HTTPS transport security (certificate validation via
+ * `CURLOPT_SSL_VERIFYPEER`/`CURLOPT_SSL_VERIFYHOST` and a TLS >= 1.2 minimum via
+ * `CURLOPT_SSLVERSION`), disables signal handling for multi-threaded safety,
  * logs HTTP transport tracing at LOGLEVEL_VERBOSE, sets request timeouts, and captures response codes.
  *
  * @param[in]  method       HTTP method ("GET" or "POST").
@@ -168,7 +274,9 @@ int is_retryable_token_http_status(long status_code) {
  * @param[in]  postfields   URL-encoded request body (for POST requests).
  * @param[in]  bearer_token Access token for Authorization header (optional).
  * @param[in]  timeout_ms   Request timeout limit in milliseconds.
- * @param[out] resp         Pointer to response object receiving result.
+ * @param[out] resp         Pointer to response object receiving result; zero-initialized by this
+ *                          function before any return (success or error), so callers may always
+ *                          read `status_code`/`size` and pass it to free_http_response().
  * @param[in]  loglevel     Active syslog verbosity level.
  * @param[in]  pamh         PAM handle context for syslog reporting.
  * @return 0 on transport execution success, -1 on error.
@@ -178,6 +286,15 @@ int http_request(const char *method, const char *url, const char *postfields, co
     if (!url || !resp || !method) {
         return -1;
     }
+
+    /*
+     * Zero the response before any failure path (global init failure, handle
+     * allocation failure, setopt failure, ...) so that on EVERY return --
+     * success or error -- the caller can safely read `status_code`/`size` and
+     * pass the struct to free_http_response() without touching uninitialized
+     * memory or freeing a garbage `body` pointer.
+     */
+    memset(resp, 0, sizeof(http_response_t));
 
     if (oauth_http_global_init() != 0) {
         if (pamh) {
@@ -197,8 +314,6 @@ int http_request(const char *method, const char *url, const char *postfields, co
         pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
                       "HTTP Request includes Bearer authorization token header");
     }
-
-    memset(resp, 0, sizeof(http_response_t));
 
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -290,6 +405,14 @@ int http_request(const char *method, const char *url, const char *postfields, co
 #else
     CHECK_SETOPT(CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
     CHECK_SETOPT(CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+
+    /* Enforce strict TLS certificate validation and a TLS >= 1.2 minimum protocol
+     * version (defense in depth on top of the HTTPS-only restriction above). */
+    CHECK_SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
+    CHECK_SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+    CHECK_SETOPT(CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 #endif
 
 #undef CHECK_SETOPT

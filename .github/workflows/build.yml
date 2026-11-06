@@ -17,12 +17,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.compiler }} libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+          sudo apt-get install -y ${{ matrix.compiler }} libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev zbar-tools
 
       - name: Build shared module
         run: make CC=${{ matrix.compiler }}
@@ -44,15 +44,72 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+          sudo apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev zbar-tools
 
       - name: Build and run unit test suite under ASan/UBSan/LSan
         run: make test-sanitize CC=clang
+
+  # Independent QR scanner gate: renders the verification-URI terminal art with
+  # the production code path (tests/qr_scan/qr_render_check.c over src/qr.c +
+  # the vendored Nayuki encoder), rasterizes BOTH terminal styles exactly as a
+  # monospace terminal displays them (tests/qr_scan/art2png.py, as P5 PGM:
+  # spec-trivial and decodable under any zbarimg image backend), and requires zbarimg (libzbar — a
+  # decoder independent of the Nayuki encoder and of the local ZXing fixture
+  # check) to recover the exact URI. The rendered art is also published in the
+  # job summary so a maintainer can scan it with a phone camera — the "real
+  # terminal conditions" leg that a headless CI decode cannot provide.
+  qr-scan-audit:
+    name: Independent QR Scan Verification (zbar)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install scanner and headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zbar-tools libpam0g-dev libcurl4-openssl-dev libjson-c-dev
+
+      - name: Build QR render harness
+        run: |
+          mkdir -p build
+          gcc -O2 -Iinclude -D_GNU_SOURCE -Wall -Wextra -Werror \
+              src/qr.c third_party/qrcodegen/qrcodegen.c \
+              tests/qr_scan/qr_render_check.c -o build/qr_render_check
+
+      - name: Render terminal art and decode with zbarimg
+        run: |
+          set -euo pipefail
+          URI="https://auth.example.edu/link?code=WXYZ-9012"
+          ./build/qr_render_check "$URI" build/qr_art_utf8.txt build/qr_art_ascii.txt 3 > /dev/null
+          python3 tests/qr_scan/art2png.py build/qr_art_utf8.txt build/qr_art_utf8.pgm 3
+          python3 tests/qr_scan/art2png.py build/qr_art_ascii.txt build/qr_art_ascii.pgm 3
+          got_utf8=$(zbarimg --quiet --raw build/qr_art_utf8.pgm)
+          got_ascii=$(zbarimg --quiet --raw build/qr_art_ascii.pgm)
+          echo "zbar decoded (UTF-8 art):  $got_utf8"
+          echo "zbar decoded (ASCII art):  $got_ascii"
+          [ "$got_utf8" = "$URI" ]
+          [ "$got_ascii" = "$URI" ]
+
+      - name: Publish art for phone-camera scan
+        run: |
+          {
+            echo '## Terminal QR art — scan with a phone camera'
+            echo
+            echo 'The block below is the scale-1 ASCII rendering produced by the'
+            echo 'module; point a phone camera at a terminal showing it to verify'
+            echo 'decodability under real terminal conditions.'
+            echo
+            echo '```'
+            cat build/qr_art_ascii.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   rpm-build:
     name: Native ${{ matrix.distro.name }} RPM Package Build
@@ -78,7 +135,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Enable optional repo and install build dependencies
         run: |

@@ -21,6 +21,9 @@ build/sanitize/
 tests/runner
 tests/*.o
 
+# Python bytecode (tests/qr_scan/*.py tooling)
+__pycache__/
+
 # ==============================================================================
 # Local Configuration & Secrets
 # ==============================================================================

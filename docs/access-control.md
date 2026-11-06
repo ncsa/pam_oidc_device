@@ -15,6 +15,7 @@ These controls limit the blast radius of overly permissive claim regular express
 # Local system user controls (Evaluated LOCALLY before contacting the IdP)
 allow_users = alice, bob, charlie
 deny_users = root, admin
+allow_root = false
 
 # Identity Provider group & role controls (Evaluated after UserInfo claim retrieval)
 group_claim_field = groups
@@ -29,6 +30,7 @@ enforce_groups = false
 | --- | --- | --- | --- |
 | `allow_users` | string | `""` | Comma-separated list of local usernames permitted to authenticate. Empty allows all non-denied users. |
 | `deny_users` | string | `""` | Comma-separated list of local usernames denied authentication. **Takes precedence over `allow_users`.** |
+| `allow_root` | boolean | `false` | When `true`, permits the `root` account to authenticate. **Default denies `root` even if it is listed in `allow_users`.** |
 | `allow_groups` | string | `""` | Comma-separated list of provider groups/roles granting access. A user matching any listed group is allowed. |
 | `deny_groups` | string | `""` | Comma-separated list of provider groups/roles denying access. **Takes precedence over `allow_groups`.** |
 | `enforce_groups` | boolean | `false` | When `true`, requires group/role evaluation even if group lists are empty (denying access if no groups match). |
@@ -41,6 +43,7 @@ enforce_groups = false
 Local account access checks are evaluated **before making any network requests** to the identity provider.
 
 * **Denial Precedence:** If a local user is listed in `deny_users`, authentication is refused immediately with `PAM_PERM_DENIED` without making any HTTP requests.
+* **Root Default-Deny:** The `root` account is refused with `PAM_PERM_DENIED` unless `allow_root = true` is explicitly set; this applies regardless of `allow_users`/`deny_users`.
 * **Allow Enforcement:** If `allow_users` is set, any local account not explicitly listed is rejected before network contact.
 * **Case Sensitivity:** Matching honors the `case_sensitive` setting configured under the `[claim]` section.
 

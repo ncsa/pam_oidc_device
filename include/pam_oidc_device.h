@@ -28,6 +28,8 @@
 #include <security/pam_ext.h>
 #include <security/pam_modules.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
@@ -57,6 +59,28 @@
 /** @brief Maximum supported access token length in bytes. */
 #define MAX_ACCESS_TOKEN_LEN 8192
 
+/** @brief Number of CSPRNG bytes used to derive an RFC 7636 PKCE code verifier. */
+#define PKCE_VERIFIER_BYTES 48
+
+/** @brief Length of the Base64URL (no padding) encoding of a PKCE code verifier (48 input bytes). */
+#define PKCE_VERIFIER_LEN 64
+
+/** @brief Length of the Base64URL (no padding) encoding of an S256 PKCE code challenge (32 digest bytes). */
+#define PKCE_S256_CHALLENGE_LEN 43
+
+/** @brief Number of light (quiet-zone) modules drawn on every side of the terminal QR code (ISO/IEC 18004 requires 4).
+ */
+#define QR_QUIET_ZONE 4
+
+/** @brief Maximum QR Code symbol version this module will render (symbol width 21-97 modules). */
+#define QR_MAX_VERSION 20
+
+/** @brief Byte capacity of the packed module grid of any QR symbol up to QR_MAX_VERSION. */
+#define QR_MATRIX_BYTES_MAX ((((((QR_MAX_VERSION) * 4 + 17) * ((QR_MAX_VERSION) * 4 + 17) + 7) / 8) + 1))
+
+/** @brief Worst-case byte capacity of a fully rendered terminal QR block (version 20, scale 3, UTF-8 glyphs). */
+#define QR_RENDER_BUF_MAX 32768
+
 /* ============================================================================
  * Data Structures & Enumerations
  * ============================================================================ */
@@ -84,8 +108,32 @@ typedef enum {
     SEC_CLAIM,    /**< [claim] section: Identity claim field extraction and matching rules. */
     SEC_ACCESS,   /**< [access] section: Local account and provider group allow/deny controls. */
     SEC_PROMPT,   /**< [prompt] section: User interaction message formatting. */
-    SEC_RUNTIME   /**< [runtime] section: Module operational limits and debugging settings. */
+    SEC_RUNTIME,  /**< [runtime] section: Module operational limits and debugging settings. */
+    SEC_QR        /**< [qr] section: Terminal QR code rendering options. */
 } config_section_t;
+
+/**
+ * @enum qr_style_t
+ * @brief Terminal rendering style for the verification-URI QR code.
+ */
+typedef enum {
+    QR_STYLE_UTF8 = 0, /**< Compact UTF-8 half-block glyphs (U+2580, U+2584, U+2588); one character per
+                          two stacked modules. Densest output, but requires a font that covers these glyphs. */
+    QR_STYLE_ASCII = 1 /**< One configurable printable-ASCII character per module (default '#'); maximum
+                          font/terminal compatibility, including legacy or minimal-font terminals. */
+} qr_style_t;
+
+/**
+ * @enum qr_ec_t
+ * @brief QR Code error-correction level (ISO/IEC 18004). Higher levels tolerate more damaged or
+ * obfuscated modules (e.g., terminal rendering artifacts) at the cost of a larger symbol.
+ */
+typedef enum {
+    QR_EC_LOW = 0,      /**< ~7% codeword recovery; smallest symbol. */
+    QR_EC_MEDIUM = 1,   /**< ~15% codeword recovery; default. */
+    QR_EC_QUARTILE = 2, /**< ~25% codeword recovery. */
+    QR_EC_HIGH = 3      /**< ~30% codeword recovery; most robust, largest symbol. */
+} qr_ec_t;
 
 /**
  * @struct config_t
@@ -121,11 +169,33 @@ typedef struct {
     int require_exp_claim;  /**< Flag: 1 to require a well-formed 'exp' claim when verify_jwt_claims is enabled. */
     char allow_users[256];  /**< Comma-separated local usernames permitted to authenticate (empty = all allowed). */
     char deny_users[256];   /**< Comma-separated local usernames denied authentication (takes precedence over allow). */
+    int allow_root;         /**< Flag: 1 to permit the `root` account to authenticate; 0 (default) denies root. */
     char allow_groups[256]; /**< Comma-separated provider groups/roles granting access (any single match suffices). */
     char deny_groups[256];  /**< Comma-separated provider groups/roles denying access (takes precedence over allow). */
     int enforce_groups;     /**< Flag: 1 to require group/role authorization when no group lists are configured. */
     char group_claim_field[64]; /**< JSON field name in UserInfo containing group/role claims (e.g., "groups", "roles").
                                  */
+    int use_pkce;               /**< Three-state PKCE gate: 0 (default) off; 1 always extend the RFC 8628 device
+                                 *  flow with RFC 7636 PKCE (fresh CSPRNG `code_verifier` per attempt, its `S256`
+                                 *  `code_challenge` sent to the device authorization endpoint, the verifier
+                                 *  presented at the token endpoint); 2 ("auto") probe `discovery_endpoint` once
+                                 *  per attempt and enable PKCE only when the provider metadata advertises S256
+                                 *  PKCE support plus a device-authorization endpoint; probe failures fail safe
+                                 *  to 0. */
+    char discovery_endpoint[512]; /**< OIDC/OAuth discovery metadata URL (e.g.,
+                                   *  `https://idp/.well-known/openid-configuration`); used only when
+                                   *  `use_pkce` is 2 ("auto"). Empty otherwise. */
+    int qr_enabled;               /**< Flag: 1 to render the verification URI as a scannable terminal QR code
+                                   *  before the text prompt (default 0). Rendering failure is non-fatal. */
+    qr_style_t qr_style;          /**< Terminal glyph style: QR_STYLE_UTF8 (compact half-blocks, default) or
+                                   *  QR_STYLE_ASCII (one block character per module; maximum font support). */
+    char qr_block_char[2];        /**< Single printable ASCII character used for dark modules in the
+                                   *  QR_STYLE_ASCII style (default "#"). */
+    int qr_scale;                 /**< Integer enlargement factor for rendered QR modules, 1-3 (default 1). */
+    qr_ec_t qr_ec_level;          /**< QR error-correction level (default QR_EC_MEDIUM). */
+    int qr_uri_complete;          /**< Flag: 1 (default) to encode `verification_uri_complete` when the provider
+                                   *  supplies it (the code is embedded, so no typing is needed on the second
+                                   *  device); 0 to prefer the plain `verification_uri` with manual code entry. */
 } config_t;
 
 /**
@@ -301,6 +371,99 @@ void free_http_response(http_response_t *resp);
 int is_retryable_token_http_status(long status_code);
 
 /**
+ * @brief Classifies a parsed OIDC/OAuth discovery document as advertising S256 PKCE.
+ *
+ * Returns 1 when the document is a JSON object whose `code_challenge_methods_supported`
+ * member is an array of strings containing the exact value "S256". NOTE: that metadata
+ * field (defined for the authorization-code flow) is treated here as a *heuristic hint*
+ * for device-flow PKCE: no standard discovery parameter advertises PKCE for the RFC 8628
+ * device grant specifically, so callers must treat the result as a recommendation, not
+ * proof (see examples/README.md).
+ *
+ * @param[in] doc Parsed discovery-document JSON object (may be NULL).
+ * @return 1 if S256 is advertised, 0 otherwise (including malformed or missing fields).
+ */
+int discovery_json_advertises_s256(const struct json_object *doc);
+
+/**
+ * @brief Probes a provider's discovery document once to decide device-flow PKCE gating.
+ *
+ * Performs a GET against `url` (bounded to 5000 ms), parses the metadata, and applies
+ * the auto-mode decision: PKCE is enabled only when the document both advertises S256
+ * via `code_challenge_methods_supported` and advertises a `device_authorization_endpoint`.
+ * The decision (and its rationale) is logged so operators can audit the suggestion.
+ *
+ * @param[in]  url        HTTPS discovery metadata URL (must be pre-validated).
+ * @param[out] supported  Set to 1 when PKCE should be enabled, 0 otherwise.
+ * @param[in]  loglevel   Active syslog verbosity level.
+ * @param[in]  pamh       PAM handle for syslog logging context (optional).
+ * @return 0 when the probe completed (check *supported for the decision), -1 when the
+ *         probe could not complete (transport/HTTP/JSON failure; *supported is 0).
+ */
+int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, pam_handle_t *pamh);
+
+/**
+ * @brief Encodes a verification URI into a packed QR Code module matrix.
+ *
+ * Byte-mode encoding per ISO/IEC 180004 with automatic mask selection; the smallest symbol
+ * version in 1..QR_MAX_VERSION that fits the input at the requested error-correction level is
+ * chosen (the input must not contain NUL bytes).
+ *
+ * @param[in]  url        NUL-terminated verification URI to encode.
+ * @param[in]  ec         Requested error-correction level.
+ * @param[out] qrdata     Packed module grid in qrcodegen layout: byte 0 stores the symbol size;
+ *                        module (x, y) occupies bit (y*size + x) % 8 of byte (y*size + x) / 8 + 1
+ *                        (LSB-first).
+ * @param[in]  qrdata_cap Byte capacity of qrdata; must be at least QR_MATRIX_BYTES_MAX.
+ * @param[out] out_size   Symbol width/height in modules (21 + 4 * version) on success.
+ * @return 0 on success, -1 if arguments are invalid or the URI does not fit any version up to
+ *         QR_MAX_VERSION at the requested error-correction level.
+ */
+int qr_encode_uri(const char *url, qr_ec_t ec, uint8_t *qrdata, size_t qrdata_cap, int *out_size);
+
+/**
+ * @brief Renders a packed QR module matrix as terminal text with a configurable quiet zone.
+ *
+ * QR_STYLE_UTF8 pairs stacked module rows into half-block glyph rows (U+2580/U+2584/U+2588),
+ * halving the number of text lines; QR_STYLE_ASCII emits one `block_char` per dark module.
+ * `scale` repeats each glyph `scale` times horizontally and vertically (1-3). Every output
+ * line is newline-terminated, including the final line.
+ *
+ * @param[in]  qrdata     Packed module grid as produced by qrcodegen_encodeText()/qr_encode_uri().
+ * @param[in]  size       Symbol width/height in modules (21-97 for versions 1-20).
+ * @param[in]  style      Rendering style.
+ * @param[in]  scale      Enlargement factor, 1-3.
+ * @param[in]  block_char Dark-module character for QR_STYLE_ASCII (printable ASCII; ignored for
+ *                        QR_STYLE_UTF8, where the fixed half-block glyphs are used).
+ * @param[out] out        Buffer receiving the rendered block.
+ * @param[in]  out_len    Byte capacity of out.
+ * @return 0 on success, -1 on invalid arguments or output-buffer overflow.
+ */
+int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scale, char block_char, char *out,
+                     size_t out_len);
+
+/**
+ * @brief Renders the verification URI as a scannable terminal QR code block with a header line.
+ *
+ * Selects `verification_uri_complete` when configured and available (falling back to the plain
+ * verification URI), encodes it at the configured error-correction level, renders it in the
+ * configured style/scale, and prefixes it with a short instruction line. All rendering failures
+ * (URI too long, buffer overflow, ...) are reported via the syslog and returned as -1; callers
+ * must treat the result as optional and continue with the plain text prompt.
+ *
+ * @param[in]  cfg        Module configuration (qr_* fields).
+ * @param[in]  loglevel   Active syslog verbosity level.
+ * @param[in]  url_plain     Provider `verification_uri` (required).
+ * @param[in]  url_complete  Provider `verification_uri_complete` (may be NULL).
+ * @param[out] out          Buffer receiving the full rendered block.
+ * @param[in]  out_len      Byte capacity of out.
+ * @param[in]  pamh       PAM handle for syslog logging context (optional, may be NULL).
+ * @return 0 on success, -1 if the block could not be rendered.
+ */
+int qr_render_verification_code(const config_t *cfg, loglevel_t loglevel, const char *url_plain,
+                                const char *url_complete, char *out, size_t out_len, pam_handle_t *pamh);
+
+/**
  * @brief Encodes a URL parameter string per RFC 3986 using cURL.
  *
  * @param[in] curl Active cURL easy handle.
@@ -308,6 +471,36 @@ int is_retryable_token_http_status(long status_code);
  * @return Heap-allocated encoded string pointer (must be freed using curl_free), or NULL on failure.
  */
 char *url_encode_param(CURL *curl, const char *str);
+
+/**
+ * @brief Generates a high-entropy RFC 7636 PKCE code verifier from the OpenSSL CSPRNG.
+ *
+ * Reads 48 random bytes from `RAND_bytes()` and encodes them as unpadded Base64URL
+ * (RFC 4648 §5), yielding a 64-character verifier drawn from the RFC 7636 §4.2
+ * character set (Base64URL's `-`/`_` substitute for `+`/`/`; `.`/`~` are unused).
+ *
+ * The caller owns `out` and is expected to scrub it with `secure_memzero()` on
+ * every termination path; this function never logs or returns the verifier.
+ *
+ * @param[out] out    Buffer receiving the NUL-terminated verifier.
+ * @param[in]  out_len Buffer capacity in bytes (must be at least PKCE_VERIFIER_LEN + 1).
+ * @return 0 on success, -1 on NULL inputs, undersized buffer, or CSPRNG failure.
+ */
+int pkce_generate_code_verifier(char *out, size_t out_len);
+
+/**
+ * @brief Computes the S256 PKCE code challenge for a code verifier (RFC 7636 §4.2).
+ *
+ * `code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))` without padding,
+ * yielding a 43-character string.
+ *
+ * @param[in]  verifier  NUL-terminated code verifier string.
+ * @param[out] out       Buffer receiving the NUL-terminated challenge.
+ * @param[in]  out_len   Buffer capacity in bytes (must be at least PKCE_S256_CHALLENGE_LEN + 1).
+ * @return 0 on success, -1 on NULL inputs, empty verifier, undersized buffer, or
+ *         digest computation failure.
+ */
+int pkce_compute_s256_challenge(const char *verifier, char *out, size_t out_len);
 
 /**
  * @brief Formats prompt display string presented to user during authentication.
@@ -345,7 +538,9 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
  *
  * Evaluates the configured `deny_users` and `allow_users` lists (comma-separated, honoring
  * `case_sensitive`) for the requesting local account. Denial lists take precedence over
- * allow lists. This is a purely local decision made before any provider interaction.
+ * allow lists. The `root` account is denied by default and only authenticates when
+ * `allow_root` is explicitly enabled, regardless of the user lists. This is a purely
+ * local decision made before any provider interaction.
  *
  * @param[in] pam_user  Target POSIX system username.
  * @param[in] cfg       Module configuration parameters containing the account lists.
