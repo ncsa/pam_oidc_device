@@ -1,16 +1,15 @@
 # AGENTS.md — pam_oidc_device: AI Agent Context & Rules
 
 > **Purpose.** This file is the single, *tool-agnostic* source of truth for all AI/GenAI coding
-> agents (Copilot, Cline, Cursor, Roo, …) working on `pam_oidc_device`. It consolidates the former
-> `.airules` and `.github/ai-instructions/system-context.md`. Machine-oriented memory of prior AI
-> work (decisions, gotchas, verification status) is kept separately in
+> agents (Copilot, Cline, Cursor, Roo, …) working on `pam_oidc_device`. Machine-oriented memory
+> of prior AI work (decisions, gotchas, verification status) is kept separately in
 > [`.agents/memory.md`](.agents/memory.md) and must be read before starting significant work.
 
 ---
 
 ## 1. Project Overview & Architecture
 
-- **Project Identity:** `pam_oidc_device` (v0.1.0, see `include/metadata.h`) is a Linux Pluggable
+- **Project Identity:** `pam_oidc_device` (v0.2.0, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core Purpose:** Implements out-of-band user authentication via the OAuth 2.0 Device
   Authorization Grant (RFC 8628) and OpenID Connect (OIDC).
@@ -302,3 +301,35 @@ AI-assisted work on this repo — **not** a user-facing changelog (that is `CHAN
 - Wiping of sensitive memory buffers must use `secure_memzero()` or `explicit_bzero()`.
 - Always run build/test commands in quiet mode (e.g., `make -s`, `pytest --tb=short`).
 - Do not run commands that emit over 50 lines of output unless requested.
+
+
+---
+
+## 9. Core Security & Hardening Best Practices
+
+* **Extend Device Flow with PKCE (RFC 7636):** Although RFC 8628 originally treated device codes as sufficient proof, modern identity providers (IdPs) recommend or support pairing the Device Grant with Proof Key for Code Exchange (PKCE). Generate a high-entropy `code_verifier` on the C side, send `code_challenge` in the initial `/device/authorization` request, and pass `code_verifier` during token polling to prevent device code replay or interception attacks.
+* **Strict Local-to-Remote User Identity Binding:** Do not grant authorization solely because the token exchange succeeded. Validate the returned identity (e.g., verifying the `sub`, `preferred_username`, or custom claim from an OIDC `/userinfo` endpoint or decoded JWT) against the local Linux system user returned by `pam_get_user()`. Explicitly disable or restrict `root` authentication unless mapped through a strict local alias file.
+* **Mitigate Out-of-Band Device Code Phishing:** RFC 8628 flows are vulnerable to phishing, where an attacker triggers a flow and sends the `user_code` to a victim. Ensure the PAM module outputs clear context via `PAM_TEXT_INFO` (e.g., specifying host IP, system identifier, and requested scope) so the user verifies what they are authorizing on their secondary device.
+* **Enforce TLS 1.2+ & Strict Certificate Validation:** When using libraries like `libcurl` for HTTP polling in C, explicitly set `CURLOPT_SSL_VERIFYPEER = 1L`, `CURLOPT_SSL_VERIFYHOST = 2L`, and enforce minimum TLS 1.2/1.3 versions. Never allow disabling certificate validation via module options.
+* **Token Lifetime & In-Memory Cleanup:** Treat access and refresh tokens as ephemeral in-memory secrets. Use `explicit_bzero()` or `memset_s()` to zero out memory buffers holding client secrets, device codes, or tokens immediately after use or before `pam_sm_authenticate()` exits.
+
+---
+
+## 10. Key C & PAM Implementation "Gotchas"
+
+1. **Process Boundary & Memory Leak Accumulation:** PAM modules execute in the address space of the caller (`sshd`, `sudo`, `login`). Any leaked memory or open file descriptors persist for the lifetime of the host process. Ensure all HTTP client handles (e.g., `curl_easy_cleanup`), JSON parsers (e.g., `json_object_put`), and dynamic strings are freed on all execution paths.
+2. **Signal Handling & Interruptible Polling:** If a user cancels an SSH session (or sends `SIGINT`/`SIGTERM`), standard network calls can hang. Make sure your HTTP polling loop respects signal interruptions, breaks gracefully, cleans up resources, and returns `PAM_AUTH_ERR` or `PAM_AUTHINFO_UNAVAIL`.
+3. **Polling Interval & Backoff Enforcement:** Implement strict compliance with the authorization server's `interval` response. If the server responds with an error payload containing `slow_down`, RFC 8628 requires increasing the polling interval by at least 5 seconds. Failing to do so can trigger rate-limiting or DDoS defenses on the server side.
+4. **Session Timeouts vs. PAM Timeouts:** PAM authentication blocks execution. Long polling timeouts (e.g., waiting 15 minutes for `expires_in`) can trigger SSH `LoginGraceTime` or `systemd-pam` module timeouts. Configure a conservative maximum timeout on the PAM module side (e.g., 60–120 seconds) independent of the server's maximum code expiration.
+5. **Reentrancy and Thread Safety:** If building with `libcurl`, call `curl_global_init()` properly or rely on static module initialization. Ensure thread-safe calls when parsing JSON responses or evaluating crypto primitives.
+
+---
+
+## 11. Key Documentation & Implementation References
+
+* **[RFC 8628 Official Specification](https://datatracker.ietf.org/doc/html/rfc8628):** The foundational IETF standard for the OAuth 2.0 Device Authorization Grant.
+* **[IETF OAuth 2.0 Security Best Current Practice (BCP)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics):** The latest guidance on threat models, client isolation, token handling, and transport security.
+* **[Authlete Device Flow Technical Deep-Dive](https://developers.authlete.com/protocols-and-flows/advanced-flows/oauth-2-0-device-authorization-grant-device-flow):** Detailed protocol mechanics, parameter breakdown, and implementation state diagrams.
+* **[Okta Threat Research: Device Code Phishing](https://www.okta.com/blog/threat-intelligence/device-code-phishing--it-s-phishing-with-dynamite/):** Analysis of real-world exploitation vectors against RFC 8628 flows and mitigation strategies.
+* **[Ping Identity: Device Authorization Grant with PKCE](https://docs.pingidentity.com/pingoneaic/am-oauth2/oauth2-device-flow-pkce.html):** Guide on extending RFC 8628 with PKCE parameters (`code_challenge` / `code_verifier`) for strengthened device flow security.
+* **[Nithe14/pam_oauth2_device (GitHub)](https://github.com/Nithe14/pam_oauth2_device):** An example implementation of a Linux PAM module utilizing the OAuth 2.0 Device Authorization Grant.

@@ -1,0 +1,70 @@
+# ==============================================================================
+# 1. Line Endings & Binary Controls
+# ==============================================================================
+# Force LF line endings across all platforms to prevent CRLF diff noise
+* text=auto eol=lf
+
+# Explicitly mark binaries to prevent git from attempting text diffs
+*.so binary
+*.o binary
+*.pyc binary
+
+# ==============================================================================
+# 2. PR Diff Noise Suppression (GitHub / GitLab Linguist)
+# ==============================================================================
+# Explicitly set C diff drivers for core source code
+src/**/*.c diff=cpp
+src/**/*.h diff=cpp
+include/**/*.h diff=cpp
+
+# Third-party code: collapse so reviewers don't audit vendored dependencies
+third_party/** linguist-vendored
+
+# AI scaffolding & agent context files: collapse from code review diffs
+.agents/** linguist-vendored
+.github/ai-instructions/** linguist-vendored
+AGENTS.md linguist-vendored
+CLAUDE.md linguist-vendored
+.clinerules linguist-vendored
+.cursorrules linguist-vendored
+.roorules linguist-vendored
+.windsurfrules linguist-vendored
+
+# CI workflows, tooling configs, and packaging scripts: collapse by default
+.github/workflows/** linguist-generated
+.githooks/** linguist-generated
+.clang-format linguist-generated
+.clang-tidy linguist-generated
+packaging/** linguist-generated
+
+# Documentation and examples: collapse so code changes remain the focal point
+docs/** linguist-documentation
+examples/** linguist-documentation
+*.md linguist-documentation
+
+# ==============================================================================
+# 3. Release Tarball Cleanliness (git archive)
+# ==============================================================================
+# Omit internal AI tooling, CI, and formatting configs from source release archives.
+#
+# NOTE: `tests` and `packaging` are intentionally NOT export-ignored even though
+# they are "non-shipping" directories. The `make rpm` target builds the RPM
+# source tarball from the checked-out tree and hard-depends on both:
+#   - `packaging/` holds the .spec file and packaging/gen-changelog.py, which
+#     `make rpm` copies into rpmbuild/SPECS and runs to generate %changelog.
+#   - `tests/` holds the CMocka suite executed by the spec's %check (make test).
+# Export-ignoring them caused the Native EL* RPM builds to fail at the `tar`
+# step ("Cannot stat: No such file or directory" for packaging/tests), so they
+# must remain present in any source archive the RPM build consumes.
+.agents export-ignore
+.github export-ignore
+.githooks export-ignore
+.clang-format export-ignore
+.clang-tidy export-ignore
+.clinerules export-ignore
+.cursorrules export-ignore
+.roorules export-ignore
+.windsurfrules export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
+REVIEW.md export-ignore

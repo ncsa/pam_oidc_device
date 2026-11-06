@@ -1,0 +1,50 @@
+# Third-Party Attribution — QR Code generator library (C edition)
+
+Files in this directory:
+
+    qrcodegen.c, qrcodegen.h
+
+Upstream project:  Project Nayuki — QR Code generator library (C)
+Project page:      https://www.nayuki.io/page/qr-code-generator-library
+Repository:        https://github.com/nayuki/QR-Code-generator
+License:           MIT (full license text is in the file headers of qrcodegen.c and
+                   qrcodegen.h, and is preserved verbatim by this project)
+
+## Provenance (pinned version)
+
+  qrcodegen.c   vendored from commit 8329a7108fc22be3e1eec0a9f9318978579e3621 (2024-09-01)
+  qrcodegen.h   vendored from commit f3705873ab6cc5e4ff64400d227dba2b5164ce74 (2022-01-08)
+  Pinned:        2026-11-08 (machine-readable pins and local SHA-256 digests:
+                 vendor-provenance.txt)
+
+## Local deviations from upstream
+
+The vendored files are byte-for-byte identical to the pinned upstream files except for:
+
+  1. `local-deviations.patch` (the only semantic deviations, kept minimal on purpose):
+       - qrcodegen.h: `#pragma once` replaced with a conventional include guard
+         (`#ifndef QRCODEGEN_H` / `#define QRCODEGEN_H` / `#endif`).
+       - qrcodegen.c: the `QRCODEGEN_TEST` conditional defining the `testable`
+         macro replaced with an unconditional `#define testable static` — the
+         PAM module only ever consumes the private (static) API surface, so the
+         test-exposure path is never used.
+       - qrcodegen.c: `#include "qrcodegen.h"` moved above the system includes.
+  2. Project clang-format style (4-space indent, 120-column wrap, no trailing
+     whitespace). Formatting only; zero semantic effect.
+
+Token-level equivalence (upstream + local-deviations.patch == tree) is re-verified
+on every run of `scripts/check_qrcodegen_upstream.sh`.
+
+## Keeping it current ("frozen" != "abandoned")
+
+  - `.github/workflows/vendor-audit.yml` runs `scripts/check_qrcodegen_upstream.sh`
+    monthly, on every PR touching `third_party/**`, and on demand
+    (workflow_dispatch). It fails the job if the local files drift from the
+    recorded SHA-256 digests, if upstream content has drifted from the pinned
+    revision, or if upstream itself has advanced past the pin (which means a
+    maintainer must review the upstream diff and re-vendor).
+  - Re-vendoring procedure: fetch the new upstream files, re-apply the
+    deviations, run the project's clang-format, update `vendor-provenance.txt`
+    (pins + SHA-256 digests), regenerate `local-deviations.patch` if needed,
+    re-run the CMocka suite (including `test_qr_render_golden_utf8` and
+    `test_qr_scan_roundtrip`), and review the encoder diff line by line.

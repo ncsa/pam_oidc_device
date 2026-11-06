@@ -13,20 +13,24 @@ clang-format --dry-run --Werror src/*.c include/*.h tests/*.c
 
 ## Static Analysis & Testing
 
-All PRs must pass the local lint gate, compile with zero warnings, and pass dynamic sanitizer analysis. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does:
+All PRs must pass the local lint gate, compile with zero warnings under **both** compilers, pass the CMocka suite, pass dynamic sanitizer analysis, and (on every push/PR to `main`) the EL8/EL9/EL10 RPM build. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does. The loop below mirrors the gate set in `AGENTS.md` §3:
 
 ```bash
 # 1. Lint / static analysis (clang-format, clang-tidy, cppcheck, flawfinder)
 make lint
 
-# 2. Compile with zero warnings under the project's strict -W flags
-make clean && make
+# 2. Compile with zero warnings under the project's strict -W flags, then run
+#    the CMocka suite — under both compilers (CI's compile-matrix job)
+make clean && make CC=gcc && make test CC=gcc
+make clean && make CC=clang && make test CC=clang
 
-# 3. Run dynamic memory sanitizer build
-make sanitize
+# 3. Build AND run the CMocka suite under ASan + UBSan + LSan (CI's
+#    sanitize-test job). `make sanitize` is a compile-only smoke check and is
+#    NOT a CI gate — run it only as an optional fast pre-check.
+make test-sanitize CC=clang
 
-# 4. Run cmocka unit tests
-make test
+# 4. Packaging (CI's rpm-build job on EL8/EL9/EL10; requires an EL/dnf host)
+make rpm
 ```
 
 ### Enabling the pre-commit gate (recommended)
@@ -52,13 +56,14 @@ docker run -it --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
     apt-get update
     apt-get install -y build-essential clang clang-format clang-tidy cppcheck \
       libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
-    make clean && make && clang-tidy src/*.c -- -Iinclude -D_GNU_SOURCE
-    make sanitize
-    make test
+    make lint                                  # lint.yml gates (tools missing here are skipped with a notice)
+    make clean && make CC=gcc && make test CC=gcc     # compile-matrix: gcc
+    make clean && make CC=clang && make test CC=clang # compile-matrix: clang
+    make test-sanitize CC=clang               # sanitize-test: ASan/UBSan/LSan (builds AND RUNS)
   '
 ```
 
-(Or push your branch and let the GitHub Actions `ubuntu-latest` workflows — `lint.yml` and `build.yml` — run the authoritative gates.)
+(Or push your branch and let the GitHub Actions `ubuntu-latest` workflows — `lint.yml` and `build.yml` — run the authoritative gates. The `rpm-build` gate cannot be mirrored in the Ubuntu container — it requires an EL image such as `rockylinux:9` with `rpm-build` and `pam-devel`, as in `build.yml` — or simply run it in CI.)
 
 For PAM-independent logic you can still work locally: `brew install clang-format` for formatting, isolated stub-based compile checks under the project's strict warning flags, and decoding any new base64url JWT test fixtures in Python to confirm they encode the intended JSON. See `AGENTS.md` §3 (Non-Linux Hosts) for details.
 

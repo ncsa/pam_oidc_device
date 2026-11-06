@@ -1,0 +1,15 @@
+# Provenance metadata for the vendored Project Nayuki QR Code generator (C edition).
+#
+# The `key=value` lines below are machine-consumed by scripts/check_qrcodegen_upstream.sh
+# (the periodic upstream-drift audit; see .github/workflows/vendor-audit.yml). When
+# re-vendoring, refresh the pin SHAs / dates / local SHA-256 values and regenerate
+# local-deviation-patch if the deviations change.
+upstream_repo=nayuki/QR-Code-generator
+upstream_path_c=c/qrcodegen.c
+upstream_path_h=c/qrcodegen.h
+qrcodegen_c_pin=8329a7108fc22be3e1eec0a9f9318978579e3621
+qrcodegen_h_pin=f3705873ab6cc5e4ff64400d227dba2b5164ce74
+pinned_at=2026-11-08
+qrcodegen_c_sha256=7c6f0ebe719ef28d92b2fa6ae18b52be9255b835b4a6a3717f12d16f070b7735
+qrcodegen_h_sha256=8f5f4a38819b3503e8de9187c3ac5218014ebeda2181312132ad4cc0411776ea
+local_deviation_patch=local-deviations.patch

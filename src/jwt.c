@@ -29,14 +29,19 @@
 #include <time.h>
 
 /**
- * @brief Decodes a Base64URL encoded string per RFC 4648.
+ * @brief Decodes a Base64URL encoded string per RFC 4648 §5.
  *
- * Converts URL-safe characters ('-' -> '+', '_' -> '/'), calculates padding,
- * and decodes payload bytes via OpenSSL BIO stream filters.
+ * Strictly validates that every input byte belongs to the Base64URL alphabet
+ * (`A-Z`, `a-z`, `0-9`, '-', '_') with optional 1-2 trailing '=' padding,
+ * rejecting standard Base64 characters ('+', '/'), embedded padding,
+ * whitespace, and control characters. Converts URL-safe characters
+ * ('-' -> '+', '_' -> '/'), calculates padding, and decodes payload bytes
+ * via OpenSSL BIO stream filters.
  *
  * @param[in]  input   Base64URL encoded input string.
  * @param[out] out_len Pointer receiving decoded byte count.
- * @return Heap-allocated decoded null-terminated string, or NULL on decoding error.
+ * @return Heap-allocated decoded null-terminated string, or NULL on decoding error
+ *         (invalid input alphabet, embedded padding, or BIO failure).
  */
 static char *base64url_decode(const char *input, size_t *out_len) {
     if (!input) {
@@ -44,6 +49,26 @@ static char *base64url_decode(const char *input, size_t *out_len) {
     }
 
     size_t in_len = strlen(input);
+
+    /* Strict RFC 4648 §5 Base64URL alphabet validation: only [A-Za-z0-9_-] is
+     * legal, plus up to two contiguous '=' padding characters at the very end.
+     * This rejects standard Base64 '+'/'/', stray whitespace/control bytes, and
+     * any '=' not part of the trailing pad, none of which are valid Base64URL. */
+    size_t pad_start = in_len;
+    while (pad_start > 0 && input[pad_start - 1] == '=') {
+        pad_start--;
+    }
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            continue;
+        }
+        if (c == '=' && i >= pad_start) {
+            continue; /* legal contiguous trailing padding */
+        }
+        return NULL;
+    }
+
     size_t padded_len = (in_len + 3) / 4 * 4;
     char *buf = calloc(1, padded_len + 1);
     if (!buf) {
@@ -305,7 +330,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
                         } else if (json_object_is_type(j_aud, json_type_array)) {
                             size_t array_len = json_object_array_length(j_aud);
                             for (size_t i = 0; i < array_len; i++) {
-                                struct json_object *item = json_object_array_get_idx(j_aud, i);
+                                struct json_object *item = json_object_array_get_idx(j_aud, (int)i);
                                 if (item && json_object_is_type(item, json_type_string) &&
                                     strcmp(json_object_get_string(item), expected_aud) == 0) {
                                     aud_valid = 1;

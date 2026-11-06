@@ -1,0 +1,48 @@
+--- a/third_party/qrcodegen/qrcodegen.c
++++ b/third_party/qrcodegen/qrcodegen.c
+@@ -21,17 +21,20 @@
+  *   Software.
+  */
+ 
++#include "qrcodegen.h"
+ #include <assert.h>
+ #include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include "qrcodegen.h"
+ 
+-#ifndef QRCODEGEN_TEST
+-	#define testable static  // Keep functions private
+-#else
+-	#define testable  // Expose private functions
+-#endif
++/*
++ * All functions in this file are self-contained and thread-safe when each call
++ * supplies its own (non-aliasing) buffers; no global state is touched. The
++ * `testable` indirection from the upstream project is unnecessary here, so all
++ * private helpers are made `static` and only the public API (see qrcodegen.h)
++ * is exported from the PAM module.
++ */
++#define testable static
+ 
+ 
+ /*---- Forward declarations for private functions ----*/
+--- a/third_party/qrcodegen/qrcodegen.h
++++ b/third_party/qrcodegen/qrcodegen.h
+@@ -21,7 +21,8 @@
+  *   Software.
+  */
+ 
+-#pragma once
++#ifndef QRCODEGEN_H
++#define QRCODEGEN_H
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
+@@ -383,3 +384,5 @@
+ #ifdef __cplusplus
+ }
+ #endif
++
++#endif /* QRCODEGEN_H */
+\ No newline at end of file

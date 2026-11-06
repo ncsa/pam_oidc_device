@@ -49,6 +49,18 @@ static int ascii_strcasecmp(const char *s1, const char *s2) {
  * against `target` using either exact or case-insensitive ASCII matching. Empty tokens
  * are ignored, so trailing/leading commas do not produce spurious matches.
  *
+ * Length handling: `list` is copied into a fixed 256-byte stack buffer so `strtok_r()`
+ * can split it in place without mutating the caller's (const, reused) config string. A
+ * list whose length reaches that bound is REJECTED, not truncated: `copy_checked()`
+ * reports the overflow and this function returns 0 (no match), so a partial token can
+ * never spuriously match. That is fail-safe for allow lists (an over-long allow list
+ * matches nothing, so the account is refused). For a deny list the same bound is, in
+ * principle, a fail-open (an over-long deny list is simply not applied) — but every
+ * current caller passes one of the 256-byte `config_t` list fields, which the config
+ * loader already bounds to 255 characters, so the cap is a defense-in-depth backstop
+ * that is unreachable through the normal config path; it keeps the function safe even
+ * if it were ever called with an arbitrary-length list, and keeps stack usage bounded.
+ *
  * @param[in] list           Comma-separated candidate list.
  * @param[in] target         Value to search for.
  * @param[in] case_sensitive 1 for exact comparison, 0 for case-insensitive comparison.
@@ -200,6 +212,8 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
  *
  * Evaluates the configured `deny_users` and `allow_users` lists for the requesting local
  * account. Denial lists take precedence over allow lists; empty lists impose no restriction.
+ * The `root` account is additionally denied unless `cfg->allow_root` is explicitly set,
+ * independent of the allow/deny lists.
  *
  * @param[in] pam_user  Target POSIX system username.
  * @param[in] cfg       Module configuration parameters containing the account lists.
@@ -218,6 +232,18 @@ int verify_user_access(const char *pam_user, const config_t *cfg, pam_handle_t *
                       "Account '%s' is explicitly denied via deny_users; authentication refused", pam_user);
         return 0;
     }
+
+    /* Root is denied by default and requires an explicit 'allow_root' opt-in. This runs
+     * regardless of allow_users/deny_users so that listing "root" in allow_users alone
+     * never grants root authentication. */
+    if (strcmp(pam_user, "root") == 0 && !cfg->allow_root) {
+        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Root account '%s' is refused: set 'allow_root = true' in [access] to permit root "
+                      "authentication via this module",
+                      pam_user);
+        return 0;
+    }
+
     if (strlen(cfg->allow_users) > 0 && !list_contains(cfg->allow_users, pam_user, cs)) {
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Account '%s' is not present in allow_users; authentication refused", pam_user);
@@ -330,7 +356,7 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
     if (json_object_is_type(j_group, json_type_array)) {
         size_t arr_len = json_object_array_length(j_group);
         for (size_t i = 0; i < arr_len; i++) {
-            struct json_object *item = json_object_array_get_idx(j_group, i);
+            struct json_object *item = json_object_array_get_idx(j_group, (int)i);
             if (item && json_object_is_type(item, json_type_string)) {
                 const char *val = json_object_get_string(item);
                 if (group_value_denied(val, cfg, cs)) {
