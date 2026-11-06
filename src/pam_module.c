@@ -27,6 +27,20 @@
 #include <unistd.h>
 
 /**
+ * @brief Determines whether one POSIX `timespec` is strictly before another.
+ *
+ * Performs a full lexicographic comparison of both the seconds and nanoseconds
+ * fields, unlike comparisons that inspect only `tv_sec`.
+ *
+ * @param[in] a  First timestamp.
+ * @param[in] b  Second timestamp.
+ * @return 1 if `a` is strictly before `b`, 0 otherwise.
+ */
+static int timespec_before(const struct timespec *a, const struct timespec *b) {
+    return (a->tv_sec < b->tv_sec) || (a->tv_sec == b->tv_sec && a->tv_nsec < b->tv_nsec);
+}
+
+/**
  * @brief Formats arrays of key-value parameters into an HTTP `application/x-www-form-urlencoded` string.
  *
  * Handles URL encoding of values via libcurl, reallocates destination buffers dynamically,
@@ -292,7 +306,8 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
  * 5. Polls Token Endpoint using monotonic clock timing until token issuance, expiration, or user denial.
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
- * 8. Logs all returned UserInfo claim fields/data when loglevel is debug or higher.
+ * 8. Logs a redacted UserInfo receipt record (size + claim field) at debug level; the full claim payload
+ *    is logged only at verbose (troubleshooting) level to keep PII out of routine logs.
  * 9. Verifies user identity claim against `PAM_USER` via `verify_claim`.
  * 10. Evaluates group membership via `verify_group_membership` if enabled and returns `PAM_PERM_DENIED` on denial.
  * 11. Zeroes sensitive credentials in RAM and releases memory allocations.
@@ -318,6 +333,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
     char device_code[2048];
     memset(device_code, 0, sizeof(device_code));
+
+    char code_verifier[PKCE_VERIFIER_LEN + 1];
+    memset(code_verifier, 0, sizeof(code_verifier));
+
+    char code_challenge[PKCE_S256_CHALLENGE_LEN + 1];
+    memset(code_challenge, 0, sizeof(code_challenge));
 
     http_response_t resp;
     memset(&resp, 0, sizeof(resp));
@@ -388,6 +409,17 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
                   "OAuth 2.0 device authentication initiated for user '%s'", pam_user);
 
+    /* Resolve the effective PKCE state for this attempt. "auto" mode probes the
+     * provider's discovery document once per attempt; any probe failure fails safe
+     * to "off" so a discovery outage (or inconclusive metadata) can never block
+     * logins. The probe logs its decision and rationale. */
+    int pkce_active = cfg.use_pkce;
+    if (cfg.use_pkce == 2) {
+        int supported = 0;
+        (void)discovery_probe_pkce(cfg.discovery_endpoint, &supported, active_loglevel, pamh);
+        pkce_active = supported;
+    }
+
     curl = curl_easy_init();
     if (!curl) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to initialize cURL handle");
@@ -395,12 +427,29 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
+    /* Step 3a: Derive PKCE (RFC 7636) S256 material when enabled. A fresh CSPRNG
+     * code verifier is generated per authentication attempt; its code_challenge is
+     * sent with the device-authorization request and the verifier itself is
+     * presented only at the token endpoint, binding the token exchange to this
+     * flow. Both stack buffers are scrubbed unconditionally at `cleanup`. */
+    if (pkce_active) {
+        if (pkce_generate_code_verifier(code_verifier, sizeof(code_verifier)) != 0 ||
+            pkce_compute_s256_challenge(code_verifier, code_challenge, sizeof(code_challenge)) != 0) {
+            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Failed to generate PKCE code verifier or S256 challenge");
+            retval = PAM_SERVICE_ERR;
+            goto cleanup;
+        }
+        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                      "PKCE (RFC 7636) S256 enabled for this device-authorization attempt");
+    }
+
     /* Step 3: Request device code from provider Device Endpoint */
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Requesting device code from endpoint: %s",
                   cfg.device_authorization_endpoint);
 
-    const char *d_keys[3];
-    const char *d_vals[3];
+    const char *d_keys[5];
+    const char *d_vals[5];
     size_t d_count = 0;
 
     d_keys[d_count] = "client_id";
@@ -416,6 +465,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     if (strlen(cfg.scopes) > 0) {
         d_keys[d_count] = "scope";
         d_vals[d_count++] = cfg.scopes;
+    }
+    if (pkce_active) {
+        d_keys[d_count] = "code_challenge";
+        d_vals[d_count++] = code_challenge;
+        d_keys[d_count] = "code_challenge_method";
+        d_vals[d_count++] = "S256";
     }
 
     if (build_form_postfields(curl, d_keys, d_vals, d_count, &postfields) != 0) {
@@ -553,8 +608,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     }
 
     /* Step 5: Build token request body prior to entering polling loop */
-    const char *t_keys[4];
-    const char *t_vals[4];
+    const char *t_keys[5];
+    const char *t_vals[5];
     size_t t_count = 0;
 
     t_keys[t_count] = "client_id";
@@ -570,6 +625,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     t_vals[t_count++] = "urn:ietf:params:oauth:grant-type:device_code";
     t_keys[t_count] = "device_code";
     t_vals[t_count++] = device_code;
+    if (pkce_active) {
+        t_keys[t_count] = "code_verifier";
+        t_vals[t_count++] = code_verifier;
+    }
 
     if (build_form_postfields(curl, t_keys, t_vals, t_count, &token_postfields) != 0) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to build token request form postfields");
@@ -593,16 +652,22 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             }
             next_poll.tv_sec += interval;
 
-            if (next_poll.tv_sec >= device_deadline.tv_sec) {
+            if (!timespec_before(&next_poll, &device_deadline)) {
                 pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                               "Polling reached device authorization expiration deadline");
                 break;
             }
 
-            int sleep_rc;
-            do {
-                sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_poll, NULL);
-            } while (sleep_rc == EINTR);
+            int sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_poll, NULL);
+            if (sleep_rc == EINTR) {
+                /* A signal (e.g. user-initiated cancellation / SIGTERM) interrupted the poll
+                 * sleep. Resuming the loop would keep a possibly abandoned session blocking
+                 * the login; abort instead — all resources are reclaimed at `cleanup`. */
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
+                              "Polling interrupted by a signal; aborting device-authorization wait");
+                retval = PAM_ABORT;
+                goto cleanup;
+            }
 
             if (sleep_rc != 0) {
                 pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Clock nanosleep failed with error %d",
@@ -614,7 +679,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         first_poll = 0;
 
         struct timespec now;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec >= device_deadline.tv_sec) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || !timespec_before(&now, &device_deadline)) {
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling authorization deadline reached");
             break;
         }
@@ -651,7 +716,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                     struct json_object *j_acc = NULL;
                     if (json_object_object_get_ex(tok_json, "access_token", &j_acc) && j_acc &&
                         json_object_is_type(j_acc, json_type_string)) {
-                        size_t token_len = json_object_get_string_len(j_acc);
+                        size_t token_len = (size_t)json_object_get_string_len(j_acc);
                         if (token_len > 0 && token_len <= MAX_ACCESS_TOKEN_LEN) {
                             access_token = strdup(json_object_get_string(j_acc));
                             if (!access_token) {
@@ -772,8 +837,14 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
-    /* Log ALL UserInfo claim fields/data when loglevel is LOGLEVEL_DEBUG or higher */
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "UserInfo claim payload received: %s",
+    /* Redacted PII-safe UserInfo audit log at LOGLEVEL_DEBUG: the raw claim payload
+     * contains personal data (emails, phone numbers, group memberships) and must not
+     * be persisted to the system log at the routine debug level. The full payload is
+     * emitted only at LOGLEVEL_VERBOSE, the troubleshooting level. */
+    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                  "UserInfo claim payload received: %zu bytes, claim field '%s' present", userinfo_resp.size,
+                  cfg.claim_field);
+    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim payload received: %s",
                   userinfo_resp.body);
 
     struct json_object *j_claim = NULL;
@@ -845,6 +916,8 @@ cleanup:
      * `pam_get_user()`), so it is intentionally NOT freed during cleanup.
      */
     secure_memzero(device_code, sizeof(device_code));
+    secure_memzero(code_verifier, sizeof(code_verifier));
+    secure_memzero(code_challenge, sizeof(code_challenge));
     secure_memzero(&cfg, sizeof(cfg));
 
     if (curl) {
@@ -855,13 +928,21 @@ cleanup:
 }
 
 /**
- * @brief Standard PAM credential management interface hook.
+ * @brief PAM credential-management hook (required by the PAM module ABI).
  *
- * This authentication module does not manage user credentials, standard PAM tickets,
- * or kerberos tokens. Returns `PAM_SUCCESS` directly to fulfill module contract.
+ * This module is intentionally a credential-management no-op. The RFC 8628 device
+ * flow is fully self-contained within `pam_sm_authenticate()`: device codes,
+ * access tokens, and identity claims are never stored in PAM handle items,
+ * written to disk, or otherwise retained after that call returns (sensitive
+ * buffers are scrubbed before exit). Consequently there are no module-managed
+ * credentials, PAM tickets, or Kerberos tokens for this hook to preset
+ * (`PAM_PRESET`), reinitialize (`PAM_REINIT`), or refresh (`PAM_REFRESH`) — it
+ * returns `PAM_SUCCESS` unconditionally so the rest of the PAM stack can
+ * proceed. Any required credential management must be provided by another
+ * module in the PAM stack.
  *
  * @param[in] pamh  PAM framework handle.
- * @param[in] flags PAM credential flags.
+ * @param[in] flags PAM credential flags (`PAM_PRESET`, `PAM_REINIT`, `PAM_EXPIRE`, `PAM_REFRESH`).
  * @param[in] argc  Module argument count.
  * @param[in] argv  Module arguments array.
  * @return `PAM_SUCCESS` unconditionally.

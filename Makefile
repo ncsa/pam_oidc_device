@@ -34,7 +34,7 @@ SAN_FLAGS  = -fsanitize=address -fsanitize=undefined -fsanitize=leak -fno-omit-f
 SAN_RUNNER = build/sanitize/runner
 
 TARGET = $(NAME).so
-OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pam_module.o
+OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pkce.o src/pam_module.o
 CONFIG_DEFAULT = config/$(NAME).conf
 
 PAM_DIR ?= /lib64/security
@@ -62,7 +62,7 @@ sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -fPIC -shared -Wall -Wextra -g \
 		-fsanitize=address -fsanitize=undefined -fsanitize=leak \
-		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pam_module.c $(LIBS)
+		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/pam_module.c $(LIBS)
 
 test: $(OBJS)
 	$(CC) $(CPPFLAGS) -Wall -Wextra -g tests/test_suite.c $(OBJS) \
@@ -84,7 +84,7 @@ test: $(OBJS)
 test-sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -Wall -Wextra -g $(SAN_FLAGS) \
-		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pam_module.c \
+		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/pam_module.c \
 		-o $(SAN_RUNNER) -lcmocka $(LIBS)
 	ASAN_OPTIONS=detect_leaks=1 \
 	LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp \

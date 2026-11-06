@@ -52,6 +52,13 @@
   any other well-formed `4xx` OAuth `error` aborts immediately. Treat `429`/`5xx` (including empty,
   `{}`, or HTML proxy bodies) as transient and retry with backoff *within* the device-authorization
   deadline. Use `CLOCK_MONOTONIC` + `clock_nanosleep`; never wall-clock `time()` for deadlines.
+- **Test-binary curl shadowing:** `tests/test_suite.c` defines weak overrides of
+  `curl_easy_setopt`/`curl_easy_perform` (TLS-options test) — the test binary therefore never
+  performs real HTTP transfers; no test may rely on real curl transport. (`url_encode_param`
+  uses `curl_easy_escape`, which is NOT overridden.) Because naming the `curl_easy_setopt`
+  override would collide with libcurl's `typecheck-gcc.h` argument-checking macro under real
+  GCC, the test TU starts with `#define CURL_DISABLE_TYPECHECK` — keep that define *before*
+  the project-header include, and keep the test TU free of direct `curl_easy_setopt` calls.
 - **Documentation honesty:** local JWT inspection is **claims-only** (`exp`, `nbf`, `iss`, `aud`) —
   no signature verification, no replay protection; enforce token authenticity via the provider's
   UserInfo endpoint. `jwks_url` and `introspection_endpoint` are accepted-but-unused (load-time
@@ -72,7 +79,7 @@
   `fclose` (caller owns the stream), does not apply defaults, and zeroes `cfg` via
   `secure_memzero` on failure. Unit tests drive it with `fmemopen` + the `init_config_defaults()`
   helper in `tests/test_suite.c`. Key ownership is section-strict: `verify_jwt_claims`,
-  `clock_skew_leeway`, `require_exp_claim` are `[oauth]` keys; `case_sensitive` is a `[claim]`
+  `clock_skew_leeway`, `require_exp_claim`, `use_pkce` are `[oauth]` keys; `case_sensitive` is a `[claim]`
   key; `[runtime]` only accepts `max_poll_seconds` and `loglevel`.
 - **Terminal output defense-in-depth:** `render_prompt_message()` validates the fully rendered
   prompt line-by-line via `is_safe_terminal_string` (newlines permitted; all other bytes must be
@@ -87,6 +94,190 @@
 ---
 
 ## Interaction Log (newest first)
+
+### 2026-11-07 — PKCE auto-detection via provider discovery metadata + provider-support docs
+- **Task:** Document how to determine device-flow PKCE support per provider; set `use_pkce` in the example configs; add a live discovery check that gates/enables PKCE and logs a suggestion.
+- **Decisions & Rationale:**
+  - **Research (verified live 2026-11):** No standard OIDC/OAuth discovery parameter advertises
+    device-flow PKCE. `code_challenge_methods_supported` (present on CILogon, ABSENT from
+    Microsoft's v2.0 `/.well-known/openid-configuration`) describes the auth-code flow only →
+    treated as a heuristic hint, documented as such. Keycloak's device flow supports PKCE
+    (issue keycloak/keycloak#13244, mid-2022). Entra ID's device-code reference does not
+    document `code_challenge`. Unregistered-client probes against MS/CILogon are inconclusive
+    (client validated before parameters) — the definitive test needs a *registered* test
+    client; documented that gotcha in examples/README.md.
+  - **`use_pkce` is now tri-state:** 0 off (default), 1 on, 2 "auto" (parsed by new
+    `parse_pkce_mode()` in `src/config.c` next to `parse_bool`). New optional `[oauth]` key
+    `discovery_endpoint[512]` (HTTPS-validated like the other endpoints; `seen`-flag
+    duplicate detection). Load-time validation: `use_pkce = auto` without
+    `discovery_endpoint` → config load fails (fail fast). Load-time advisories: explicit
+    `true` logs a one-time "confirm provider support" INFO; `discovery_endpoint` set with
+    non-auto `use_pkce` logs "has no effect" INFO.
+  - **Probe:** `discovery_probe_pkce()` in `src/http.c` (kept the Makefile `OBJS` untouched
+    by reusing http.c rather than a new TU): GET, 5000 ms cap, via the existing
+    `http_request()` (TLS-verified, HTTPS-only); decision = enable PKCE iff
+    `discovery_json_advertises_s256()` (pure helper, exported for tests; exact case-sensitive
+    "S256" string match inside a string array) AND a `device_authorization_endpoint` string
+    exists. Any transport/HTTP/JSON failure → -1, fail-safe off; discovery outage can never
+    block logins. Every decision logged with rationale (failures at LOGLEVEL_ERROR threshold /
+    LOG_WARNING; decisions at LOGLEVEL_INFO).
+  - **Flow wiring (`src/pam_module.c`):** `int pkce_active = cfg.use_pkce;` resolved after
+    `verify_user_access()` (denied accounts never trigger a probe) and before PKCE material
+    generation; the three former `if (cfg.use_pkce)` sites now use `pkce_active`. Also fixed
+    the macOS-flagged sign-conversion at the token-length read:
+    `(size_t)json_object_get_string_len(j_acc)`.
+  - **Examples/docs:** `keycloak.conf` sets `use_pkce = true`; `entra_id.conf` and
+    `cilogon.conf` keep `#use_pkce = false` with verify-first comments; `examples/README.md`
+    gained "Does Your Provider Support PKCE with the Device Flow?" (why discovery can't
+    answer it, vendor-docs + live test-client curl probe procedure, `auto` semantics,
+    per-archetype recommendation table) plus a new metadata-mapping table row. Threat-model
+    §7 and the shipped `config/pam_oidc_device.conf` comments updated; CHANGELOG [Unreleased]
+    gained a Features entry.
+- **Gotchas & Lessons:** `json_object_get_string_len()` returns `int` — cast explicitly when
+  assigning to `size_t` under `-Wconversion`. Discovery probes must be fail-safe-off: an
+  IdP metadata outage mid-login must degrade to plain device flow, never `PAM_AUTH_ERR`.
+  Web research here: duckduckgo/bing scrape endpoints are bot-gated; direct vendor doc URLs +
+  live `curl` of real discovery documents + GitHub API searches are the reliable path.
+- **Verification:** clang-format clean locally; all 6 modules compile warning-free under the
+  strict flag set + `-fsanitize=undefined` via the /tmp/pam_san PAM-stub harness; full CMocka
+  suite passes under UBSan, **40/40 (5 new tests: pkce_auto, auto_requires_discovery,
+  invalid_discovery_endpoint, duplicate_discovery_endpoint, discovery_json_advertises_s256)**,
+  zero diagnostics. NOT yet verified: Linux CI gates (make lint incl. clang-tidy/cppcheck/
+  flawfinder, gcc+clang build/test matrix, `make test-sanitize CC=clang`, `make rpm` EL8/9/10)
+  — macOS can't run them; push and let CI run.
+- **Follow-ups / Open Items:** none for this feature; consider a discovery fetch
+  timeout/latency knob if 5 s ever proves too aggressive for air-gapped-ish networks.
+
+### 2026-11-07 — F-3: PKCE (RFC 7636) device-flow extension (config-gated)
+- **Task:** Implement F-3 from the threat-model review: extend the RFC 8628 device flow with
+  PKCE S256 — config-gated, CSPRNG verifier, scrub on cleanup.
+- **Decisions & Rationale:**
+  - **Opt-in config gate:** `use_pkce` boolean in the `[oauth]` section (default `false`,
+    `parse_bool` + `seen.use_pkce` duplicate detection; `load_config` default block sets 0).
+    Opt-in (not opt-out) because providers without device-flow PKCE support will reject the
+    device-authorization request, so flipping the default would break existing deployments.
+  - **New translation unit `src/pkce.c`:** `pkce_generate_code_verifier()` (48 bytes from
+    OpenSSL `RAND_bytes()` -> 64-char unpadded Base64URL, within RFC 7636 s4.2's 43-128 bound;
+    raw CSPRNG stack buffer `secure_memzero`'d before return) and
+    `pkce_compute_s256_challenge()` (EVP SHA-256 -> 43-char unpadded Base64URL). Shared static
+    `base64url_encode_nopad()` helper (standard 3-octet grouping, URL-safe alphabet, no `=`
+    padding). Both exported via the public header so the test binary can drive them.
+  - **Flow integration (`pam_module.c`):** when `cfg.use_pkce`, step 3a generates the pair
+    before the device-authorization POST; `code_challenge` + `code_challenge_method=S256`
+    appended to the device POST (`d_keys[5]`), `code_verifier` appended to the token POST
+    (`t_keys[5]`). Verifier is never displayed, not in the verification URI, never logged.
+    Failure to generate -> `PAM_SERVICE_ERR` + `goto cleanup`.
+  - **Secret disposal:** `code_verifier[65]` / `code_challenge[44]` zeroed at declaration and
+    `secure_memzero`'d unconditionally at `cleanup` (next to `device_code`); their encoded
+    copies die with the already-scrubbed `postfields`/`token_postfields`.
+  - **Makefile:** `src/pkce.o` added to `OBJS`; `src/pkce.c` added to the `sanitize` and
+    `test-sanitize` source lists (three hardcoded lists — keep them in sync when adding files).
+- **Gotchas & Lessons:**
+  - RFC 7636 Appendix B known vector now anchors `test_pkce_s256_challenge` (verifier
+    `dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` ->
+    challenge `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`); cross-checked with Python
+    `hashlib`/`base64.urlsafe_b64encode` before trusting it.
+  - `tests/test_suite.c` `init_config_defaults()` mirrors `load_config()`'s default block —
+    add new int defaults to *both* when they are non-zero.
+- **Verification:** clang-format gate clean (exact CI scope). PAM-independent PKCE logic
+  compile-checked + executed in an isolated harness under the project's strict warning flags
+  (verifier length/alphabet/uniqueness, RFC vector, fail-closed paths all pass). NOT yet run:
+  full Linux gates (lint, gcc+clang build/test matrix, `make test-sanitize CC=clang`, rpm)
+  — no Docker/PAM headers locally; CI is required.
+- **Follow-ups / Open Items:** push the branch and monitor `compile-matrix` +
+  `sanitize-test`; on CI green, mark F-3 closed in `docs/threat-model.md` if the review
+  process tracks per-finding status there.
+
+### 2026-11-07 — Fix gcc CI parse error in test_suite.c weak curl override
+- **Task:** `make test CC=gcc` failed on ubuntu-latest with `error: expected identifier or '('
+  before '__extension__'` at `tests/test_suite.c:45` (the weak `curl_easy_setopt` override).
+- **Root cause:** libcurl's `<curl/curl.h>` (8.x) includes `typecheck-gcc.h` when compiled
+  with a *real* GCC >= 4.3, which `#define`s `curl_easy_setopt`/`curl_easy_getinfo`/
+  `curl_multi_setopt`/`curl_share_setopt` as variadic argument type-checking macros built
+  from `__extension__` statement-expressions. Naming our weak override therefore expands
+  the macro → parse error. Clang masquerades as GCC 4.2 (`__GNUC_MINOR__ < 3`), so the guard
+  is false and only the gcc CI job hit it. The stubs predate F-2 (added in `38dcb2f`), so the
+  gcc compile-matrix job had been failing since that commit.
+- **Fix:** `#define CURL_DISABLE_TYPECHECK` at the top of `tests/test_suite.c` (before the
+  project header that pulls in `curl.h`) — the explicit opt-out in curl.h's own guard.
+  Safe: the macros are a compile-time argument check only, and the test TU never calls
+  `curl_easy_setopt()` directly (only *names* the weak stubs). No `#undef` juggling needed;
+  the real function declarations from `<curl/easy.h>` are untouched.
+- **Verification:** (local, macOS — no PAM headers, no Docker): clang-format gate clean on the
+  CI scope; isolated harness compiled against the *real* curl 8.5.0 headers (Ubuntu 24.04's
+  libcurl) under the project's strict warning flags — with and without the define — and
+  executed: weak interposition still captures the TLS setopt values, exit 0. Negative control
+  reproduced the exact `expected identifier or '('` parse error when the typecheck-style macro
+  is active. Still requires: full Linux gates in CI (`make lint`, gcc+clang build/test matrix,
+  `make test-sanitize CC=clang`, `make rpm` EL8/9/10).
+- **Follow-ups:** push the branch and watch the `compile-matrix` gcc job.
+
+### 2026-11-07 — Security remediations F-2, F-6, F-7, F-8
+- **Task:** Implement four security remediations from the threat-model review: F-2 (root
+  default-deny), F-6 (EINTR during poll no longer silently resumes), F-7 (documented no-op
+  `pam_sm_setcred` rationale), F-8 (full `timeval` deadline comparison).
+- **Decisions & Rationale:**
+  - F-2: `int allow_root` (0 default) added to `oauth_config_t` next to `enforce_groups`;
+    parsed in the `[access]` section of `config.c` via `parse_bool` (accepts true/false,
+    yes/no, on/off, 1/0, case-insensitive) with duplicate-key detection (`seen.allow_root`).
+    The root gate in `verify_user_access()` runs after the `deny_users` check and *before*
+    the `allow_users` check, so listing "root" in `allow_users` alone never grants access —
+    root requires explicit `allow_root = true`. Uses `strcmp(pam_user, "root") == 0` rather
+    than uid lookup because PAM passes the account name string. `load_config` zeroes the
+    struct with `memset`, so the default-deny needs no extra initialization.
+  - F-8: `timespec_before()` helper (sec-then-nsec lexicographic compare) replaced both
+    `now.tv_sec >= deadline.tv_sec` comparisons in the poll loop.
+  - F-6: `clock_nanosleep` `EINTR` now logs at ERROR, cleans up, and returns `PAM_ABORT`
+    (`goto cleanup`) — a signal during auth means the caller was interrupted; silently
+    resuming could keep blocking longer than the PAM/SSH grace window.
+- **Gotchas & Lessons:**
+  - `docs/threat-model.md` lists the same four findings (F-2/F-6/F-7/F-8) — keep
+    `CHANGELOG.md`/docs in sync when closing them.
+  - In `test_verify_user_access`, each block mutates a shared `cfg`; always `memset` a block
+    to a clean state before asserting — the new root-allowed block left `allow_root=1` set
+    for the subsequent deny_users block and had to be fixed.
+- **Verification:** `clang-format -i` + `clang-format --dry-run --Werror src/*.c include/*.h
+  tests/*.c` pass locally on macOS (clean, exit 0). Full C gates (lint, gcc+clang build/test
+  matrix, `make test-sanitize CC=clang`, rpm) still required on a Linux host/CI.
+- **Follow-ups / Open Items:** Run the Linux container gate (AGENTS.md §3) or push for CI
+  before merge; confirm no existing deployments relied on root via `allow_users`
+  (behavior change, documented under `[Unreleased]` in `CHANGELOG.md`).
+
+### 2026-11-07 — Security-review remediations F-1/F-4/F-5 (TLS enforcement, strict Base64URL, PII log redaction)
+- **Task:** Implement three security-review remediations: F-1 add explicit TLS options to
+  `http_request()`; F-4 strictly validate the Base64URL alphabet in `base64url_decode()`;
+  F-5 redact PII from the DEBUG-level UserInfo log in `pam_sm_authenticate()`.
+- **Decisions & Rationale:**
+  - **F-1:** `CHECK_SETOPT(CURLOPT_SSL_VERIFYPEER, 1L)`, `CHECK_SETOPT(CURLOPT_SSL_VERIFYHOST, 2L)`,
+    and `CHECK_SETOPT(CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2)` (guarded by
+    `LIBCURL_VERSION_NUM >= 0x072000`) — defense in depth on top of the HTTPS-only
+    `CURLOPT_PROTOCOLS(_STR)` restriction.
+  - **F-4:** `base64url_decode()` now rejects any byte outside `[A-Za-z0-9_-]` and any `'='`
+    that is not part of a contiguous 1–2 char trailing pad (trailing-pad start is scanned
+    first, then a single pass validates the rest). Fail-closed before OpenSSL BIO, which
+    historically tolerated such input.
+  - **F-5:** DEBUG now logs only the payload byte size and the configured claim-field name;
+    the raw UserInfo body is emitted only at `LOGLEVEL_VERBOSE` (troubleshooting level).
+  - **F-1 test without a real transfer:** weak definitions of `curl_easy_setopt` /
+    `curl_easy_perform` in `tests/test_suite.c` — the executable's own symbols shadow
+    libcurl's at dynamic-link time. All setopt calls no-op with `CURLE_OK`; the mock
+    captures only the three TLS options, which the new
+    `test_http_request_enforces_tls_options` asserts.
+- **Gotchas & Lessons:** base64 *of* '+' or '/' is not a literal '+'/'/' in the encoded
+  output (`"b/c"` encodes to `Yi9j`); negative test fixtures must use synthetic segments
+  containing the literal chars (e.g. `"AAA+AAA"`). cmocka `mock_function` was avoided for
+  external-library symbols (uncertain mechanism); a plain `__attribute__((weak))` override
+  is deterministic and works on Mach-O (verified locally) — expected to hold on ELF/CI,
+  unverified.
+- **Verification:** clang-format clean (exact CI scope); `make lint` passed on macOS
+  (clang-tidy/cppcheck/flawfinder skipped — headers/tools unavailable on this host);
+  isolated strict-flags compile-check + functional run of the new `jwt.c` validation loop
+  (all accept/reject cases OK); weak-override shadowing demonstrated against a fake
+  dylib. **NOT yet run: full Linux gates (gcc+clang build+test matrix,
+  `make test-sanitize CC=clang`, rpm) — no Docker/PAM headers locally; CI is required.**
+- **Follow-ups / Open Items:** resolved since — F-2 and F-6/F-8 landed in
+  "Security remediations F-2, F-6, F-7, F-8" (same day), F-3 (PKCE, opt-in `use_pkce`)
+  landed in "F-3: PKCE (RFC 7636) device-flow extension (config-gated)". No F-items open.
 
 ### 2026-11-05 — D2: align AGENTS.md §3 "required gates" with what CI actually runs
 - **Task:** AGENTS.md §3 listed gates CI does not run (`make sanitize` presented as a mandatory

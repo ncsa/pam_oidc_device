@@ -116,6 +116,7 @@ For advanced configurations, policy enforcement, and operational tuning, refer t
 | 📖 **[PAM & OpenSSH Setup Guide](docs/pam-ssh-setup.md)** | Full SSH configuration, authselect profiles, stack position recommendations, and system log auditing. |
 | 🔐 **[Account & Group Access Control](docs/access-control.md)** | Restricting access via `allow_users`, `deny_users`, and provider group/role claims (`allow_groups`/`deny_groups`). |
 | 🛡️ **[Local JWT Claim Inspection](docs/jwt-validation.md)** | Pre-flight claims-only inspection (`verify_jwt_claims`), tenant pinning (`iss`), and audience checks (`aud`). |
+| 🎯 **[Threat Model & Security Boundary](docs/threat-model.md)** | Trust boundaries, terminal injection defense, process memory scrubbing, and threat matrix. |
 | 🏢 **[Identity Provider Integration Examples](examples/README.md)** | Complete config templates for Microsoft Entra ID, Okta, Keycloak, Auth0, and CILogon. |
 
 ---
@@ -145,6 +146,8 @@ sudo dnf localinstall -y rpmbuild/RPMS/x86_64/pam_oidc_device-0.1.0-1.el9.x86_64
 ---
 
 ## Security & Credential Handling
+
+For a complete security analysis, attack vector breakdown, and trust boundary mapping, see the [Threat Model](docs/threat-model.md).
 
 * **Zero Disk Footprint:** OAuth device codes, tokens, and response bodies are never written to disk or swap files.
 * **Volatile Memory Scrubbing:** Module-owned secret materials (client secrets, access/refresh tokens, decoded JSON payload fields) are explicitly zeroed out in process RAM via `secure_memzero` before memory is released.

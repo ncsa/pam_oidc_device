@@ -200,6 +200,8 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
  *
  * Evaluates the configured `deny_users` and `allow_users` lists for the requesting local
  * account. Denial lists take precedence over allow lists; empty lists impose no restriction.
+ * The `root` account is additionally denied unless `cfg->allow_root` is explicitly set,
+ * independent of the allow/deny lists.
  *
  * @param[in] pam_user  Target POSIX system username.
  * @param[in] cfg       Module configuration parameters containing the account lists.
@@ -218,6 +220,18 @@ int verify_user_access(const char *pam_user, const config_t *cfg, pam_handle_t *
                       "Account '%s' is explicitly denied via deny_users; authentication refused", pam_user);
         return 0;
     }
+
+    /* Root is denied by default and requires an explicit 'allow_root' opt-in. This runs
+     * regardless of allow_users/deny_users so that listing "root" in allow_users alone
+     * never grants root authentication. */
+    if (strcmp(pam_user, "root") == 0 && !cfg->allow_root) {
+        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Root account '%s' is refused: set 'allow_root = true' in [access] to permit root "
+                      "authentication via this module",
+                      pam_user);
+        return 0;
+    }
+
     if (strlen(cfg->allow_users) > 0 && !list_contains(cfg->allow_users, pam_user, cs)) {
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Account '%s' is not present in allow_users; authentication refused", pam_user);

@@ -16,6 +16,20 @@
  * SPDX-License-Identifier: MIT
  */
 
+/*
+ * libcurl's <curl/curl.h> includes typecheck-gcc.h when compiled with a
+ * real GCC >= 4.3, which redefines curl_easy_setopt(), curl_easy_getinfo()
+ * and the multi/share setopt variants as variadic argument type-checking
+ * macros built from __extension__ blocks. That macro would expand at the
+ * weak curl_easy_setopt() override below ("expected identifier or '('
+ * before '__extension__'"). libcurl's own guard offers an explicit opt-out
+ * via CURL_DISABLE_TYPECHECK; the macros are purely a compile-time argument
+ * check and this translation unit never calls curl_easy_setopt() directly,
+ * so disabling them here is safe. (Clang masquerades as GCC 4.2, so it
+ * never enables the macros — which is why only the gcc CI job fails.)
+ */
+#define CURL_DISABLE_TYPECHECK
+
 #include "../include/pam_oidc_device.h"
 
 /* clang-format off */
@@ -27,6 +41,43 @@
 #include <stdlib.h>
 #include <string.h>
 /* clang-format on */
+
+/*
+ * Weak overrides of libcurl's transport entry points, used exclusively by
+ * test_http_request_enforces_tls_options(). Defining these global symbols in
+ * the test executable redirects the calls made by the module code here
+ * instead of into libcurl (no real transfer is performed), so the TLS
+ * options requested by http_request() can be captured and asserted. Every
+ * setopt call is a no-op returning CURLE_OK; only the TLS options are
+ * recorded.
+ */
+static int tls_opt_seen;
+static long tls_opt_ssl_verifypeer;
+static long tls_opt_ssl_verifyhost;
+static int tls_opt_ssl_version;
+
+__attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
+    (void)curl;
+    va_list args;
+    va_start(args, option);
+    if (option == CURLOPT_SSL_VERIFYPEER) {
+        tls_opt_ssl_verifypeer = va_arg(args, long);
+        tls_opt_seen++;
+    } else if (option == CURLOPT_SSL_VERIFYHOST) {
+        tls_opt_ssl_verifyhost = va_arg(args, long);
+        tls_opt_seen++;
+    } else if (option == CURLOPT_SSLVERSION) {
+        tls_opt_ssl_version = va_arg(args, int);
+        tls_opt_seen++;
+    }
+    va_end(args);
+    return CURLE_OK;
+}
+
+__attribute__((weak)) CURLcode curl_easy_perform(CURL *curl) {
+    (void)curl;
+    return CURLE_OK;
+}
 
 /**
  * @brief Unit test verifying cURL URL parameter encoding functionality[cite: 7].
@@ -430,6 +481,39 @@ static void test_jwt_malformed_structure(void **state) {
 }
 
 /**
+ * @brief Unit test verifying strict RFC 4648 §5 Base64URL alphabet enforcement during
+ *        JWT payload decoding.
+ *
+ * Payload segments containing standard Base64 characters ('+', '/'), whitespace or
+ * control bytes, or embedded padding must be rejected, while legal trailing '='
+ * padding must continue to be accepted.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_base64url_strict_alphabet(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Standard Base64 '+' and '/' characters are not valid Base64URL. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.AAA+AAA.sig", &cfg, NULL), -1);
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.AAA/AAA.sig", &cfg, NULL), -1);
+
+    /* Embedded newline (C0 control byte) is rejected. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.AA\nAAA.sig", &cfg, NULL), -1);
+
+    /* Padding appearing mid-segment is rejected. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.AAAA=BAAA.sig", &cfg, NULL), -1);
+
+    /* Trailing whitespace is rejected. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.AAA= .sig", &cfg, NULL), -1);
+
+    /* Legal trailing padding is still accepted (payload decodes to {"sub":"test_user"}). */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0X3VzZXIifQ==.sig", &cfg, NULL), 0);
+}
+
+/**
  * @brief Unit test verifying transient/retryable classification of OAuth token-endpoint HTTP
  *        status codes.
  *
@@ -463,6 +547,97 @@ static void test_retryable_token_http_status(void **state) {
 }
 
 /**
+ * @brief Unit test verifying that http_request() enforces strict TLS options.
+ *
+ * curl_easy_setopt/curl_easy_perform are weakly overridden in this test binary
+ * (see the weak definitions at the top of this file), so no real network
+ * transfer occurs. The test captures the TLS-related options and asserts that
+ * certificate validation is enabled and the minimum protocol version is
+ * TLS 1.2.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_http_request_enforces_tls_options(void **state) {
+    (void)state;
+
+    tls_opt_seen = 0;
+    tls_opt_ssl_verifypeer = 0;
+    tls_opt_ssl_verifyhost = 0;
+    tls_opt_ssl_version = -1;
+
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    int rc = http_request("GET", "https://auth.example/token", NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, 0);
+
+    assert_true(tls_opt_seen >= 2);
+    assert_int_equal(tls_opt_ssl_verifypeer, 1);
+    assert_int_equal(tls_opt_ssl_verifyhost, 2);
+#if LIBCURL_VERSION_NUM >= 0x072000
+    assert_int_equal(tls_opt_ssl_version, (int)CURL_SSLVERSION_TLSv1_2);
+#endif
+}
+
+/**
+ * @brief Unit test verifying RFC 7636 code verifier generation properties.
+ *
+ * Asserts the verifier is exactly 64 Base64URL (no padding) characters drawn
+ * from the RFC 4648 §5 URL-safe alphabet, that consecutive draws differ
+ * (CSPRNG output), and that NULL/undersized output buffers fail closed.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_pkce_code_verifier(void **state) {
+    (void)state;
+
+    char verifier[PKCE_VERIFIER_LEN + 1];
+    memset(verifier, 0xAA, sizeof(verifier));
+    assert_int_equal(pkce_generate_code_verifier(verifier, sizeof(verifier)), 0);
+    assert_int_equal(strlen(verifier), PKCE_VERIFIER_LEN);
+    for (size_t i = 0; i < strlen(verifier); i++) {
+        unsigned char c = (unsigned char)verifier[i];
+        assert_true((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_');
+    }
+
+    char verifier2[PKCE_VERIFIER_LEN + 1];
+    assert_int_equal(pkce_generate_code_verifier(verifier2, sizeof(verifier2)), 0);
+    assert_string_not_equal(verifier, verifier2);
+
+    /* Fail closed: NULL buffer or buffer too small for 64 chars + NUL. */
+    char small[PKCE_VERIFIER_LEN];
+    assert_int_equal(pkce_generate_code_verifier(small, sizeof(small)), -1);
+    assert_int_equal(pkce_generate_code_verifier(NULL, sizeof(small)), -1);
+}
+
+/**
+ * @brief Unit test verifying S256 code challenge computation against the RFC 7636 known vector.
+ *
+ * Uses the Appendix B example from RFC 7636: the base example verifier must
+ * produce exactly the published challenge, and invalid inputs must fail closed.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_pkce_s256_challenge(void **state) {
+    (void)state;
+
+    const char *verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const char *expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    char challenge[PKCE_S256_CHALLENGE_LEN + 1];
+    assert_int_equal(pkce_compute_s256_challenge(verifier, challenge, sizeof(challenge)), 0);
+    assert_string_equal(challenge, expected);
+    assert_int_equal(strlen(challenge), PKCE_S256_CHALLENGE_LEN);
+
+    /* Fail closed: NULL/empty verifier, NULL output, or undersized buffer. */
+    char small[PKCE_S256_CHALLENGE_LEN];
+    assert_int_equal(pkce_compute_s256_challenge(verifier, small, sizeof(small)), -1);
+    assert_int_equal(pkce_compute_s256_challenge(NULL, challenge, sizeof(challenge)), -1);
+    assert_int_equal(pkce_compute_s256_challenge("", challenge, sizeof(challenge)), -1);
+    assert_int_equal(pkce_compute_s256_challenge(verifier, NULL, sizeof(challenge)), -1);
+}
+
+/**
  * @brief Unit test verifying local account allow/deny list enforcement.
  *
  * Exercises `verify_user_access` for no-lists, allow, deny, deny-precedence-over-allow,
@@ -474,13 +649,29 @@ static void test_verify_user_access(void **state) {
     (void)state;
     config_t cfg;
 
-    /* No lists configured: every account is permitted. */
+    /* No lists configured: every non-root account is permitted; root is denied by
+     * default even without any user lists. */
     memset(&cfg, 0, sizeof(cfg));
     cfg.case_sensitive = 1;
     cfg.loglevel = LOGLEVEL_NONE;
     assert_int_equal(verify_user_access("alice", &cfg, NULL), 1);
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
+
+    /* Root requires the explicit allow_root opt-in; listing root in allow_users alone
+     * never grants root access. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.allow_users, "root,alice", sizeof(cfg.allow_users) - 1);
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
+    assert_int_equal(verify_user_access("alice", &cfg, NULL), 1);
+    cfg.allow_root = 1;
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 1);
 
     /* deny_users blocks listed accounts, permits the rest. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
     strncpy(cfg.deny_users, "root, daemon", sizeof(cfg.deny_users) - 1);
     assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
     assert_int_equal(verify_user_access("alice", &cfg, NULL), 1);
@@ -661,6 +852,7 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.case_sensitive, 1);
     assert_int_equal(cfg.loglevel, LOGLEVEL_INFO);
     assert_string_equal(cfg.group_claim_field, "groups");
+    assert_int_equal(cfg.use_pkce, 0);
 }
 
 /**
@@ -724,6 +916,8 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "verify_jwt_claims = true\n"
                                     "clock_skew_leeway = 5\n"
                                     "require_exp_claim = no\n"
+                                    "use_pkce = true\n"
+                                    "discovery_endpoint = https://idp.example.com/.well-known/openid-configuration\n"
                                     "[claim]\n"
                                     "claim_field = preferred_username\n"
                                     "claim_regex = ^(.*)$\n"
@@ -732,6 +926,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "[access]\n"
                                     "allow_users = alice,bob\n"
                                     "deny_users = mallory\n"
+                                    "allow_root = yes\n"
                                     "allow_groups = sysadmins\n"
                                     "deny_groups = terminated\n"
                                     "enforce_groups = yes\n"
@@ -761,6 +956,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.case_sensitive, 0);
     assert_string_equal(cfg.allow_users, "alice,bob");
     assert_string_equal(cfg.deny_users, "mallory");
+    assert_int_equal(cfg.allow_root, 1);
     assert_string_equal(cfg.allow_groups, "sysadmins");
     assert_string_equal(cfg.deny_groups, "terminated");
     assert_int_equal(cfg.enforce_groups, 1);
@@ -771,6 +967,8 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.verify_jwt_claims, 1);
     assert_int_equal(cfg.clock_skew_leeway, 5);
     assert_int_equal(cfg.require_exp_claim, 0);
+    assert_int_equal(cfg.use_pkce, 1);
+    assert_string_equal(cfg.discovery_endpoint, "https://idp.example.com/.well-known/openid-configuration");
 }
 
 /**
@@ -1017,6 +1215,159 @@ static void test_parse_config_file_null_args(void **state) {
 }
 
 /**
+ * @brief Unit test verifying parse_config_file accepts the three-state use_pkce "auto" mode.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_pkce_auto(void **state) {
+    (void)state;
+    static const char *const text = "[oauth]\n"
+                                    "client_id = ci\n"
+                                    "device_authorization_endpoint = https://idp.example.com/device\n"
+                                    "token_endpoint = https://idp.example.com/token\n"
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "use_pkce = auto\n"
+                                    "discovery_endpoint = https://idp.example.com/.well-known/openid-configuration\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.use_pkce, 2);
+    assert_string_equal(cfg.discovery_endpoint, "https://idp.example.com/.well-known/openid-configuration");
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects use_pkce = auto without discovery_endpoint.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_pkce_auto_requires_discovery(void **state) {
+    (void)state;
+    static const char *const text = "[oauth]\n"
+                                    "client_id = ci\n"
+                                    "device_authorization_endpoint = https://idp.example.com/device\n"
+                                    "token_endpoint = https://idp.example.com/token\n"
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "use_pkce = auto\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+    /* All parsed content is securely zeroed on failure. */
+    assert_string_equal(cfg.client_id, "");
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects a non-HTTPS discovery_endpoint.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_invalid_discovery_endpoint(void **state) {
+    (void)state;
+    static const char *const text =
+        "[oauth]\n"
+        "client_id = ci\n"
+        "device_authorization_endpoint = https://idp.example.com/device\n"
+        "token_endpoint = https://idp.example.com/token\n"
+        "userinfo_endpoint = https://idp.example.com/userinfo\n"
+        "use_pkce = auto\n"
+        "discovery_endpoint = http://insecure.example.com/.well-known/openid-configuration\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects a duplicated discovery_endpoint key.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_duplicate_discovery_endpoint(void **state) {
+    (void)state;
+    static const char *const text = "[oauth]\n"
+                                    "client_id = ci\n"
+                                    "device_authorization_endpoint = https://idp.example.com/device\n"
+                                    "token_endpoint = https://idp.example.com/token\n"
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "use_pkce = auto\n"
+                                    "discovery_endpoint = https://a.example.com/.well-known/openid-configuration\n"
+                                    "discovery_endpoint = https://b.example.com/.well-known/openid-configuration\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+}
+
+/**
+ * @brief Unit test verifying discovery_json_advertises_s256 classifies discovery metadata.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_json_advertises_s256(void **state) {
+    (void)state;
+    /* S256 present among other methods, plus a device-authorization endpoint. */
+    struct json_object *doc = json_tokener_parse("{\"code_challenge_methods_supported\":[\"plain\",\"S256\"],\"device_"
+                                                 "authorization_endpoint\":\"https://x/d\"}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 1);
+    json_object_put(doc);
+
+    /* S256 as the sole advertised method. */
+    doc = json_tokener_parse("{\"code_challenge_methods_supported\":[\"S256\"]}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 1);
+    json_object_put(doc);
+
+    /* Only the auth-code-flow plain method advertised. */
+    doc = json_tokener_parse("{\"code_challenge_methods_supported\":[\"plain\"]}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 0);
+    json_object_put(doc);
+
+    /* Field missing entirely (e.g., Microsoft Entra ID v2.0 discovery document). */
+    doc = json_tokener_parse("{\"issuer\":\"https://idp.example.com\",\"token_endpoint\":\"https://idp/token\"}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 0);
+    json_object_put(doc);
+
+    /* Wrong member type (string instead of array) is not advertised. */
+    doc = json_tokener_parse("{\"code_challenge_methods_supported\":\"S256\"}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 0);
+    json_object_put(doc);
+
+    /* Non-string array elements are skipped; a valid "S256" element still counts. */
+    doc = json_tokener_parse("{\"code_challenge_methods_supported\":[42,\"S256\"]}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 1);
+    json_object_put(doc);
+
+    /* PKCE method names are case-sensitive per RFC 7636: lowercase is not a match. */
+    doc = json_tokener_parse("{\"code_challenge_methods_supported\":[\"s256\"]}");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 0);
+    json_object_put(doc);
+
+    /* A non-object document (e.g., a JSON array) cannot advertise anything. */
+    doc = json_tokener_parse("[\"S256\"]");
+    assert_non_null(doc);
+    assert_int_equal(discovery_json_advertises_s256(doc), 0);
+    json_object_put(doc);
+
+    /* NULL input is safe. */
+    assert_int_equal(discovery_json_advertises_s256(NULL), 0);
+}
+
+/**
  * @brief Execution entry point for the CMocka test runner suite[cite: 7].
  *
  * Registers and executes unit tests for URL encoding, loglevel parsing, identity claim mapping,
@@ -1040,7 +1391,11 @@ int main(void) {
         cmocka_unit_test(test_jwt_audience_array),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),
         cmocka_unit_test(test_jwt_malformed_structure),
+        cmocka_unit_test(test_jwt_base64url_strict_alphabet),
         cmocka_unit_test(test_retryable_token_http_status),
+        cmocka_unit_test(test_http_request_enforces_tls_options),
+        cmocka_unit_test(test_pkce_code_verifier),
+        cmocka_unit_test(test_pkce_s256_challenge),
         cmocka_unit_test(test_verify_user_access),
         cmocka_unit_test(test_verify_group_membership_lists),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
@@ -1058,6 +1413,11 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_whitespace_and_comments),
         cmocka_unit_test(test_parse_config_file_bad_regex),
         cmocka_unit_test(test_parse_config_file_null_args),
+        cmocka_unit_test(test_parse_config_file_pkce_auto),
+        cmocka_unit_test(test_parse_config_file_pkce_auto_requires_discovery),
+        cmocka_unit_test(test_parse_config_file_invalid_discovery_endpoint),
+        cmocka_unit_test(test_parse_config_file_duplicate_discovery_endpoint),
+        cmocka_unit_test(test_discovery_json_advertises_s256),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

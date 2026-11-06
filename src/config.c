@@ -53,10 +53,13 @@ typedef struct {
     unsigned int require_exp_claim : 1;             /**< Flag set when require_exp_claim key is parsed. */
     unsigned int allow_users : 1;                   /**< Flag set when allow_users key is parsed. */
     unsigned int deny_users : 1;                    /**< Flag set when deny_users key is parsed. */
+    unsigned int allow_root : 1;                    /**< Flag set when allow_root key is parsed. */
     unsigned int allow_groups : 1;                  /**< Flag set when allow_groups key is parsed. */
     unsigned int deny_groups : 1;                   /**< Flag set when deny_groups key is parsed. */
     unsigned int enforce_groups : 1;                /**< Flag set when enforce_groups key is parsed. */
     unsigned int group_claim_field : 1;             /**< Flag set when group_claim_field key is parsed. */
+    unsigned int use_pkce : 1;                      /**< Flag set when use_pkce key is parsed. */
+    unsigned int discovery_endpoint : 1;            /**< Flag set when discovery_endpoint key is parsed. */
 } config_seen_t;
 
 /**
@@ -208,6 +211,27 @@ static int parse_bool(const char *val, int *out) {
         return 0;
     }
     return -1;
+}
+
+/**
+ * @brief Parses the three-state `use_pkce` configuration value.
+ *
+ * Accepts the boolean forms of `parse_bool` plus the case-insensitive "auto" mode, which
+ * probes `discovery_endpoint` once per authentication attempt to gate device-flow PKCE.
+ *
+ * @param[in]  val Raw string setting value ("true"/"1"/"yes", "false"/"0"/"no", "auto").
+ * @param[out] out Integer receiving 1 (always on), 0 (off), or 2 (auto).
+ * @return 0 on successful conversion, -1 if string is invalid or NULL.
+ */
+static int parse_pkce_mode(const char *val, int *out) {
+    if (!val || !out) {
+        return -1;
+    }
+    if (strcasecmp(val, "auto") == 0) {
+        *out = 2;
+        return 0;
+    }
+    return parse_bool(val, out);
 }
 
 /**
@@ -406,6 +430,25 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->require_exp_claim = 1;
             return parse_bool(val, &cfg->require_exp_claim);
+        } else if (strcasecmp(key, "use_pkce") == 0) {
+            if (seen->use_pkce) {
+                goto duplicate_key;
+            }
+            seen->use_pkce = 1;
+            return parse_pkce_mode(val, &cfg->use_pkce);
+        } else if (strcasecmp(key, "discovery_endpoint") == 0) {
+            if (seen->discovery_endpoint) {
+                goto duplicate_key;
+            }
+            seen->discovery_endpoint = 1;
+            if (!is_valid_https_url(val)) {
+                if (pamh) {
+                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                  "discovery_endpoint must be a valid https:// URL");
+                }
+                return -1;
+            }
+            return copy_checked(cfg->discovery_endpoint, sizeof(cfg->discovery_endpoint), val);
         }
     } else if (sec == SEC_CLAIM) {
         if (strcasecmp(key, "claim_field") == 0) {
@@ -446,6 +489,12 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->deny_users = 1;
             return copy_checked(cfg->deny_users, sizeof(cfg->deny_users), val);
+        } else if (strcasecmp(key, "allow_root") == 0) {
+            if (seen->allow_root) {
+                goto duplicate_key;
+            }
+            seen->allow_root = 1;
+            return parse_bool(val, &cfg->allow_root);
         } else if (strcasecmp(key, "allow_groups") == 0) {
             if (seen->allow_groups) {
                 goto duplicate_key;
@@ -651,6 +700,33 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
         return -1;
     }
 
+    /* "auto" mode probes the provider at run time, so a discovery endpoint is mandatory. */
+    if (cfg->use_pkce == 2 && strlen(cfg->discovery_endpoint) == 0) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "use_pkce = auto requires a discovery_endpoint in the [oauth] section");
+        }
+        secure_memzero(cfg, sizeof(config_t));
+        return -1;
+    }
+
+    /* Load-time PKCE advisories (emitted once per load, not per authentication attempt). */
+    if (cfg->use_pkce == 1) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_INFO, LOG_INFO,
+                          "use_pkce = true: device-flow PKCE is provider-specific; confirm your provider "
+                          "accepts code_challenge on the device-authorization endpoint (see "
+                          "examples/README.md). Providers without device-flow PKCE support reject the "
+                          "device-authorization request; set use_pkce = auto with a discovery_endpoint to "
+                          "gate PKCE on live provider metadata instead");
+        }
+    } else if (strlen(cfg->discovery_endpoint) > 0) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_INFO, LOG_INFO,
+                          "discovery_endpoint is set but has no effect unless use_pkce = auto");
+        }
+    }
+
     return 0;
 }
 
@@ -687,6 +763,7 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     cfg->verify_jwt_claims = 0;
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;
+    cfg->use_pkce = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
 
     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Loading configuration file: %s", path);

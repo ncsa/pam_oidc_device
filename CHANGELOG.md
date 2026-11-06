@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Root default-deny (F-2):** The `root` account is now denied authentication by default with `PAM_PERM_DENIED`. Set `allow_root = true` in the `[access]` section to explicitly permit root; the check is independent of `allow_users`/`deny_users`, so listing `root` in `allow_users` alone no longer grants root access.
+- **Robust polling deadline & interrupt handling (F-6/F-8):** The poll loop now compares full `timeval` deadlines (sec + nsec) instead of seconds only, and a signaled sleep (`EINTR`) is no longer silently resumed — it logs the interruption, returns `PAM_ABORT`, and aborts the authentication attempt.
+- **PKCE device-flow binding (F-3):** New optional `use_pkce = true` setting in the `[oauth]` section extends the RFC 8628 device flow with RFC 7636 PKCE: a fresh 64-character Base64URL `code_verifier` is generated from the OpenSSL CSPRNG on each authentication attempt, its S256 `code_challenge` is sent to the device-authorization endpoint, and the verifier is presented at the token endpoint, so a stolen `device_code` alone cannot obtain tokens. Disabled by default (`false`); enable only when the provider supports device-flow PKCE. Verifier/challenge buffers are scrubbed with `secure_memzero()` on every exit path.
+
+### Features
+- **PKCE auto-detection via provider discovery metadata:** `use_pkce` now accepts `auto` alongside `true`/`false`, and a new optional `discovery_endpoint` key (`[oauth]`, HTTPS-validated) supplies the provider's OIDC/OAuth discovery URL. In `auto` mode the module fetches that document once per login attempt (5 s cap) and enables PKCE only when the metadata advertises S256 in `code_challenge_methods_supported` *and* advertises a `device_authorization_endpoint`; every transport/HTTP/JSON probe failure fails safe to *no PKCE*, so a discovery outage can never block logins. Every decision is logged with its rationale, and explicit `use_pkce = true` now emits a one-time load-time reminder to confirm provider support. `use_pkce = auto` without `discovery_endpoint` is rejected at config load. `examples/README.md` documents how to determine a provider's device-flow PKCE support (vendor docs, a definitive live test-client probe, and the `auto` heuristic) and recommends `use_pkce` values per archetype (Keycloak: `true`; Entra ID / CILogon: `false` until proven).
+
 ## [0.1.0] - 2026-11-05
 
 Initial release of `pam_oidc_device`, a native Linux PAM authentication module that
