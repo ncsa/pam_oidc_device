@@ -43,18 +43,38 @@
 /* clang-format on */
 
 /*
- * Weak overrides of libcurl's transport entry points, used exclusively by
- * test_http_request_enforces_tls_options(). Defining these global symbols in
+ * Weak overrides of libcurl's transport entry points, used exclusively by the
+ * http_request()/discovery_probe_pkce tests. Defining these global symbols in
  * the test executable redirects the calls made by the module code here
- * instead of into libcurl (no real transfer is performed), so the TLS
- * options requested by http_request() can be captured and asserted. Every
- * setopt call is a no-op returning CURLE_OK; only the TLS options are
- * recorded.
+ * instead of into libcurl (no real transfer is ever performed):
+ *  - curl_easy_setopt() records the TLS options requested by http_request()
+ *    and captures the WRITEFUNCTION/WRITEDATA pair so a fake response body can
+ *    be "received" by the module's write callback;
+ *  - curl_easy_perform() returns `g_fake_curl_perform_rc` and, when a fake
+ *    body is configured, invokes the captured write callback with it;
+ *  - curl_easy_getinfo() reports `g_fake_curl_status_code` for
+ *    CURLINFO_RESPONSE_CODE.
+ * Every setopt call is a no-op returning CURLE_OK.
  */
 static int tls_opt_seen;
 static long tls_opt_ssl_verifypeer;
 static long tls_opt_ssl_verifyhost;
 static int tls_opt_ssl_version;
+
+static CURLcode g_fake_curl_perform_rc = CURLE_OK;
+static long g_fake_curl_status_code = 0;
+static const char *g_fake_curl_body = NULL;
+static size_t (*g_fake_write_cb)(void *, size_t, size_t, void *);
+static void *g_fake_write_data;
+
+/** Resets the fake-transport state so individual tests never leak into each other. */
+static void reset_fake_curl_transport(void) {
+    g_fake_curl_perform_rc = CURLE_OK;
+    g_fake_curl_status_code = 0;
+    g_fake_curl_body = NULL;
+    g_fake_write_cb = NULL;
+    g_fake_write_data = NULL;
+}
 
 __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
     (void)curl;
@@ -69,6 +89,10 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
     } else if (option == CURLOPT_SSLVERSION) {
         tls_opt_ssl_version = va_arg(args, int);
         tls_opt_seen++;
+    } else if (option == CURLOPT_WRITEFUNCTION) {
+        g_fake_write_cb = va_arg(args, size_t (*)(void *, size_t, size_t, void *));
+    } else if (option == CURLOPT_WRITEDATA) {
+        g_fake_write_data = va_arg(args, void *);
     }
     va_end(args);
     return CURLE_OK;
@@ -76,6 +100,23 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
 
 __attribute__((weak)) CURLcode curl_easy_perform(CURL *curl) {
     (void)curl;
+    if (g_fake_curl_perform_rc == CURLE_OK && g_fake_curl_body && g_fake_write_cb) {
+        (void)g_fake_write_cb((void *)g_fake_curl_body, strlen(g_fake_curl_body), 1, g_fake_write_data);
+    }
+    return g_fake_curl_perform_rc;
+}
+
+__attribute__((weak)) CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...) {
+    (void)curl;
+    va_list args;
+    va_start(args, info);
+    if (info == CURLINFO_RESPONSE_CODE) {
+        long *code = va_arg(args, long *);
+        if (code) {
+            *code = g_fake_curl_status_code;
+        }
+    }
+    va_end(args);
     return CURLE_OK;
 }
 
@@ -577,6 +618,122 @@ static void test_http_request_enforces_tls_options(void **state) {
 #if LIBCURL_VERSION_NUM >= 0x072000
     assert_int_equal(tls_opt_ssl_version, (int)CURL_SSLVERSION_TLSv1_2);
 #endif
+}
+
+/**
+ * @brief Verifies that discovery_probe_pkce fails safe on a non-200 transport
+ *        result (or no response status at all).
+ *
+ * The probe must return -1 and leave *supported == 0, exercising the fail-safe
+ * branch over http_request()'s zero-initialized response (no body; no
+ * uninitialized read or spurious free).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_probe_pkce_failsafe_non_200(void **state) {
+    (void)state;
+    const char *url = "https://idp.example/.well-known/openid-configuration";
+
+    /* Transport success with a non-200 status (e.g. HTTP 500) -> fail safe. */
+    reset_fake_curl_transport();
+    g_fake_curl_status_code = 500;
+    int supported = 1; /* Sentinel: the probe must clear it */
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(supported, 0);
+
+    /* Default fake status (0 == "no response") -> fail safe as well. */
+    g_fake_curl_status_code = 0;
+    supported = 1;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(supported, 0);
+}
+
+/**
+ * @brief Verifies that discovery_probe_pkce fails safe when the fake transport
+ *        reports a cURL-level error.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_probe_pkce_failsafe_transport_error(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+    g_fake_curl_perform_rc = CURLE_COULDNT_CONNECT;
+    int supported = 1;
+    assert_int_equal(
+        discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", &supported, LOGLEVEL_NONE, NULL),
+        -1);
+    assert_int_equal(supported, 0);
+}
+
+/**
+ * @brief Verifies that discovery_probe_pkce fails safe when the discovery
+ *        document body (HTTP 200) is not a JSON object.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_probe_pkce_failsafe_malformed_document(void **state) {
+    (void)state;
+    const char *url = "https://idp.example/.well-known/openid-configuration";
+
+    reset_fake_curl_transport();
+    g_fake_curl_status_code = 200;
+
+    g_fake_curl_body = "this is not a JSON document";
+    int supported = 1;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(supported, 0);
+
+    /* A valid JSON scalar is still not a discovery document object. */
+    g_fake_curl_body = "123";
+    supported = 1;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(supported, 0);
+}
+
+/**
+ * @brief Exercises the discovery_probe_pkce success matrix (HTTP 200 + JSON
+ *        object) and its three-way PKCE gating decision.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_probe_pkce_support_matrix(void **state) {
+    (void)state;
+    const char *url = "https://idp.example/.well-known/openid-configuration";
+
+    reset_fake_curl_transport();
+    g_fake_curl_status_code = 200;
+
+    /* S256 advertised AND device_authorization_endpoint present -> enable. */
+    g_fake_curl_body = "{\"code_challenge_methods_supported\": [\"S256\"], "
+                       "\"device_authorization_endpoint\": \"https://idp.example/device\"}";
+    int supported = 0;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(supported, 1);
+
+    /* S256 advertised but no device_authorization_endpoint -> disable. */
+    g_fake_curl_body = "{\"code_challenge_methods_supported\": [\"S256\"]}";
+    supported = 1;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(supported, 0);
+
+    /* S256 not advertised -> disable. */
+    g_fake_curl_body = "{\"issuer\": \"https://idp.example\"}";
+    supported = 1;
+    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(supported, 0);
+}
+
+/**
+ * @brief Verifies that discovery_probe_pkce rejects NULL arguments.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_discovery_probe_pkce_null_args(void **state) {
+    (void)state;
+    int supported = 0;
+    assert_int_equal(discovery_probe_pkce(NULL, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(
+        discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", NULL, LOGLEVEL_NONE, NULL), -1);
 }
 
 /**
@@ -1418,6 +1575,11 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_invalid_discovery_endpoint),
         cmocka_unit_test(test_parse_config_file_duplicate_discovery_endpoint),
         cmocka_unit_test(test_discovery_json_advertises_s256),
+        cmocka_unit_test(test_discovery_probe_pkce_failsafe_non_200),
+        cmocka_unit_test(test_discovery_probe_pkce_failsafe_transport_error),
+        cmocka_unit_test(test_discovery_probe_pkce_failsafe_malformed_document),
+        cmocka_unit_test(test_discovery_probe_pkce_support_matrix),
+        cmocka_unit_test(test_discovery_probe_pkce_null_args),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

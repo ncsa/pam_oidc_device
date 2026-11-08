@@ -208,7 +208,7 @@ int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, p
     }
     *supported = 0;
 
-    http_response_t resp;
+    http_response_t resp = {0};
     if (http_request("GET", url, NULL, NULL, 5000L, &resp, loglevel, pamh) != 0 || resp.status_code != 200 ||
         !resp.body) {
         pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
@@ -272,7 +272,9 @@ int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, p
  * @param[in]  postfields   URL-encoded request body (for POST requests).
  * @param[in]  bearer_token Access token for Authorization header (optional).
  * @param[in]  timeout_ms   Request timeout limit in milliseconds.
- * @param[out] resp         Pointer to response object receiving result.
+ * @param[out] resp         Pointer to response object receiving result; zero-initialized by this
+ *                          function before any return (success or error), so callers may always
+ *                          read `status_code`/`size` and pass it to free_http_response().
  * @param[in]  loglevel     Active syslog verbosity level.
  * @param[in]  pamh         PAM handle context for syslog reporting.
  * @return 0 on transport execution success, -1 on error.
@@ -282,6 +284,15 @@ int http_request(const char *method, const char *url, const char *postfields, co
     if (!url || !resp || !method) {
         return -1;
     }
+
+    /*
+     * Zero the response before any failure path (global init failure, handle
+     * allocation failure, setopt failure, ...) so that on EVERY return --
+     * success or error -- the caller can safely read `status_code`/`size` and
+     * pass the struct to free_http_response() without touching uninitialized
+     * memory or freeing a garbage `body` pointer.
+     */
+    memset(resp, 0, sizeof(http_response_t));
 
     if (oauth_http_global_init() != 0) {
         if (pamh) {
@@ -301,8 +312,6 @@ int http_request(const char *method, const char *url, const char *postfields, co
         pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
                       "HTTP Request includes Bearer authorization token header");
     }
-
-    memset(resp, 0, sizeof(http_response_t));
 
     CURL *curl = curl_easy_init();
     if (!curl) {

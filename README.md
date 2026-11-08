@@ -17,6 +17,7 @@ Users authenticating over SSH are presented with a verification URL and standard
 ## Key Features
 
 * **Standard RFC 8628 Flow:** Monotonic clock polling (`CLOCK_MONOTONIC`), resilient backoff for transient network errors, and real-time prompt streaming over SSH `keyboard-interactive` sessions.
+* **PKCE (RFC 7636):** Optional S256 code-verifier/code-challenge pairs bind the token exchange to the originating device-flow attempt; enabled via `use_pkce = true|false|auto` (`auto` probes the provider's discovery document once and fails safe to off).
 * **Flexible Claim Mapping:** Extract local system usernames from OIDC UserInfo claims (`sub`, `preferred_username`, etc.) using POSIX Extended Regular Expressions.
 * **Pre-Flight Access Controls:** Reject unauthorized local accounts *before* contacting the identity provider, limiting identity mapping risks.
 * **Group & Role Authorization:** Restrict access to users belonging to specific provider groups or roles.
@@ -34,7 +35,7 @@ On Enterprise Linux 8 / 9 / 10 (RHEL, Rocky Linux, AlmaLinux):
 
 ```bash
 # Install dependencies
-sudo dnf install -y gcc pam-devel libcurl-devel json-c-devel make
+sudo dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel make
 
 # Clone and compile
 git clone https://github.com/ncsa/pam_oidc_device.git

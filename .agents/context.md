@@ -1,9 +1,8 @@
 # AGENTS.md — pam_oidc_device: AI Agent Context & Rules
 
 > **Purpose.** This file is the single, *tool-agnostic* source of truth for all AI/GenAI coding
-> agents (Copilot, Cline, Cursor, Roo, …) working on `pam_oidc_device`. It consolidates the former
-> `.airules` and `.github/ai-instructions/system-context.md`. Machine-oriented memory of prior AI
-> work (decisions, gotchas, verification status) is kept separately in
+> agents (Copilot, Cline, Cursor, Roo, …) working on `pam_oidc_device`. Machine-oriented memory
+> of prior AI work (decisions, gotchas, verification status) is kept separately in
 > [`.agents/memory.md`](.agents/memory.md) and must be read before starting significant work.
 
 ---

@@ -598,7 +598,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     char *user_resp = NULL;
     int prompt_res = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, &user_resp, "%s", prompt_buf);
     if (user_resp) {
-        secure_memzero(user_resp, strlen(user_resp));
+        /* Include the terminating NUL so the entire PAM-owned buffer is scrubbed. */
+        secure_memzero(user_resp, strlen(user_resp) + 1);
         free(user_resp);
     }
     if (prompt_res != PAM_SUCCESS) {
@@ -685,6 +686,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         }
 
         long remain_ms = (long)((device_deadline.tv_sec - now.tv_sec) * 1000);
+        if (remain_ms <= 0L) {
+            /*
+             * The monotonic check above guarantees `now` is before the deadline
+             * at nanosecond precision, but the whole-second difference can still
+             * be zero at the deadline boundary. cURL treats a zero (or negative)
+             * CURLOPT_TIMEOUT_MS as "no timeout", so stop polling instead of
+             * firing a request with an unbounded lifetime.
+             */
+            break;
+        }
         long req_timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
 
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling token endpoint (timeout: %ldms)",

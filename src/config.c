@@ -152,7 +152,7 @@ int is_safe_terminal_string(const char *str) {
  *
  * @param[in] str Candidate user code string.
  * @return 1 if code is non-empty, under 64 characters, and consists of
- *         alphanumeric/hyphen/space/underscore chars, 0 otherwise.
+ *         ASCII alphanumeric/hyphen/space/underscore chars, 0 otherwise.
  */
 int is_safe_user_code(const char *str) {
     if (!str || strlen(str) == 0 || strlen(str) > 64) {
@@ -160,7 +160,13 @@ int is_safe_user_code(const char *str) {
     }
     for (size_t i = 0; str[i] != '\0'; i++) {
         unsigned char c = (unsigned char)str[i];
-        if (!(isalnum(c) || c == '-' || c == ' ' || c == '_')) {
+        /*
+         * Explicit ASCII ranges instead of locale-dependent isalnum(), so the
+         * accepted set cannot vary with the ambient locale -- consistent with
+         * the byte-wise style of the other terminal-safety helpers.
+         */
+        int ascii_alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!(ascii_alnum || c == '-' || c == ' ' || c == '_')) {
             return 0;
         }
     }
