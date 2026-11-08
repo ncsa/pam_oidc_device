@@ -40,6 +40,45 @@ static int timespec_before(const struct timespec *a, const struct timespec *b) {
     return (a->tv_sec < b->tv_sec) || (a->tv_sec == b->tv_sec && a->tv_nsec < b->tv_nsec);
 }
 
+/*
+ * Fixed capacities of the form-field tables that build the device-authorization
+ * and token request bodies. Both are exactly at capacity today: the device
+ * request carries client_id, [client_secret], [scope], code_challenge and
+ * code_challenge_method (5 with secret + scope + PKCE) and the token request
+ * carries client_id, [client_secret], grant_type, device_code and
+ * code_verifier (5 with secret + PKCE). form_field_append() enforces these
+ * bounds at runtime, so adding a future parameter that exceeds them fails
+ * safe (PAM_BUF_ERR) instead of silently overflowing the stack arrays.
+ */
+#define DEVICE_FORM_MAX_FIELDS 5
+#define TOKEN_FORM_MAX_FIELDS 5
+
+/**
+ * @brief Appends one key/value pair to a fixed-capacity form-field table.
+ *
+ * Enforces the table capacity so an oversized parameter set cannot silently
+ * overflow the underlying stack arrays.
+ *
+ * @param[in]  keys      Key table (at least `capacity` slots).
+ * @param[in]  vals      Value table (at least `capacity` slots).
+ * @param[out] count     Current number of pairs; incremented on success.
+ * @param[in]  capacity  Number of reserved slots in keys/vals.
+ * @param[in]  key       Field name.
+ * @param[in]  val       Field value.
+ * @return 0 on success, -1 if the table is already full.
+ */
+static int form_field_append(const char **keys, const char **vals, size_t *count, size_t capacity, const char *key,
+                             const char *val) {
+    if (*count >= capacity) {
+        return -1;
+    }
+    size_t idx = *count;
+    keys[idx] = key;
+    vals[idx] = val;
+    *count = idx + 1;
+    return 0;
+}
+
 /**
  * @brief Formats arrays of key-value parameters into an HTTP `application/x-www-form-urlencoded` string.
  *
@@ -448,29 +487,40 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Requesting device code from endpoint: %s",
                   cfg.device_authorization_endpoint);
 
-    const char *d_keys[5];
-    const char *d_vals[5];
+    /*
+     * Form-field table for the device-authorization request. Every append goes
+     * through form_field_append(), which enforces DEVICE_FORM_MAX_FIELDS so an
+     * oversized parameter set fails safe instead of overflowing the table.
+     */
+    const char *d_keys[DEVICE_FORM_MAX_FIELDS];
+    const char *d_vals[DEVICE_FORM_MAX_FIELDS];
     size_t d_count = 0;
+    int d_append_rc = 0;
 
-    d_keys[d_count] = "client_id";
-    d_vals[d_count++] = cfg.client_id;
+    d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_id", cfg.client_id);
 
     /* Client credentials are transmitted as form parameters in the request body
      * (`client_secret_post`, RFC 6749 s2.3.1); the `client_secret_basic` (HTTP Basic)
      * client-authentication method is not supported. */
     if (strlen(cfg.client_secret) > 0) {
-        d_keys[d_count] = "client_secret";
-        d_vals[d_count++] = cfg.client_secret;
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_secret", cfg.client_secret);
     }
     if (strlen(cfg.scopes) > 0) {
-        d_keys[d_count] = "scope";
-        d_vals[d_count++] = cfg.scopes;
+        d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "scope", cfg.scopes);
     }
     if (pkce_active) {
-        d_keys[d_count] = "code_challenge";
-        d_vals[d_count++] = code_challenge;
-        d_keys[d_count] = "code_challenge_method";
-        d_vals[d_count++] = "S256";
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge", code_challenge);
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge_method", "S256");
+    }
+
+    if (d_append_rc != 0) {
+        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Device request form-field table overflowed its fixed capacity");
+        retval = PAM_BUF_ERR;
+        goto cleanup;
     }
 
     if (build_form_postfields(curl, d_keys, d_vals, d_count, &postfields) != 0) {
@@ -609,26 +659,37 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     }
 
     /* Step 5: Build token request body prior to entering polling loop */
-    const char *t_keys[5];
-    const char *t_vals[5];
+    /*
+     * Form-field table for the token request. Every append goes through
+     * form_field_append(), which enforces TOKEN_FORM_MAX_FIELDS so an oversized
+     * parameter set fails safe instead of overflowing the table.
+     */
+    const char *t_keys[TOKEN_FORM_MAX_FIELDS];
+    const char *t_vals[TOKEN_FORM_MAX_FIELDS];
     size_t t_count = 0;
+    int t_append_rc = 0;
 
-    t_keys[t_count] = "client_id";
-    t_vals[t_count++] = cfg.client_id;
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_id", cfg.client_id);
 
     /* Client credentials follow the same form-body `client_secret_post` pattern as the
      * device-authorization request above; `client_secret_basic` is not supported. */
     if (strlen(cfg.client_secret) > 0) {
-        t_keys[t_count] = "client_secret";
-        t_vals[t_count++] = cfg.client_secret;
+        t_append_rc |=
+            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_secret", cfg.client_secret);
     }
-    t_keys[t_count] = "grant_type";
-    t_vals[t_count++] = "urn:ietf:params:oauth:grant-type:device_code";
-    t_keys[t_count] = "device_code";
-    t_vals[t_count++] = device_code;
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "grant_type",
+                                     "urn:ietf:params:oauth:grant-type:device_code");
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "device_code", device_code);
     if (pkce_active) {
-        t_keys[t_count] = "code_verifier";
-        t_vals[t_count++] = code_verifier;
+        t_append_rc |=
+            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "code_verifier", code_verifier);
+    }
+
+    if (t_append_rc != 0) {
+        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Token request form-field table overflowed its fixed capacity");
+        retval = PAM_BUF_ERR;
+        goto cleanup;
     }
 
     if (build_form_postfields(curl, t_keys, t_vals, t_count, &token_postfields) != 0) {
