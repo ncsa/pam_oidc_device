@@ -59,6 +59,14 @@
   override would collide with libcurl's `typecheck-gcc.h` argument-checking macro under real
   GCC, the test TU starts with `#define CURL_DISABLE_TYPECHECK` — keep that define *before*
   the project-header include, and keep the test TU free of direct `curl_easy_setopt` calls.
+- **clang-format version skew (CI = 18.1.x):** CI's `formatting` job installs `clang-format`
+  from Ubuntu 24.04 apt → **clang-format 18.1.x**; this host has MacPorts 19.1.7. The two can
+  *oppositely* disagree on the same line — e.g. anonymous function-pointer type-ids inside
+  `va_arg(args, size_t (*)(…))` (18 wants `size_t(*)(`, 19 wants `size_t (*(`). Keep such
+  type-ids out of the clang-format CI scope (`src/*.c include/*.h tests/*.c`) — use named
+  typedefs (see `test_write_cb` in `tests/test_suite.c`) — and when in doubt, verify with a
+  pinned 18.1.8 binary (`python3 -m venv /tmp/cf18 && /tmp/cf18/bin/pip install
+  clang-format==18.1.8`) in addition to the local one.
 - **Documentation honesty:** local JWT inspection is **claims-only** (`exp`, `nbf`, `iss`, `aud`) —
   no signature verification, no replay protection; enforce token authenticity via the provider's
   UserInfo endpoint. `jwks_url` and `introspection_endpoint` are accepted-but-unused (load-time
@@ -94,6 +102,37 @@
 ---
 
 ## Interaction Log (newest first)
+
+### 2026-11-07 — CI clang-format gate: anonymous fnptr type-id in `va_arg` (version skew fix)
+- **Task:** CI `formatting` job failed `clang-format --dry-run --Werror` at `tests/test_suite.c:93`
+  (`va_arg(args, size_t (*)(void *, size_t, size_t, void *))` — the C1 fake-transport capture).
+- **Decisions & Rationale:** Local clang-format 19.1.7 (MacPorts) *accepts* that line, but CI
+  (Ubuntu 24.04 `apt-get install clang-format`) runs **clang-format 18.1.x**, which *rejects* it —
+  and the two versions **disagree in opposite directions** on spacing: 18 wants `size_t(*)(`,
+  19 wants `size_t (*(`. Reformatting to satisfy one would fail the other, so the code was made
+  version-neutral instead: a named typedef `typedef size_t (*test_write_cb)(void *ptr,
+  size_t size, size_t nmemb, void *userdata);` (libcurl's `curl_write_callback` signature),
+  `g_fake_write_cb` redeclared as `static test_write_cb`, and the capture reduced to
+  `va_arg(args, test_write_cb)`. No anonymous function-pointer type-id remains in the CI scope,
+  so neither clang-format version has anything to reformat.
+- **Gotchas & Lessons:**
+  - The local 19.1.7 green check was *false assurance* — local and CI clang-format differ by a
+    major version and can disagree on the same line. To reproduce CI exactly, install
+    `clang-format==18.1.8` in a throwaway venv (`python3 -m venv /tmp/cf18 && /tmp/cf18/bin/pip
+    install clang-format==18.1.8`) and gate with **both** binaries before pushing.
+  - Avoid anonymous function-pointer type-ids (in `va_arg`, casts, or declarations) inside the
+    clang-format CI scope (`src/*.c include/*.h tests/*.c`); prefer named typedefs.
+- **Verification:**
+  - LOCAL (macOS): `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` green under
+    **both** 18.1.8 (CI parity) and 19.1.7; `make -s lint` green; isolated strict-flag harness
+    (`cc` + `clang`, `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2
+    -Wformat-security -O2 -g`, zero warnings) replicating the `va_arg` capture/invoke round-trip —
+    PASS on both.
+  - NOT RUN: full CMocka suite / `make test-sanitize CC=clang` / `make rpm` (no libpam/cmocka
+    here). The pushed branch must still pass the entire Linux/CI gate loop.
+- **Follow-ups / Open Items:**
+  - Push `wglick/review` → confirm `lint.yml` `formatting` now passes; remaining gates
+    (compile-matrix, sanitize-test, rpm-build) still pending in CI.
 
 ### 2026-11-07 — Review remediation: A1–A5 + B1–B4 + C1 (discovery_probe_pkce tests)
 - **Task:** Implement the follow-up fixes from the code/docs review: A1 (`http_request` left `resp` uninitialized on early-exit paths), A2 (`req_timeout_ms` could be 0/negative at the deadline boundary; cURL treats `CURLOPT_TIMEOUT_MS=0` as "no timeout"), A3 (locale-dependent `isalnum()` in `is_safe_user_code`), A4 (`user_resp` scrub omitted the terminating NUL), A5 (device/token form-field key/value arrays sized exactly at capacity; a sixth parameter would silently overflow the stack arrays), B1–B4 (README missing `openssl-devel`; CHANGELOG self-contradiction on `is_safe_terminal_string`; CONTRIBUTING gate loop drifted from `AGENTS.md` §3; README missing PKCE feature bullet), C1 (no tests for `discovery_probe_pkce`).

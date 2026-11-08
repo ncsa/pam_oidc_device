@@ -56,6 +56,11 @@
  *    CURLINFO_RESPONSE_CODE.
  * Every setopt call is a no-op returning CURLE_OK.
  */
+/* libcurl's curl_write_callback signature (curl/curl.h), given a local name so
+ * va_arg() below never embeds an anonymous function-pointer type-id, whose
+ * formatting differs across clang-format versions. */
+typedef size_t (*test_write_cb)(void *ptr, size_t size, size_t nmemb, void *userdata);
+
 static int tls_opt_seen;
 static long tls_opt_ssl_verifypeer;
 static long tls_opt_ssl_verifyhost;
@@ -64,7 +69,7 @@ static int tls_opt_ssl_version;
 static CURLcode g_fake_curl_perform_rc = CURLE_OK;
 static long g_fake_curl_status_code = 0;
 static const char *g_fake_curl_body = NULL;
-static size_t (*g_fake_write_cb)(void *, size_t, size_t, void *);
+static test_write_cb g_fake_write_cb;
 static void *g_fake_write_data;
 
 /** Resets the fake-transport state so individual tests never leak into each other. */
@@ -90,7 +95,7 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
         tls_opt_ssl_version = va_arg(args, int);
         tls_opt_seen++;
     } else if (option == CURLOPT_WRITEFUNCTION) {
-        g_fake_write_cb = va_arg(args, size_t (*)(void *, size_t, size_t, void *));
+        g_fake_write_cb = va_arg(args, test_write_cb);
     } else if (option == CURLOPT_WRITEDATA) {
         g_fake_write_data = va_arg(args, void *);
     }
