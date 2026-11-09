@@ -1,0 +1,39 @@
+name: Vendor Drift Audit
+
+# Periodic check that the vendored third-party code in third_party/ stays in a
+# known, reviewed state — "frozen" must not silently become "abandoned":
+#   * runs monthly on the 1st,
+#   * on demand (workflow_dispatch),
+#   * on every PR that touches third_party/** or the audit script itself.
+#
+# The job fails (non-zero) when:
+#   - the local vendored files no longer match the recorded SHA-256 digests,
+#   - the local files have semantic drift vs. the pinned upstream revision, or
+#   - upstream has advanced past the pin and needs review / re-vendoring
+#     (exit code 2; re-vendoring procedure in third_party/qrcodegen/AUTHORS).
+#
+# No build dependencies are required: the audit is pure shell/curl/python3
+# (all present on the ubuntu-latest runner), so it must keep passing on a
+# bare checkout.
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # 06:00 UTC on the 1st of each month
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "third_party/**"
+      - "scripts/check_qrcodegen_upstream.sh"
+      - ".github/workflows/vendor-audit.yml"
+
+jobs:
+  qrcodegen:
+    name: Nayuki qrcodegen upstream-drift check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
+
+      - name: Run upstream drift audit
+        run: sh scripts/check_qrcodegen_upstream.sh
