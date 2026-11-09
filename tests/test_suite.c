@@ -1844,17 +1844,22 @@ static void test_qr_render_golden_utf8(void **state) {
  *
  * Writes the given rendered art to a file, rasterizes it with
  * tests/qr_scan/art2png.py (the same rasterization a monospace terminal
- * display produces), and decodes the PNG with zbarimg (libzbar — a QR decoder
- * independent of both the Nayuki encoder and the local ZXing fixture check).
+ * display produces) as a binary P5 PGM, and decodes it with zbarimg (libzbar —
+ * a QR decoder independent of both the Nayuki encoder and the local ZXing
+ * fixture check). The raster is written as a binary P5 PGM rather than a PNG:
+ * it is spec-trivial (no zlib/chunk/CRC machinery) and decodes under any
+ * zbarimg image backend (ImageMagick's native PGM coder or libzbar's
+ * built-in PPM/PGM reader). (PNG output stays available to the rasterizer for
+ * human/phone-camera leg use.)
  *
  * @param[in]  art         Rendered art (quiet zone included, no header).
  * @param[in]  art_path    Art file path (created/overwritten).
- * @param[in]  png_path    Rasterized PNG path (created/overwritten).
+ * @param[in]  pgm_path    Rasterized P5 PGM path (created/overwritten).
  * @param[out] decoded     Buffer for the decoded payload.
  * @param[in]  decoded_cap Capacity of decoded (NUL included).
  * @return 0 on a successful decode, -1 on any failure.
  */
-static int qr_scan_decode_art(const char *art, const char *art_path, const char *png_path, char *decoded,
+static int qr_scan_decode_art(const char *art, const char *art_path, const char *pgm_path, char *decoded,
                               size_t decoded_cap) {
     char cmd[512];
     FILE *f = fopen(art_path, "w");
@@ -1863,12 +1868,12 @@ static int qr_scan_decode_art(const char *art, const char *art_path, const char 
     }
     fputs(art, f);
     fclose(f);
-    snprintf(cmd, sizeof(cmd), "python3 tests/qr_scan/art2png.py %s %s 3 >/dev/null", art_path, png_path);
+    snprintf(cmd, sizeof(cmd), "python3 tests/qr_scan/art2png.py %s %s 3 >/dev/null", art_path, pgm_path);
     if (system(cmd) != 0) {
         return -1;
     }
     char zcmd[512];
-    snprintf(zcmd, sizeof(zcmd), "zbarimg --quiet --raw %s", png_path);
+    snprintf(zcmd, sizeof(zcmd), "zbarimg --quiet --raw %s", pgm_path);
     FILE *zp = popen(zcmd, "r");
     if (!zp) {
         return -1;
@@ -1912,7 +1917,7 @@ static void test_qr_scan_roundtrip(void **state) {
     char full[QR_RENDER_BUF_MAX];
     char art[QR_RENDER_BUF_MAX];
     char art_path[64] = "/tmp/pam_oidc_qr_scan_XXXXXX";
-    char png_path[100];
+    char pgm_path[100];
     char decoded[512];
 
     init_config_defaults(&cfg);
@@ -1923,7 +1928,7 @@ static void test_qr_scan_roundtrip(void **state) {
     int fd = mkstemp(art_path);
     assert_int_not_equal(fd, -1);
     close(fd);
-    snprintf(png_path, sizeof(png_path), "%s.png", art_path);
+    snprintf(pgm_path, sizeof(pgm_path), "%s.pgm", art_path);
 
     for (int style = 0; style <= QR_STYLE_ASCII; style++) {
         cfg.qr_style = (style == 0) ? QR_STYLE_UTF8 : QR_STYLE_ASCII;
@@ -1938,12 +1943,12 @@ static void test_qr_scan_roundtrip(void **state) {
         }
         memcpy(art, art_start, art_len);
         art[art_len] = '\0';
-        assert_int_equal(qr_scan_decode_art(art, art_path, png_path, decoded, sizeof(decoded)), 0);
+        assert_int_equal(qr_scan_decode_art(art, art_path, pgm_path, decoded, sizeof(decoded)), 0);
         assert_string_equal(decoded, uri_complete);
     }
 
     unlink(art_path);
-    unlink(png_path);
+    unlink(pgm_path);
 }
 
 /**

@@ -119,6 +119,44 @@
 
 ## Interaction Log (newest first)
 
+### 2026-11-08 — CI `zbarimg` PNG rejection → PGM switch; found & fixed vertical-raster truncation bug
+- **Task:** CI (ubuntu-latest, `zbar-tools`) failed `test_qr_scan_roundtrip`:
+  `ERROR: Not enough image data … @ error/png.c/MagickPNGErrorHandler` — CI's
+  zbarimg reads images through ImageMagick, whose strict PNG decoder rejected
+  the hand-rolled PNG. The local macOS "zbarimg" (a zxing-cpp/PIL shim) had
+  passed, because **PIL silently zero-pads truncated images** — masking the
+  real bug.
+- **Decisions & Rationale:** Root cause was NOT the PNG format:
+  `tests/qr_scan/art2png.py` expanded pixel columns by `px_per_module` but
+  appended **one** pixel row per module row, so the raster carried only
+  1/px_per_module of the declared scanline bytes (e.g. 41 of 123 rows at
+  scale 3). Fixed by repeating each expanded row `px_per_module` times
+  vertically (`pixel_rows.extend([bytes(pixel)] * px_per_module)`). The
+  machine-scanned leg now writes **P5 PGM** (`.pgm` out-extension in
+  `art2png.py`; trivial header+raw-bytes writer, no zlib/chunk/CRC) instead of
+  PNG: it decodes under any zbarimg image backend (ImageMagick's native PGM
+  coder or libzbar's built-in PPM/PGM reader). PNG output remains available
+  for the human/phone-camera leg. Updated `test_qr_scan_roundtrip`
+  (`pgm_path`, `.pgm`) and the `qr-scan-audit` job (PGM decode) to match.
+- **Gotchas & Lessons:** A test shim that is *more lenient* than the real
+  tool can certify broken output — PIL's zero-padding made a structurally
+  truncated image decode "successfully" locally while every strict decoder
+  (ImageMagick/libpng, PIL's own strict PPM path) rejects it. When validating
+  image rasters, check the full decoded data (size + corner pixels + warnings),
+  not just that the payload decodes.
+- **Verification:** Locally (macOS): regenerated scale-3 art from the
+  non-PAM harness dumps; `art2png.py` now emits byte-exact rasters — PIL
+  strict-verify of PGM/PNG with 0 warnings and correct 123×123 dims;
+  independent zxing-cpp decode of PGM (UTF-8 + ASCII art) and PNG all return
+  the exact URI; clang-format clean (CI scope); workflow YAML parses; py
+  syntax OK. The C edits are mechanical (param rename, `.pgm` extension).
+  **Still requires Linux/CI:** `make test CC=gcc` / `CC=clang` with
+  `zbar-tools` (compile-matrix), `make test-sanitize CC=clang`, and the
+  `qr-scan-audit` zbarimg decode — pushed for CI verification.
+- **Follow-ups:** Watch `wglick/qr-terminal` CI: `qr-scan-audit` must show
+  zbarimg recovering the URI from PGM; manual phone-camera scan of the
+  published scale-1 art in the job summary.
+
 ### 2026-11-08 — QR vendor provenance + upstream drift audit; independent-scanner decode gate
 - **Task:** Implement two follow-up recommendations on `wglick/qr-terminal`: (1) record
   provenance for the vendored Nayuki qrcodegen and add a periodic check against upstream

@@ -19,9 +19,17 @@ The ISO/IEC 18004 quiet zone (4 light modules on every side) must be present
 in the input; a violation (e.g. a prompt header line above the symbol) is an
 error, so a wrong input can never silently produce an undecodable image.
 
-Usage:  art2png.py ART_FILE PNG_FILE [PX_PER_MODULE]
-        (PX_PER_MODULE is the output pixel size per module; defaults to 3)
+Usage:  art2png.py ART_FILE OUT_FILE [PX_PER_MODULE]
+        (OUT_FILE's extension selects P5 PGM when it ends in ".pgm" and a
+        minimal grayscale PNG otherwise; PX_PER_MODULE is the output pixel
+        size per module, default 3)
 Exit:   0 success, 2 usage/parse error.  Pure standard library (struct/zlib).
+
+Note:  the machine-scanned leg uses P5 PGM, not PNG: it is spec-trivial
+(header + raw bytes, no zlib/chunk/CRC machinery) and reads cleanly through
+every zbarimg image backend (ImageMagick's native PGM coder or libzbar's
+built-in PPM/PGM decoders).  PNG output remains available (any other output
+extension) for human/phone-camera use, where arbitrary decoders render it.
 """
 
 import struct
@@ -155,11 +163,19 @@ def write_png(path, width, height, pixel_rows):
         fh.write(png)
 
 
+def write_pgm(path, width, height, pixel_rows):
+    """Write a minimal binary P5 PGM image (header + raw bytes, no encoding)."""
+    header = f"P5\n{width} {height}\n255\n"
+    with open(path, "wb") as fh:
+        fh.write(header.encode("ascii"))
+        fh.write(b"".join(pixel_rows))
+
+
 def main(argv):
     if len(argv) not in (4, 5):
         print(__doc__, file=sys.stderr)
         return 2
-    art_path, png_path = argv[1], argv[2]
+    art_path, img_path = argv[1], argv[2]
     px_per_module = int(argv[3]) if len(argv) == 5 else 3
     if px_per_module < 1:
         print("error: PX_PER_MODULE must be >= 1", file=sys.stderr)
@@ -179,11 +195,18 @@ def main(argv):
         pixel = bytearray()
         for cell in row:
             pixel.extend([BLACK if cell else WHITE] * px_per_module)
-        pixel_rows.append(bytes(pixel))
-    write_png(png_path, mod_cols * px_per_module, mod_rows * px_per_module, pixel_rows)
-    print(f"{png_path}: {mod_cols * px_per_module}x{mod_rows * px_per_module} px "
+        # A module row spans px_per_module pixel rows: repeat the expanded row
+        # vertically as well (horizontal expansion happens in the inner loop).
+        pixel_rows.extend([bytes(pixel)] * px_per_module)
+    if img_path.endswith(".pgm"):
+        write_pgm(img_path, mod_cols * px_per_module, mod_rows * px_per_module, pixel_rows)
+        fmt = "P5 PGM"
+    else:
+        write_png(img_path, mod_cols * px_per_module, mod_rows * px_per_module, pixel_rows)
+        fmt = "PNG"
+    print(f"{img_path}: {mod_cols * px_per_module}x{mod_rows * px_per_module} px "
           f"({mod_cols}x{mod_rows} modules, {'UTF-8' if is_utf8 else 'ASCII'} art, "
-          f"{px_per_module} px/module)")
+          f"{px_per_module} px/module, {fmt})")
     return 0
 
 
