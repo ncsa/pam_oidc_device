@@ -40,6 +40,7 @@
 #include <cmocka.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 /* clang-format on */
 
 /*
@@ -1839,11 +1840,119 @@ static void test_qr_render_golden_utf8(void **state) {
 }
 
 /**
+ * @brief Rasterizes terminal QR art and decodes it with an independent scanner.
+ *
+ * Writes the given rendered art to a file, rasterizes it with
+ * tests/qr_scan/art2png.py (the same rasterization a monospace terminal
+ * display produces), and decodes the PNG with zbarimg (libzbar — a QR decoder
+ * independent of both the Nayuki encoder and the local ZXing fixture check).
+ *
+ * @param[in]  art         Rendered art (quiet zone included, no header).
+ * @param[in]  art_path    Art file path (created/overwritten).
+ * @param[in]  png_path    Rasterized PNG path (created/overwritten).
+ * @param[out] decoded     Buffer for the decoded payload.
+ * @param[in]  decoded_cap Capacity of decoded (NUL included).
+ * @return 0 on a successful decode, -1 on any failure.
+ */
+static int qr_scan_decode_art(const char *art, const char *art_path, const char *png_path, char *decoded,
+                              size_t decoded_cap) {
+    char cmd[512];
+    FILE *f = fopen(art_path, "w");
+    if (!f) {
+        return -1;
+    }
+    fputs(art, f);
+    fclose(f);
+    snprintf(cmd, sizeof(cmd), "python3 tests/qr_scan/art2png.py %s %s 3 >/dev/null", art_path, png_path);
+    if (system(cmd) != 0) {
+        return -1;
+    }
+    char zcmd[512];
+    snprintf(zcmd, sizeof(zcmd), "zbarimg --quiet --raw %s", png_path);
+    FILE *zp = popen(zcmd, "r");
+    if (!zp) {
+        return -1;
+    }
+    size_t n = fread(decoded, 1, decoded_cap - 1, zp);
+    int status = pclose(zp);
+    decoded[n] = '\0';
+    while (n > 0 && (decoded[n - 1] == '\n' || decoded[n - 1] == '\r')) {
+        decoded[--n] = '\0';
+    }
+    return (status != 0 || n == 0) ? -1 : 0;
+}
+
+/**
+ * @brief End-to-end terminal QR round trip through an independent scanner.
+ *
+ * Renders the verification-URI art through the production code path
+ * (qr_render_verification_code) in BOTH terminal styles, rasterizes it exactly
+ * as a monospace terminal displays it, and requires zbarimg to recover the
+ * exact complete verification URI. This is the CI-enforced leg of the
+ * "independent scanner" check; the phone-camera leg (manual scan of the
+ * published art) is covered by the qr-scan-audit job, which writes the
+ * rendered art into the workflow step summary.
+ *
+ * Skips cleanly when zbarimg or python3 is not installed (e.g. the rpm %check
+ * container); CI installs zbar-tools so the test runs in the compile-matrix
+ * and sanitizer jobs.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_scan_roundtrip(void **state) {
+    (void)state;
+    if (system("command -v zbarimg >/dev/null 2>&1") != 0 || system("command -v python3 >/dev/null 2>&1") != 0) {
+        printf("SKIP test_qr_scan_roundtrip: zbarimg and python3 are not installed\n");
+        return;
+    }
+
+    const char *const uri_plain = "https://auth.example.edu/device";
+    const char *const uri_complete = "https://auth.example.edu/link?code=WXYZ-9012";
+    config_t cfg;
+    char full[QR_RENDER_BUF_MAX];
+    char art[QR_RENDER_BUF_MAX];
+    char art_path[64] = "/tmp/pam_oidc_qr_scan_XXXXXX";
+    char png_path[100];
+    char decoded[512];
+
+    init_config_defaults(&cfg);
+    cfg.qr_scale = 3;
+    assert_int_equal(
+        qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, uri_plain, uri_complete, full, sizeof(full), NULL), 0);
+
+    int fd = mkstemp(art_path);
+    assert_int_not_equal(fd, -1);
+    close(fd);
+    snprintf(png_path, sizeof(png_path), "%s.png", art_path);
+
+    for (int style = 0; style <= QR_STYLE_ASCII; style++) {
+        cfg.qr_style = (style == 0) ? QR_STYLE_UTF8 : QR_STYLE_ASCII;
+        assert_int_equal(
+            qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, uri_plain, uri_complete, full, sizeof(full), NULL), 0);
+        /* art = everything after the one-line instruction header, minus the
+         * trailing separator blank line the verification-code glue appends. */
+        const char *art_start = strchr(full, '\n') + 1;
+        size_t art_len = strlen(art_start);
+        if (art_len > 0 && art_start[art_len - 1] == '\n') {
+            art_len--;
+        }
+        memcpy(art, art_start, art_len);
+        art[art_len] = '\0';
+        assert_int_equal(qr_scan_decode_art(art, art_path, png_path, decoded, sizeof(decoded)), 0);
+        assert_string_equal(decoded, uri_complete);
+    }
+
+    unlink(art_path);
+    unlink(png_path);
+}
+
+/**
  * @brief Execution entry point for the CMocka test runner suite[cite: 7].
  *
  * Registers and executes unit tests for URL encoding, loglevel parsing, identity claim mapping,
  * input sanitization, prompt message rendering, JWT metadata verification, configuration
- * stream parsing (parse_config_file), and terminal QR code encoding/rendering (qr.c).
+ * stream parsing (parse_config_file), and terminal QR code encoding/rendering (qr.c),
+ * including an independent-scanner decode round trip (test_qr_scan_roundtrip).
  *
  * @return 0 if all unit tests pass, non-zero return code if any test fails[cite: 7].
  */
@@ -1899,6 +2008,7 @@ int main(void) {
         cmocka_unit_test(test_qr_encode_uri),
         cmocka_unit_test(test_qr_render_verification_code),
         cmocka_unit_test(test_qr_render_golden_utf8),
+        cmocka_unit_test(test_qr_scan_roundtrip),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

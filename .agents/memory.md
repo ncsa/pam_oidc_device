@@ -107,7 +107,85 @@
   pattern rule for `third_party/.../*.o` and the rpm tarball file list must include
   `third_party` (see the `third_party/qrcodegen/` precedent, 2026-11-08).
 
+- **Vendored code carries provenance + a drift gate:** each `third_party/` payload keeps
+  machine-readable pins + local SHA-256 (`vendor-provenance.txt`), a human `AUTHORS`
+  (upstream, pin commits, license, re-vendoring procedure), and a minimal
+  `local-deviations.patch` (the ONLY semantic deviations from upstream; everything else
+  is clang-format). A scheduled audit workflow (`vendor-audit.yml` → `scripts/check_*.sh`)
+  verifies local integrity, token-normalized equivalence vs. pinned upstream + patch, and
+  fails when upstream advances past the pin. Drift primitive: token-normalize (blank
+  string/char literals, strip comments, delete all whitespace) — immune to clang-format
+  version skew (local 19 vs CI 18) and whitespace churn.
+
 ## Interaction Log (newest first)
+
+### 2026-11-08 — QR vendor provenance + upstream drift audit; independent-scanner decode gate
+- **Task:** Implement two follow-up recommendations on `wglick/qr-terminal`: (1) record
+  provenance for the vendored Nayuki qrcodegen and add a periodic check against upstream
+  so "frozen" never becomes "abandoned"; (2) verify the rendered terminal QR through
+  independent scanners (zbarimg in CI; phone camera manually).
+- **Decisions & Rationale:**
+  - Provenance is triple-locked in `third_party/qrcodegen/`: `vendor-provenance.txt`
+    (machine-readable: upstream pins — qrcodegen.c @ 8329a7108fc2… (2024-09-01),
+    qrcodegen.h @ f3705873ab6c… (2022-01-08), pinned_at, local SHA-256s, patch name),
+    `AUTHORS` (human attribution, MIT, deviation list, re-vendoring procedure), and
+    `local-deviations.patch` (the only semantic deviations: `#pragma once`→include
+    guard, `QRCODEGEN_TEST` block→`#define testable static`, include order). Verified
+    token-equivalence of (pinned upstream + patch) == tree.
+  - `scripts/check_qrcodegen_upstream.sh` (gated by new `.github/workflows/vendor-audit.yml`:
+    monthly cron 1st 06:00 UTC, workflow_dispatch, PRs touching `third_party/**`):
+    (a) local SHA-256 integrity vs. provenance file; (b) fetch upstream AT THE PINS,
+    `git apply -p3` the deviation patch (git init in mktemp dir), compare
+    token-normalized content; (c) GitHub API freshness — newest commit touching each
+    upstream path vs. pin; exit 2 (job failure) when upstream advanced, with the
+    since-pin commit list; 403/429 API responses degrade to a warning only.
+  - The vendored copy is NOT byte-identical to upstream (clang-formatted at vendor
+    time); the earlier "unmodified" commit framing is superseded by the patch +
+    token-equivalence mechanism.
+  - Scanner gate: `tests/qr_scan/art2png.py` (stdlib-only PNG writer; UTF-8 half-block
+    lines each cover 2 module rows with NO vertical repetition, ASCII art lines are
+    repeated `scale` times vertically; output pixel scale is a separate
+    PX_PER_MODULE arg) and `tests/qr_scan/qr_render_check.c` (production-path harness,
+    also prints scale-1 ASCII art to stdout for phone scans). New CMocka
+    `test_qr_scan_roundtrip`: renders BOTH styles via qr_render_verification_code at
+    scale 3, rasterizes, requires `zbarimg --quiet --raw` to return the exact complete
+    URI; skips cleanly when zbarimg/python3 are absent (rpm %check container).
+  - `build.yml`: `zbar-tools` added to compile-matrix + sanitize-test apt lines (the
+    round trip now runs under gcc, clang, and ASan/UBSan/LSan); new `qr-scan-audit`
+    job (gcc + zbar-tools + PAM/curl/json-c headers for the harness build) decodes
+    both styles and appends the scale-1 ASCII art to the job step summary for
+    phone-camera verification.
+  - `packaging/pam_oidc_device.spec` now installs `third_party/qrcodegen/AUTHORS` to
+    `%{_docdir}/%{name}/third_party/` and lists it under `%license`.
+- **Gotchas & Lessons:**
+  - In terminal QR art the TRAILING all-space lines are the bottom quiet zone — do not
+    strip trailing blank lines when rasterizing (first attempt dropped the bottom 4
+    modules; the quiet-zone guard caught it).
+  - art2png detects the renderer's art scale from the quiet-zone width: 4*scale light
+    lines (ASCII, vertical repetition) or 4*scale leading spaces on the first glyph
+    line (UTF-8, horizontal-only repetition) — then downsamples and enforces a clean
+    4-module quiet zone + square grid at module resolution.
+  - zbarimg is unavailable on this macOS box (no Homebrew): validate the pipeline with
+    zxing-cpp in a throwaway venv (/tmp/qrvenv + PIL + numpy), and exercise the REAL C
+    test path (popen/exit-code contract, temp files, header stripping) with a
+    `/tmp/fakebin/zbarimg` shim that emulates zbarimg's stdout/exit-code semantics over
+    ZXing.
+  - Stub-cmocka local builds additionally need `-Wno-string-conversion` (string-literal
+    quirk in the stub assert macros) and `-include build/verify/linux_shims.h`
+    (clock_nanosleep/TIMER_ABSTIME absent on macOS); both are local-only artifacts.
+- **Verification:** LOCAL (macOS, stub-based): drift script passes end-to-end
+  (integrity, pinned fetch, token equivalence, freshness) and correctly fails on a
+  tampered sandbox copy; both terminal arts rasterize to 123x123 px (41x41 modules)
+  and decode to the exact URI under ZXing; all 6 QR CMocka tests pass —
+  test_qr_scan_roundtrip SKIPS without zbarimg and PASSES under the ZXing shim;
+  `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` clean; harness +
+  test_suite.c compile clean under the full strict warning set; both workflow YAMLs
+  parse. STILL REQUIRED on Linux/CI: `make lint`, gcc+clang `make test` (round trip now
+  live), `make test-sanitize CC=clang`, EL8/9/10 `make rpm`, plus the new
+  `qr-scan-audit` and `vendor-audit` jobs.
+- **Follow-ups / Open Items:** push the two new commits to `wglick/qr-terminal`; watch
+  the first `qr-scan-audit` + `vendor-audit` runs; optionally scan the published
+  scale-1 art with a phone camera for the real-conditions leg.
 
 ### 2026-11-08 — Terminal QR rendering wrap-up: stub fidelity, vendored-code placement, gate warnings
 - **Task:** Final pass on the QR terminal-rendering branch (`wglick/qr-terminal`): make the
