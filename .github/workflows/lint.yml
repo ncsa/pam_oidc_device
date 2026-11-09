@@ -1,0 +1,68 @@
+name: Lint and Static Analysis
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  formatting:
+    name: Check Code Formatting (clang-format)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Run clang-format check
+        run: clang-format --dry-run --Werror src/*.c include/*.h tests/*.c
+
+  clang-tidy:
+    name: Static Analysis (clang-tidy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install clang-tidy & headers
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy libpam0g-dev libcurl4-openssl-dev libjson-c-dev
+
+      - name: Run clang-tidy
+        run: clang-tidy src/*.c -- -Iinclude -D_GNU_SOURCE
+
+  cppcheck:
+    name: Static Analysis (cppcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck libpam0g-dev libcurl4-openssl-dev libjson-c-dev
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all \
+                   --suppress=missingIncludeSystem \
+                   --suppress=unusedFunction \
+                   --suppress=constParameterCallback \
+                   --error-exitcode=1 \
+                   --std=c99 \
+                   -I include/ \
+                   src/
+
+  flawfinder:
+    name: Security Auditing (Flawfinder)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Flawfinder
+        run: pip install flawfinder==2.0.19
+
+      - name: Run Flawfinder security audit
+        run: flawfinder --minlevel=3 --error-level=3 src/ include/
