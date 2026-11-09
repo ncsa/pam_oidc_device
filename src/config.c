@@ -42,6 +42,7 @@ typedef struct {
     unsigned int claim_capture_group : 1;           /**< Flag set when claim_capture_group key is parsed. */
     unsigned int max_poll_seconds : 1;              /**< Flag set when max_poll_seconds key is parsed. */
     unsigned int init_message : 1;                  /**< Flag set when init_message key is parsed. */
+    unsigned int show_countdown : 1;                /**< Flag set when show_countdown key is parsed. */
     unsigned int case_sensitive : 1;                /**< Flag set when case_sensitive key is parsed. */
     unsigned int loglevel : 1;                      /**< Flag set when loglevel key is parsed. */
     unsigned int issuer : 1;                        /**< Flag set when issuer key is parsed. */
@@ -637,6 +638,12 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->init_message = 1;
             return copy_checked(cfg->init_message, sizeof(cfg->init_message), val);
+        } else if (strcasecmp(key, "show_countdown") == 0) {
+            if (seen->show_countdown) {
+                goto duplicate_key;
+            }
+            seen->show_countdown = 1;
+            return parse_bool(val, &cfg->show_countdown);
         }
     } else if (sec == SEC_RUNTIME) {
         if (strcasecmp(key, "max_poll_seconds") == 0) {
@@ -908,6 +915,7 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
     cfg->claim_capture_group = 1;
     cfg->max_poll_seconds = 300;
+    cfg->show_countdown = 0;
     cfg->case_sensitive = 1;
     cfg->loglevel = LOGLEVEL_INFO;
     cfg->verify_jwt_claims = 0;

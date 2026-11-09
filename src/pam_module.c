@@ -335,6 +335,69 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
 }
 
 /**
+ * @brief Formats a non-negative second count as a compact duration string.
+ *
+ * Uses "MM:SS" for durations under one hour and "H:MM:SS" for one hour or more,
+ * keeping the on-screen expiry countdown compact on the terminal.
+ *
+ * @param[in]  seconds Duration in seconds (0..359999).
+ * @param[out] out     Buffer receiving the formatted duration.
+ * @param[in]  out_len Destination buffer capacity in bytes (at least 8).
+ * @return 0 on success, -1 on invalid input or buffer overflow.
+ */
+int format_time_remaining(int seconds, char *out, size_t out_len) {
+    if (!out || out_len < 8 || seconds < 0 || seconds > 359999) {
+        return -1;
+    }
+    int w;
+    if (seconds >= 3600) {
+        w = snprintf(out, out_len, "%d:%02d:%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    } else {
+        w = snprintf(out, out_len, "%02d:%02d", seconds / 60, seconds % 60);
+    }
+    return (w >= 0 && (size_t)w < out_len) ? 0 : -1;
+}
+
+/**
+ * @brief Renders one on-screen expiry-countdown line for in-place terminal repainting.
+ *
+ * The line starts with a carriage return ("\r") so each redraw overwrites the
+ * current terminal line without scrolling, and is space-padded to `padded_width`
+ * so a shorter remaining time fully overwrites the previous, longer one. Content
+ * is a module-static template plus a local time string (no provider or user data),
+ * so no terminal-injection validation applies.
+ *
+ * @param[in]  remaining_sec Seconds remaining until the device code expires.
+ * @param[out] out           Buffer receiving the rendered line.
+ * @param[in]  out_len       Destination buffer capacity in bytes.
+ * @param[in]  padded_width  Total width to pad with spaces (0 = no padding; normally
+ *                           the width of the initial countdown line).
+ * @return 0 on success, -1 on invalid input or buffer overflow.
+ */
+int render_countdown_line(int remaining_sec, char *out, size_t out_len, size_t padded_width) {
+    if (!out || out_len == 0 || remaining_sec < 0) {
+        return -1;
+    }
+    char time_str[16];
+    if (format_time_remaining(remaining_sec, time_str, sizeof(time_str)) != 0) {
+        return -1;
+    }
+    int w = snprintf(out, out_len, "\rCode expires in %s", time_str);
+    if (w < 0 || (size_t)w >= out_len) {
+        return -1;
+    }
+    size_t len = (size_t)w;
+    if (padded_width > len) {
+        size_t pad_to = (padded_width + 1 < out_len) ? padded_width : out_len - 1;
+        for (size_t i = len; i < pad_to; i++) {
+            out[i] = ' ';
+        }
+        out[pad_to] = '\0';
+    }
+    return 0;
+}
+
+/**
  * @brief Primary PAM authentication hook implementation.
  *
  * Executes full RFC 8628 device authorization workflow:
@@ -342,7 +405,9 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
  * 2. Loads module configuration settings (`load_config`).
  * 3. Sends POST request to Device Authorization Endpoint to obtain `device_code` and `user_code`.
  * 4. Displays prompt instruction to user via PAM conversation function (`pam_prompt`),
- *    optionally preceded by a scannable terminal QR code of the verification URI (`[qr]` section).
+ *    optionally preceded by a scannable terminal QR code of the verification URI (`[qr]` section),
+ *    and, when `show_countdown` is enabled, an on-screen "Code expires in MM:SS" countdown
+ *    that repaints in place every `COUNTDOWN_TICK_SECONDS` (RFC 8628 expiry timer guidance).
  * 5. Polls Token Endpoint using monotonic clock timing until token issuance, expiration, or user denial.
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
@@ -395,6 +460,14 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
     config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
+
+    /* On-screen expiry-countdown state (active only when `show_countdown` is
+     * enabled and the first line was displayed successfully): the line content
+     * is rebuilt in place every `COUNTDOWN_TICK_SECONDS` during the inter-poll
+     * sleep, padded to `countdown_width` so repaints fully overwrite. */
+    char countdown_buf[64];
+    size_t countdown_width = 0;
+    int countdown_shown = 0;
 
     /* Step 1: Parse module parameters from PAM configuration line */
     for (int i = 0; i < argc; i++) {
@@ -675,6 +748,30 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
+    /* Step 4c: Optionally start the on-screen device-code expiry countdown (RFC 8628
+     * encourages clients to show a visual timer based on `expires_in`). The line
+     * repaints in place during the inter-poll sleep; any display failure is
+     * non-fatal, because the countdown is informational and the text prompt above
+     * already carries the full instructions. */
+    if (cfg.show_countdown && pamh) {
+        if (render_countdown_line(expires_in, countdown_buf, sizeof(countdown_buf), 0) == 0) {
+            countdown_width = strlen(countdown_buf);
+            int cd_rc = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", countdown_buf);
+            if (cd_rc == PAM_ABORT) {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
+                              "Countdown display interrupted; aborting authentication");
+                retval = PAM_ABORT;
+                goto cleanup;
+            }
+            if (cd_rc == PAM_SUCCESS) {
+                countdown_shown = 1;
+            } else {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "Expiry countdown not displayed (conversation returned %d)", cd_rc);
+            }
+        }
+    }
+
     /* Step 5: Build token request body prior to entering polling loop */
     /*
      * Form-field table for the token request. Every append goes through
@@ -723,12 +820,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     int first_poll = 1;
     while (1) {
         if (!first_poll) {
-            struct timespec next_poll;
-            if (clock_gettime(CLOCK_MONOTONIC, &next_poll) != 0) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
                 pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
                 retval = PAM_SYSTEM_ERR;
                 goto cleanup;
             }
+            struct timespec next_poll = now;
             next_poll.tv_sec += interval;
 
             if (!timespec_before(&next_poll, &device_deadline)) {
@@ -737,23 +835,69 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                 break;
             }
 
-            int sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_poll, NULL);
-            if (sleep_rc == EINTR) {
-                /* A signal (e.g. user-initiated cancellation / SIGTERM) interrupted the poll
-                 * sleep. Resuming the loop would keep a possibly abandoned session blocking
-                 * the login; abort instead — all resources are reclaimed at `cleanup`. */
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
-                              "Polling interrupted by a signal; aborting device-authorization wait");
-                retval = PAM_ABORT;
-                goto cleanup;
-            }
+            /*
+             * Sleep until the next poll deadline. With the on-screen expiry
+             * countdown active the sleep is sliced into COUNTDOWN_TICK_SECONDS
+             * pieces so the remaining time repaints in place; otherwise it is a
+             * single uninterrupted sleep of the full interval. Only the sleep
+             * is sliced, so the token endpoint is never polled more frequently
+             * than the provider's `interval` allows.
+             */
+            const int sleep_chunk = countdown_shown ? COUNTDOWN_TICK_SECONDS : interval;
+            struct timespec wake_at = now;
+            do {
+                wake_at.tv_sec += sleep_chunk;
+                if (!timespec_before(&wake_at, &next_poll)) {
+                    wake_at = next_poll;
+                }
 
-            if (sleep_rc != 0) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Clock nanosleep failed with error %d",
-                              sleep_rc);
-                retval = PAM_SYSTEM_ERR;
-                goto cleanup;
-            }
+                int sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake_at, NULL);
+                if (sleep_rc == EINTR) {
+                    /* A signal (e.g. user-initiated cancellation / SIGTERM) interrupted the
+                     * poll sleep. Resuming the loop would keep a possibly abandoned session
+                     * blocking the login; abort instead — all resources are reclaimed at
+                     * `cleanup`. */
+                    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
+                                  "Polling interrupted by a signal; aborting device-authorization wait");
+                    retval = PAM_ABORT;
+                    goto cleanup;
+                }
+
+                if (sleep_rc != 0) {
+                    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                  "Clock nanosleep failed with error %d", sleep_rc);
+                    retval = PAM_SYSTEM_ERR;
+                    goto cleanup;
+                }
+
+                if (countdown_shown) {
+                    struct timespec tick_now;
+                    if (clock_gettime(CLOCK_MONOTONIC, &tick_now) != 0) {
+                        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
+                        retval = PAM_SYSTEM_ERR;
+                        goto cleanup;
+                    }
+                    long long remaining =
+                        (long long)device_deadline.tv_sec - (long long)tick_now.tv_sec +
+                        ((long long)device_deadline.tv_nsec - (long long)tick_now.tv_nsec) / 1000000000LL;
+                    if (remaining < 0) {
+                        remaining = 0;
+                    }
+                    if (remaining > 359999) {
+                        remaining = 359999;
+                    }
+                    if (render_countdown_line((int)remaining, countdown_buf, sizeof(countdown_buf), countdown_width) ==
+                        0) {
+                        int cd_rc = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", countdown_buf);
+                        if (cd_rc == PAM_ABORT) {
+                            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
+                                          "Countdown display interrupted; aborting authentication");
+                            retval = PAM_ABORT;
+                            goto cleanup;
+                        }
+                    }
+                }
+            } while (timespec_before(&wake_at, &next_poll));
         }
         first_poll = 0;
 
@@ -884,6 +1028,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                 break; /* Non-recoverable network error */
             }
         }
+    }
+
+    /* If the on-screen countdown has been repainting in place, advance to a fresh
+     * line so subsequent PAM conversation messages do not mix into it. */
+    if (countdown_shown && pamh) {
+        (void)pam_prompt(pamh, PAM_TEXT_INFO, NULL, "\n");
     }
 
     if (!access_token) {

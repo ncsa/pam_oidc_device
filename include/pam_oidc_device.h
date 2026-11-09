@@ -50,6 +50,15 @@
 /** @brief Maximum supported polling interval upper bound in seconds. */
 #define MAX_SUPPORTED_POLL_INTERVAL 120
 
+/**
+ * @brief Refresh period (seconds) for the on-screen device-code expiry countdown.
+ *
+ * Matches the RFC 8628 polling floor (`MIN_POLL_INTERVAL`) so the countdown
+ * repaint never wakes the poll loop more often than the token endpoint is
+ * actually polled; only the inter-poll sleep is sliced.
+ */
+#define COUNTDOWN_TICK_SECONDS 5
+
 /** @brief Maximum buffer capacity for custom initial user prompt templates. */
 #define MAX_INIT_MSG_LEN 1024
 
@@ -155,6 +164,10 @@ typedef struct {
     int claim_capture_group;                 /**< Regex capture group index to select username slice. */
     int max_poll_seconds;                    /**< Maximum total polling time allowed before timing out. */
     char init_message[MAX_INIT_MSG_LEN];     /**< Custom template string for user terminal prompt. */
+    int show_countdown;                      /**< Flag: 1 to display an on-screen "Code expires in MM:SS" countdown that
+                                              *  repaints in place every `COUNTDOWN_TICK_SECONDS` while waiting for the
+                                              *  device authorization (RFC 8628 encourages client-side expiry timers);
+                                              *  0 (default) disables it. */
     int case_sensitive;                      /**< Flag: 1 for case-sensitive username comparison, 0 otherwise. */
     loglevel_t loglevel; /**< Configured syslog verbosity level (none, error, info, debug, verbose). */
     char issuer[512];    /**< Expected token issuer claim (iss). */
@@ -519,6 +532,37 @@ int pkce_compute_s256_challenge(const char *verifier, char *out, size_t out_len)
  */
 int render_prompt_message(const config_t *cfg, const char *url, const char *url_complete, const char *code, char *out,
                           size_t out_len);
+
+/**
+ * @brief Formats a non-negative second count as a compact duration string.
+ *
+ * Uses "MM:SS" for durations under one hour and "H:MM:SS" for one hour or more,
+ * keeping the on-screen expiry countdown compact on the terminal.
+ *
+ * @param[in]  seconds Duration in seconds (0..359999).
+ * @param[out] out     Buffer receiving the formatted duration.
+ * @param[in]  out_len Destination buffer capacity in bytes (at least 8).
+ * @return 0 on success, -1 on invalid input or buffer overflow.
+ */
+int format_time_remaining(int seconds, char *out, size_t out_len);
+
+/**
+ * @brief Renders one on-screen expiry-countdown line for in-place terminal repainting.
+ *
+ * The line starts with a carriage return ("\r") so each redraw overwrites the
+ * current terminal line without scrolling, and is space-padded to `padded_width`
+ * so a shorter remaining time fully overwrites the previous, longer one. Content
+ * is a module-static template plus a local time string (no provider or user data),
+ * so no terminal-injection validation applies.
+ *
+ * @param[in]  remaining_sec Seconds remaining until the device code expires.
+ * @param[out] out           Buffer receiving the rendered line.
+ * @param[in]  out_len       Destination buffer capacity in bytes.
+ * @param[in]  padded_width  Total width to pad with spaces (0 = no padding; normally
+ *                           the width of the initial countdown line).
+ * @return 0 on success, -1 on invalid input or buffer overflow.
+ */
+int render_countdown_line(int remaining_sec, char *out, size_t out_len, size_t padded_width);
 
 /**
  * @brief Matches raw identity claim value against expected PAM username using regex mapping rules.

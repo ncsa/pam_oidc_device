@@ -967,6 +967,7 @@ static void init_config_defaults(config_t *cfg) {
     (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
     cfg->claim_capture_group = 1;
     cfg->max_poll_seconds = 300;
+    cfg->show_countdown = 0;
     cfg->case_sensitive = 1;
     cfg->loglevel = LOGLEVEL_INFO;
     cfg->verify_jwt_claims = 0;
@@ -1110,6 +1111,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "group_claim_field = roles\n"
                                     "[prompt]\n"
                                     "init_message = Code: %s\n"
+                                    "show_countdown = yes\n"
                                     "[runtime]\n"
                                     "max_poll_seconds = 60\n"
                                     "loglevel = verbose\n"
@@ -1146,6 +1148,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.enforce_groups, 1);
     assert_string_equal(cfg.group_claim_field, "roles");
     assert_string_equal(cfg.init_message, "Code: %s");
+    assert_int_equal(cfg.show_countdown, 1);
     assert_int_equal(cfg.max_poll_seconds, 60);
     assert_int_equal(cfg.loglevel, LOGLEVEL_VERBOSE);
     assert_int_equal(cfg.verify_jwt_claims, 1);
@@ -1159,6 +1162,127 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.qr_scale, 2);
     assert_int_equal(cfg.qr_ec_level, QR_EC_HIGH);
     assert_int_equal(cfg.qr_uri_complete, 0);
+}
+
+/**
+ * @brief Unit test verifying [prompt] `show_countdown` parsing, default, and validation.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_show_countdown(void **state) {
+    (void)state;
+    char text[1024];
+    config_t cfg;
+    FILE *f;
+
+    const char *prefix = "[oauth]\n"
+                         "client_id = ci\n"
+                         "device_authorization_endpoint = https://idp.example.com/device\n"
+                         "token_endpoint = https://idp.example.com/token\n"
+                         "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                         "[prompt]\n";
+
+    /* Accepted boolean forms. */
+    snprintf(text, sizeof(text), "%sshow_countdown = true\n", prefix);
+    init_config_defaults(&cfg);
+    f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.show_countdown, 1);
+
+    snprintf(text, sizeof(text), "%sshow_countdown = no\n", prefix);
+    init_config_defaults(&cfg);
+    f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.show_countdown, 0);
+
+    /* Absent key keeps the disabled default. */
+    snprintf(text, sizeof(text), "%s", prefix);
+    init_config_defaults(&cfg);
+    f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.show_countdown, 0);
+
+    /* Invalid boolean value. */
+    snprintf(text, sizeof(text), "%sshow_countdown = banana\n", prefix);
+    init_config_defaults(&cfg);
+    f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+
+    /* Duplicate key. */
+    snprintf(text, sizeof(text), "%sshow_countdown = true\nshow_countdown = false\n", prefix);
+    init_config_defaults(&cfg);
+    f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+}
+
+/**
+ * @brief Unit test verifying compact duration formatting for the expiry countdown.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_format_time_remaining(void **state) {
+    (void)state;
+    char buf[16];
+
+    assert_int_equal(format_time_remaining(0, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "00:00");
+    assert_int_equal(format_time_remaining(5, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "00:05");
+    assert_int_equal(format_time_remaining(300, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "05:00");
+    assert_int_equal(format_time_remaining(3599, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "59:59");
+    assert_int_equal(format_time_remaining(3600, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "1:00:00");
+    assert_int_equal(format_time_remaining(3661, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "1:01:01");
+    assert_int_equal(format_time_remaining(359999, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "99:59:59");
+
+    /* Invalid inputs. */
+    assert_int_equal(format_time_remaining(-1, buf, sizeof(buf)), -1);
+    assert_int_equal(format_time_remaining(360000, buf, sizeof(buf)), -1);
+    assert_int_equal(format_time_remaining(5, NULL, sizeof(buf)), -1);
+    assert_int_equal(format_time_remaining(5, buf, 7), -1);
+}
+
+/**
+ * @brief Unit test verifying in-place repaint rendering of the expiry countdown line.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_render_countdown_line(void **state) {
+    (void)state;
+    char buf[64];
+
+    /* Base line is carriage-return prefixed so it repaints the terminal in place. */
+    assert_int_equal(render_countdown_line(300, buf, sizeof(buf), 0), 0);
+    assert_string_equal(buf, "\rCode expires in 05:00");
+
+    /* Padding to a fixed width so shorter times fully overwrite longer ones. */
+    assert_int_equal(render_countdown_line(45, buf, sizeof(buf), 24), 0);
+    assert_string_equal(buf, "\rCode expires in 00:45  ");
+    assert_int_equal((int)strlen(buf), 24);
+
+    /* H:MM:SS rendering for expiries of one hour or more. */
+    assert_int_equal(render_countdown_line(3600, buf, sizeof(buf), 0), 0);
+    assert_string_equal(buf, "\rCode expires in 1:00:00");
+
+    /* Invalid inputs. */
+    assert_int_equal(render_countdown_line(-1, buf, sizeof(buf), 0), -1);
+    assert_int_equal(render_countdown_line(300, NULL, sizeof(buf), 0), -1);
+    assert_int_equal(render_countdown_line(300, buf, 0, 0), -1);
+    assert_int_equal(render_countdown_line(300, buf, 4, 0), -1);
 }
 
 /**
@@ -1985,6 +2109,9 @@ int main(void) {
         cmocka_unit_test(test_verify_group_membership_lists),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
         cmocka_unit_test(test_parse_config_file_full_sections),
+        cmocka_unit_test(test_parse_config_file_show_countdown),
+        cmocka_unit_test(test_format_time_remaining),
+        cmocka_unit_test(test_render_countdown_line),
         cmocka_unit_test(test_parse_config_file_missing_required),
         cmocka_unit_test(test_parse_config_file_duplicate_key),
         cmocka_unit_test(test_parse_config_file_key_before_section),

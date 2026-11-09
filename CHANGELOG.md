@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Features
+- **On-screen device-code expiry countdown:** New optional `show_countdown = true` setting in the `[prompt]` section makes the module keep a "Code expires in MM:SS" line on the SSH terminal while it waits for the device authorization (RFC 8628 encourages client-side expiry timers based on `expires_in`). The line repaints in place — a carriage-return overwrite of the same terminal line, refreshed every 5 s and space-padded so shorter times fully overwrite longer ones — instead of printing a new line per update, and a terminating newline is emitted when polling ends. The countdown is derived from the provider `expires_in` (capped by `max_poll_seconds`); enabling it only slices the inter-poll sleep, so the token endpoint is never polled more frequently than the provider's `interval` allows. Disabled by default (`false`); display failures are non-fatal, and an interrupted display aborts with `PAM_ABORT` like other conversation failures.
+
 ### Security
 - **Root default-deny (F-2):** The `root` account is now denied authentication by default with `PAM_PERM_DENIED`. Set `allow_root = true` in the `[access]` section to explicitly permit root; the check is independent of `allow_users`/`deny_users`, so listing `root` in `allow_users` alone no longer grants root access.
 - **Robust polling deadline & interrupt handling (F-6/F-8):** The poll loop now compares full `timeval` deadlines (sec + nsec) instead of seconds only, and a signaled sleep (`EINTR`) is no longer silently resumed — it logs the interruption, returns `PAM_ABORT`, and aborts the authentication attempt.

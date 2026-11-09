@@ -117,7 +117,75 @@
   string/char literals, strip comments, delete all whitespace) — immune to clang-format
   version skew (local 19 vs CI 18) and whitespace churn.
 
+- **In-place terminal repaints via PAM conversation:** PAM_TEXT_INFO/PROMPT messages are
+  written verbatim to the caller's channel (no buffering/newline added), so a line can be
+  repainted in place by prefixing `\r` and space-padding to the width of the FIRST render
+  (`render_countdown_line`, the `[prompt] show_countdown` feature, 2026-11-08). Always emit
+  a terminating `\n` via PAM_TEXT_INFO after the repaint session ends, or the next PAM
+  message collides with the stale line. To refresh a UI more often than the provider
+  poll interval without violating RFC 8628, slice only the inter-poll `clock_nanosleep`
+  (chunks of `COUNTDOWN_TICK_SECONDS` == `MIN_POLL_INTERVAL`); never poll the token
+  endpoint more frequently than the provider's `interval`.
+- **RPM tarball packages the working tree:** `make rpm`'s source tarball includes stale
+  `src/*.o` left by earlier local/CI builds; a newer `.o` than its `.c` makes rpmbuild
+  `%build` skip recompilation and `%check` link the wrong-toolchain objects (symptom:
+  `undefined reference to '__isoc23_strtol'` + DWARF FORM 0x25 errors on EL9 aarch64).
+  Run `make clean` (and `rm -rf rpmbuild`) before mirroring the rpm gate locally.
+
 ## Interaction Log (newest first)
+
+### 2026-11-08 — RFC 8628 on-screen expiry countdown (`[prompt] show_countdown`)
+- **Task:** Feature request: visually show remaining device-code expiry on the SSH
+  terminal, optionally configured, updating every few seconds IN PLACE (no new line per
+  update) — RFC 8628 encourages client-side countdowns from `expires_in`.
+- **Decisions & Rationale:**
+  - New `[prompt]` boolean key `show_countdown` (default `false`), parsed via `parse_bool`
+    with duplicate-key tracking like every other key.
+  - Line format `\rCode expires in MM:SS` (`H:MM:SS` ≥ 1 h), rendered by new public helpers
+    `format_time_remaining()` / `render_countdown_line()` in `src/pam_module.c` (public so
+    CMocka can reach them — the test TU links the .o's, not the .c). Module-static template
+    + local time only → no provider/user data, so no `is_safe_terminal_string` needed.
+  - In-place repaint: `\r` prefix + space padding to the first render's width (fixed for the
+    session because remaining only decreases and MM:SS↔H:MM:SS can't widen).
+  - Refresh cadence: the inter-poll sleep is sliced into `COUNTDOWN_TICK_SECONDS` (5 s)
+    `clock_nanosleep` chunks that repaint after each wake; the HTTP poll still happens once
+    per provider `interval`, so no extra load. When disabled, it's a single sleep exactly as
+    before (chunk == interval).
+  - Initial paint right after the main prompt (Step 4c); `PAM_ABORT` on interrupted
+    conversation aborts; other display failures are non-fatal (informational line).
+  - A single terminating `\n` (PAM_TEXT_INFO) is emitted after the poll loop when the
+    countdown was shown, so later PAM messages start on a fresh line.
+  - Remaining time is recomputed from the monotonic `device_deadline` (never wall clock);
+    clamped to [0, 359999].
+- **Gotchas & Lessons:**
+  - Trailing-space assertions are a footgun: the test literal must have exactly 2 spaces to
+    match width 24 ("\rCode expires in 00:45  ") — first container run failed
+    `test_render_countdown_line` because the literal had 3 spaces; verify such lines with
+    `od -c`, not by eyeballing.
+  - Stale `src/*.o` in the tree were packaged into the local RPM tarball → `%check` linked
+    Ubuntu-clang objects under EL9 gcc (`__isoc23_strtol` undefined). `make clean` +
+    `rm -rf rpmbuild` before the rpm gate; base-commit worktree proved it environmental.
+  - macOS ASan binaries built with the local toolchain hang at startup (ld dylib-version
+    mismatch warning) — don't use ASan for local macOS smoke checks; the Linux sanitizer
+    gate is authoritative.
+- **Verification (all in `ubuntu:24.04` / `rockylinux/rockylinux:9` aarch64 containers
+  mirroring CI; native macOS PAM build is not possible):**
+  - `make CC=gcc` + `make test CC=gcc` → 54/54 PASS (3 new tests:
+    `test_parse_config_file_show_countdown`, `test_format_time_remaining`,
+    `test_render_countdown_line`; `test_parse_config_file_full_sections` extended).
+  - `make CC=clang` + `make test CC=clang` → 54/54 PASS.
+  - `clang-tidy src/*.c -- -Iinclude -D_GNU_SOURCE` clean; `clang-format --dry-run
+    --Werror src/*.c include/*.h tests/*.c` clean; cppcheck + flawfinder clean.
+  - `make test-sanitize CC=clang` → 54/54 PASS under ASan/UBSan/LSan.
+  - EL9 `make rpm` (incl. `%check`) + `dnf localinstall` → `.so` + `.conf` verified.
+  - **Still CI-only:** EL8 + EL10 rpm matrix, ubuntu-latest (x86_64) lint/build jobs,
+    and real-terminal behavior of the `\r` repaint under an actual sshd session (byte-level
+    behavior is unit-tested; PTY rendering itself is not).
+- **Follow-ups / Open Items:** nothing blocking. Possible future work: configurable
+  countdown refresh period, alternate wording, or a progress-bar style — keep any change
+  to the line format in sync with `test_render_countdown_line`.
+
+### 2026-11-08 — CI `zbarimg` PNG rejection → PGM switch; found & fixed vertical-raster truncation bug
 
 ### 2026-11-08 — CI `zbarimg` PNG rejection → PGM switch; found & fixed vertical-raster truncation bug
 - **Task:** CI (ubuntu-latest, `zbar-tools`) failed `test_qr_scan_roundtrip`:
