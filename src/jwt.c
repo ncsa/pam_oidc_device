@@ -330,7 +330,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
                         } else if (json_object_is_type(j_aud, json_type_array)) {
                             size_t array_len = json_object_array_length(j_aud);
                             for (size_t i = 0; i < array_len; i++) {
-                                struct json_object *item = json_object_array_get_idx(j_aud, i);
+                                struct json_object *item = json_object_array_get_idx(j_aud, (int)i);
                                 if (item && json_object_is_type(item, json_type_string) &&
                                     strcmp(json_object_get_string(item), expected_aud) == 0) {
                                     aud_valid = 1;

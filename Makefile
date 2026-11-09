@@ -34,7 +34,7 @@ SAN_FLAGS  = -fsanitize=address -fsanitize=undefined -fsanitize=leak -fno-omit-f
 SAN_RUNNER = build/sanitize/runner
 
 TARGET = $(NAME).so
-OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pkce.o src/pam_module.o
+OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pkce.o src/qr.o third_party/qrcodegen/qrcodegen.o src/pam_module.o
 CONFIG_DEFAULT = config/$(NAME).conf
 
 PAM_DIR ?= /lib64/security
@@ -55,6 +55,12 @@ lint:
 src/%.o: src/%.c
 	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+# Vendored third-party code (Nayuki QR Code generator) is kept outside src/ so it
+# is not subject to the project's lint/static-analysis gates; it is still
+# compiled with the full warning CFLAGS.
+third_party/qrcodegen/%.o: third_party/qrcodegen/%.c
+	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 $(TARGET): $(OBJS)
 	$(CC) -shared $(LDFLAGS) -o $@ $^ $(LIBS)
 
@@ -62,7 +68,7 @@ sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -fPIC -shared -Wall -Wextra -g \
 		-fsanitize=address -fsanitize=undefined -fsanitize=leak \
-		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/pam_module.c $(LIBS)
+		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c $(LIBS)
 
 test: $(OBJS)
 	$(CC) $(CPPFLAGS) -Wall -Wextra -g tests/test_suite.c $(OBJS) \
@@ -84,7 +90,7 @@ test: $(OBJS)
 test-sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -Wall -Wextra -g $(SAN_FLAGS) \
-		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/pam_module.c \
+		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c \
 		-o $(SAN_RUNNER) -lcmocka $(LIBS)
 	ASAN_OPTIONS=detect_leaks=1 \
 	LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp \
@@ -104,13 +110,13 @@ uninstall:
 	rm -f $(DESTDIR)$(PAM_DIR)/$(TARGET)
 
 clean:
-	rm -f src/*.o $(TARGET) tests/runner
+	rm -f src/*.o third_party/qrcodegen/*.o $(TARGET) tests/runner
 	rm -rf build/ rpmbuild/
 
 rpm:
 	mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 	tar --transform 's,^,$(NAME)-$(VERSION)/,' -czf rpmbuild/SOURCES/$(NAME)-$(VERSION).tar.gz \
-		src include config packaging Makefile README.md LICENSE SECURITY.md CHANGELOG.md tests
+		src include third_party config packaging Makefile README.md LICENSE SECURITY.md CHANGELOG.md tests
 	cp packaging/$(NAME).spec rpmbuild/SPECS/
 	python3 packaging/gen-changelog.py CHANGELOG.md include/metadata.h >> rpmbuild/SPECS/$(NAME).spec
 	rpmbuild --define "_topdir $(CURDIR)/rpmbuild" \

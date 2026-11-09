@@ -101,7 +101,65 @@
 
 ---
 
+- **Vendored third-party C lives in `third_party/`, never in `src/`/`include/`:** CI
+  clang-tidy gates `src/*.c` (and cppcheck/flawfinder `src/`) with `WarningsAsErrors: '*'`;
+  unmodified third-party code there will fail the gate. The Makefile needs a matching
+  pattern rule for `third_party/.../*.o` and the rpm tarball file list must include
+  `third_party` (see the `third_party/qrcodegen/` precedent, 2026-11-08).
+
 ## Interaction Log (newest first)
+
+### 2026-11-08 — Terminal QR rendering wrap-up: stub fidelity, vendored-code placement, gate warnings
+- **Task:** Final pass on the QR terminal-rendering branch (`wglick/qr-terminal`): make the
+  macOS verification stubs faithful to the real libraries, resolve every remaining
+  `-Wconversion`/clang-tidy gate failure in project code, and get the vendored QR encoder
+  out of the CI clang-tidy scope.
+- **Decisions & Rationale:**
+  - Verified real json-c signatures against upstream `json_object.h`/`json_tokener.h`/
+    `json_types.h`: read accessors take `const struct json_object *`, **but**
+    `json_object_put(struct json_object *)` (returns `int`) and
+    `json_object_get_string(struct json_object *)` take **non-const**;
+    `json_object_array_get_idx` takes `int`; `get_int`→`int32_t`, `get_int64`→`int64_t`.
+    `build/verify/stubs/json-c/json.h` + `stub_runtime.c` now mirror this exactly; all
+    module call sites already pass non-const locals, so no const-removal was needed in `src/`.
+  - Verified real libcurl: the slist API is `struct curl_slist *` (there is **no**
+    `curl_slist` typedef) — the old stub invented one; fixed the stub, module code was right.
+  - Moved the vendored Nayuki encoder to `third_party/qrcodegen/{qrcodegen.c,qrcodegen.h}`
+    with a local `.clang-tidy` (`Checks: ''`), a new Makefile pattern rule, updated
+    `OBJS`/sanitize/test-sanitize source lists, `clean`, and the rpm tarball file list
+    (added `third_party`). Reason: CI clang-tidy gates `src/*.c` with
+    `WarningsAsErrors: '*'` and the unmodified third-party file produced ~100 findings.
+  - `pkce.c`: `B64URL_ALPHABET[64]` → `[65]` (64 chars + NUL) — unterminated-string
+    initializer warning.
+  - Four `json_object_array_get_idx()` call sites (http.c discovery probe,
+    `secure_zero_json_tree`, identity group loop, jwt aud loop) now cast the `size_t`
+    loop index to `int` to match the real json-c parameter type under `-Wconversion`.
+  - Fixed clang-tidy gate failures in project code: `readability-math-missing-parentheses`
+    in `QR_MATRIX_BYTES_MAX` (`include/pam_oidc_device.h`), `QR_LINE_BUF_MAX` and
+    `size + 2 * QR_QUIET_ZONE` (`src/qr.c`); `readability-uppercase-literal-suffix`
+    (`0x21U`/`0x7EU`) in `src/config.c` + `src/qr.c`.
+  - Stub `json_object_object_foreachC` now assigns `iter.key/iter.val` up front (the real
+    macro assigns them each iteration) to kill a clang-analyzer uninitialized-value
+    false positive on `secure_zero_json_tree`.
+  - Stub `cmocka.h` assert macros use a `_cm_norm()` helper (string literals in boolean
+    context triggered `-Wstring-conversion`); stub `EVP_DigestInit_ex`/`RAND_bytes`
+    signatures match the vendored OpenSSL 1.1-era headers in `build/verify/inc`.
+- **Gotchas & Lessons:**
+  - `build/verify` stubs are only as good as their fidelity to the *actual* library
+    headers — a stub typedef/const mismatch creates phantom warnings (or hides real ones).
+    Always diff against upstream headers before trusting a clean stub build.
+  - Vendor third-party C under `third_party/`, never in `src/`: the clang-tidy/cpplint
+    gates are scoped to `src/*.c` precisely so project code stays strictly linted.
+- **Verification:** LOCAL (macOS, stub-based — NOT the Linux gates): all 8 project TUs +
+  vendored qrcodegen compile clean under
+  `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wformat-security -O2 -Werror`;
+  `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` clean; local clang-tidy
+  proxy over `src/*.c` (stub includes) reports zero errors; QR-filtered CMocka run passes
+  5/5 (config parsing, matrix render, URI encode, verification-code render, UTF-8 golden).
+  STILL REQUIRED on Linux: `make lint`, `make CC=gcc`/`make CC=clang` + `make test` for
+  both compilers, `make test-sanitize CC=clang`, and the EL8/EL9/EL10 `make rpm` job.
+- **Follow-ups / Open Items:** push `wglick/qr-terminal` so the authoritative CI gates run;
+  no open code items.
 
 ### 2026-11-07 — CI clang-format gate: anonymous fnptr type-id in `va_arg` (version skew fix)
 - **Task:** CI `formatting` job failed `clang-format --dry-run --Werror` at `tests/test_suite.c:93`

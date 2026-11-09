@@ -1,7 +1,7 @@
 /**
  * @file test_suite.c
  * @brief CMocka unit test suite covering configuration parsing, log level evaluation, claim mapping, sanitization,
- * prompt rendering, error handling, and local JWT token metadata verification.
+ * prompt rendering, terminal QR code encoding/rendering, error handling, and local JWT token metadata verification.
  *
  * Exercises unit test cases for core module subroutines including cURL parameter encoding,
  * log level parsing, OpenID identity claim verification, terminal injection sanitization,
@@ -972,6 +972,13 @@ static void init_config_defaults(config_t *cfg) {
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
+    /* Keep in sync with load_config() defaults. */
+    cfg->qr_enabled = 0;
+    cfg->qr_style = QR_STYLE_UTF8;
+    (void)copy_checked(cfg->qr_block_char, sizeof(cfg->qr_block_char), "#");
+    cfg->qr_scale = 1;
+    cfg->qr_ec_level = QR_EC_MEDIUM;
+    cfg->qr_uri_complete = 1;
 }
 
 /**
@@ -1015,6 +1022,13 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.loglevel, LOGLEVEL_INFO);
     assert_string_equal(cfg.group_claim_field, "groups");
     assert_int_equal(cfg.use_pkce, 0);
+    /* QR defaults preserved when the [qr] section is absent. */
+    assert_int_equal(cfg.qr_enabled, 0);
+    assert_int_equal(cfg.qr_style, QR_STYLE_UTF8);
+    assert_string_equal(cfg.qr_block_char, "#");
+    assert_int_equal(cfg.qr_scale, 1);
+    assert_int_equal(cfg.qr_ec_level, QR_EC_MEDIUM);
+    assert_int_equal(cfg.qr_uri_complete, 1);
 }
 
 /**
@@ -1097,7 +1111,14 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "init_message = Code: %s\n"
                                     "[runtime]\n"
                                     "max_poll_seconds = 60\n"
-                                    "loglevel = verbose\n";
+                                    "loglevel = verbose\n"
+                                    "[qr]\n"
+                                    "enabled = yes\n"
+                                    "style = ascii\n"
+                                    "block_char = @\n"
+                                    "scale = 2\n"
+                                    "ec_level = h\n"
+                                    "uri = plain\n";
     config_t cfg;
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(text);
@@ -1131,6 +1152,12 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.require_exp_claim, 0);
     assert_int_equal(cfg.use_pkce, 1);
     assert_string_equal(cfg.discovery_endpoint, "https://idp.example.com/.well-known/openid-configuration");
+    assert_int_equal(cfg.qr_enabled, 1);
+    assert_int_equal(cfg.qr_style, QR_STYLE_ASCII);
+    assert_string_equal(cfg.qr_block_char, "@");
+    assert_int_equal(cfg.qr_scale, 2);
+    assert_int_equal(cfg.qr_ec_level, QR_EC_HIGH);
+    assert_int_equal(cfg.qr_uri_complete, 0);
 }
 
 /**
@@ -1529,12 +1556,294 @@ static void test_discovery_json_advertises_s256(void **state) {
     assert_int_equal(discovery_json_advertises_s256(NULL), 0);
 }
 
+/** Minimal [oauth] section accepted by parse_config_file, used to append [qr] keys under test. */
+#define QR_TEST_BASE_CONF                                                                                              \
+    "[oauth]\n"                                                                                                        \
+    "client_id = ci\n"                                                                                                 \
+    "device_authorization_endpoint = https://idp.example.com/device\n"                                                 \
+    "token_endpoint = https://idp.example.com/token\n"                                                                 \
+    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+
+/**
+ * @brief Unit test for [qr] section configuration parsing (valid values, rejections, duplicates).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_config_parsing(void **state) {
+    (void)state;
+    config_t cfg;
+    char text[1024];
+
+    /* A fully populated [qr] section (case-insensitive values). */
+    snprintf(text, sizeof(text),
+             QR_TEST_BASE_CONF "[qr]\n"
+                               "enabled = yes\n"
+                               "style = UTF8\n"
+                               "block_char = x\n"
+                               "scale = 3\n"
+                               "ec_level = q\n"
+                               "uri = Complete\n");
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.qr_enabled, 1);
+    assert_int_equal(cfg.qr_style, QR_STYLE_UTF8);
+    assert_string_equal(cfg.qr_block_char, "x");
+    assert_int_equal(cfg.qr_scale, 3);
+    assert_int_equal(cfg.qr_ec_level, QR_EC_QUARTILE);
+    assert_int_equal(cfg.qr_uri_complete, 1);
+
+    /* Every malformed or duplicated [qr] entry must fail the whole parse. */
+    static const char *const bad_entries[] = {
+        "enabled = maybe\n", "style = unicode\n", "style = utf8x\n", "block_char = ab\n",
+        "block_char = \n",   "scale = 0\n",       "scale = 4\n",     "scale = 2x\n",
+        "ec_level = x\n",    "ec_level = MM\n",   "uri = both\n",    "enabled = true\nenabled = false\n",
+        "foo = 1\n",
+    };
+    for (size_t i = 0; i < sizeof(bad_entries) / sizeof(bad_entries[0]); i++) {
+        snprintf(text, sizeof(text), QR_TEST_BASE_CONF "[qr]\n%s", bad_entries[i]);
+        memset(&cfg, 0, sizeof(cfg));
+        f = open_config_stream(text);
+        assert_non_null(f);
+        assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+        fclose(f);
+    }
+}
+/**
+ * @brief Unit test for qr_render_matrix: quiet zone, ASCII/UTF-8 styles, scaling, error paths.
+ *
+ * The fixture is a synthetic all-dark 21x21 symbol so the expected terminal art is hand-computable;
+ * encode-then-render correctness is covered separately by the golden output test and by
+ * independent QR decoding of the rendered art (see build/verify/qr_verify.py).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_render_matrix(void **state) {
+    (void)state;
+    /* All-dark 21x21 symbol: byte 0 stores the symbol size (21), module bits 0..440 set. */
+    uint8_t m[57];
+    m[0] = 21;
+    memset(m + 1, 0xFF, 55);
+    m[56] = 0x01;
+
+    char out[16384];
+    char expect[16384];
+
+    /* ASCII style, scale 1, both block characters. */
+    for (int blk = 0; blk < 2; blk++) {
+        char block = (char)(blk ? '@' : '#');
+        size_t pos = 0;
+        for (int y = 0; y < 29; y++) {
+            for (int x = 0; x < 29; x++) {
+                int dark = (y >= 4 && y < 25) && (x >= 4 && x < 25);
+                expect[pos++] = (char)(dark ? block : ' ');
+            }
+            expect[pos++] = '\n';
+        }
+        expect[pos] = '\0';
+        assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, block, out, sizeof(out)), 0);
+        assert_string_equal(out, expect);
+    }
+
+    /* ASCII style, scale 2: every glyph duplicated horizontally and vertically. */
+    size_t pos = 0;
+    for (int y = 0; y < 29; y++) {
+        for (int rep = 0; rep < 2; rep++) {
+            for (int x = 0; x < 29; x++) {
+                int dark = (y >= 4 && y < 25) && (x >= 4 && x < 25);
+                expect[pos++] = (char)(dark ? '#' : ' ');
+                expect[pos++] = (char)(dark ? '#' : ' ');
+            }
+            expect[pos++] = '\n';
+        }
+    }
+    expect[pos] = '\0';
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 2, '#', out, sizeof(out)), 0);
+    assert_string_equal(out, expect);
+
+    /* UTF-8 style, scale 1: stacked module pairs become block glyphs. */
+    pos = 0;
+    for (int y = 0; y < 29; y += 2) {
+        for (int x = 0; x < 29; x++) {
+            int top = (y >= 4 && y < 25) && (x >= 4 && x < 25);
+            int bot = (y + 1 < 29) && (y + 1 >= 4 && y + 1 < 25) && (x >= 4 && x < 25);
+            if (top && bot) {
+                memcpy(expect + pos, "\342\226\210", 3); /* U+2588 */
+                pos += 3;
+            } else if (top) {
+                memcpy(expect + pos, "\342\226\200", 3); /* U+2580 */
+                pos += 3;
+            } else if (bot) {
+                memcpy(expect + pos, "\342\226\204", 3); /* U+2584 */
+                pos += 3;
+            } else {
+                expect[pos++] = ' ';
+            }
+        }
+        expect[pos++] = '\n';
+    }
+    expect[pos] = '\0';
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', out, sizeof(out)), 0);
+    assert_string_equal(out, expect);
+
+    /* Error paths. */
+    assert_int_equal(qr_render_matrix(m, 20, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 99, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 0, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 4, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, ' ', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '\033', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, (qr_style_t)9, 1, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', out, 4), -1);
+    assert_int_equal(qr_render_matrix(NULL, 21, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', NULL, sizeof(out)), -1);
+}
+/**
+ * @brief Unit test for qr_encode_uri: version sizing, error-correction scaling, determinism, errors.
+ *
+ * The version sizes are the ISO/IEC 18004 byte-mode capacities for the fixed test URLs
+ * (44 bytes at 25/33/37 modules, 13 bytes at 25 modules); encode-then-decode correctness of
+ * the underlying encoder is verified independently in build/verify/qr_verify.py.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_encode_uri(void **state) {
+    (void)state;
+    uint8_t qr[QR_MATRIX_BYTES_MAX];
+    uint8_t qr2[QR_MATRIX_BYTES_MAX];
+    int size = 0;
+
+    assert_int_equal(qr_encode_uri("https://ex.io/d", QR_EC_MEDIUM, qr, sizeof(qr), &size), 0);
+    assert_int_equal(size, 25);
+
+    const char *const url = "https://auth.example.edu/link?code=WXYZ-9012";
+    int s_l = 0, s_m = 0, s_h = 0;
+    assert_int_equal(qr_encode_uri(url, QR_EC_LOW, qr, sizeof(qr), &s_l), 0);
+    assert_int_equal(qr_encode_uri(url, QR_EC_MEDIUM, qr, sizeof(qr), &s_m), 0);
+    assert_int_equal(qr_encode_uri(url, QR_EC_HIGH, qr, sizeof(qr), &s_h), 0);
+    assert_int_equal(s_l, 29);
+    assert_int_equal(s_m, 33);
+    assert_int_equal(s_h, 37);
+    assert_true(s_l <= s_m && s_m <= s_h);
+
+    /* Determinism: identical inputs produce identical module grids. */
+    int s2 = 0;
+    assert_int_equal(qr_encode_uri(url, QR_EC_MEDIUM, qr, sizeof(qr), &s_m), 0);
+    assert_int_equal(qr_encode_uri(url, QR_EC_MEDIUM, qr2, sizeof(qr2), &s2), 0);
+    assert_int_equal(s2, s_m);
+    assert_memory_equal(qr, qr2, ((size_t)s_m * (size_t)s_m) / 8);
+
+    /* A URL beyond version-20 byte capacity at any EC level must fail cleanly. */
+    char big[1501];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    assert_int_equal(qr_encode_uri(big, QR_EC_MEDIUM, qr, sizeof(qr), &size), -1);
+    assert_int_equal(size, 0);
+
+    /* Argument validation. */
+    assert_int_equal(qr_encode_uri(NULL, QR_EC_MEDIUM, qr, sizeof(qr), &size), -1);
+    assert_int_equal(qr_encode_uri("", QR_EC_MEDIUM, qr, sizeof(qr), &size), -1);
+    assert_int_equal(qr_encode_uri(url, (qr_ec_t)QR_EC_HIGH + 1, qr, sizeof(qr), &size), -1);
+    uint8_t small[QR_MATRIX_BYTES_MAX - 1];
+    assert_int_equal(qr_encode_uri(url, QR_EC_MEDIUM, small, sizeof(small), &size), -1);
+    assert_int_equal(qr_encode_uri(url, QR_EC_MEDIUM, qr, sizeof(qr), NULL), -1);
+}
+/**
+ * @brief Unit test for qr_render_verification_code: URI selection, styles, safety, error paths.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_render_verification_code(void **state) {
+    (void)state;
+    config_t cfg;
+    char out[QR_RENDER_BUF_MAX];
+    char out2[QR_RENDER_BUF_MAX];
+    const char *const url_plain = "https://auth.example.edu/device";
+    const char *const url_complete = "https://auth.example.edu/link?code=WXYZ-9012";
+
+    init_config_defaults(&cfg);
+    /* Complete URI preferred; UTF-8 art must carry block glyphs and the instruction header. */
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, url_complete, out, sizeof(out), NULL),
+                     0);
+    assert_int_equal(strncmp(out, "Scan this QR code", 17), 0);
+    assert_non_null(strstr(out, "\342\226\210"));
+    /* Plain URI (complete unavailable) must differ from the complete-URI symbol. */
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out2, sizeof(out2), NULL), 0);
+    assert_string_not_equal(out, out2);
+    /* uri=plain must select the plain URI even when the complete one is available. */
+    cfg.qr_uri_complete = 0;
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, url_complete, out, sizeof(out), NULL),
+                     0);
+    assert_string_equal(out, out2);
+
+    /* ASCII style at scale 3: output must be pure printable ASCII plus newlines. */
+    cfg.qr_uri_complete = 1;
+    cfg.qr_style = QR_STYLE_ASCII;
+    cfg.qr_scale = 3;
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, url_complete, out, sizeof(out), NULL),
+                     0);
+    for (size_t i = 0; out[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)out[i];
+        assert_true(c == ' ' || c == '\n' || (c >= 0x21u && c <= 0x7Eu));
+    }
+
+    /* Argument / capacity validation. */
+    assert_int_equal(qr_render_verification_code(NULL, LOGLEVEL_DEBUG, url_plain, NULL, out, sizeof(out), NULL), -1);
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, "", NULL, out, sizeof(out), NULL), -1);
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, 16, NULL), -1);
+}
+/**
+ * @brief Unit test pinning the exact UTF-8 terminal rendering of a fixed verification URI.
+ *
+ * The golden output was generated by this module and cross-checked by an independent QR
+ * decoder (ZXing, see build/verify/qr_verify.py); it guards the encoder + renderer against
+ * regressions in glyph mapping, quiet zone, ordering, and header formatting.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_qr_render_golden_utf8(void **state) {
+    (void)state;
+    config_t cfg;
+    char out[QR_RENDER_BUF_MAX];
+    init_config_defaults(&cfg);
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, "https://auth.example.edu/device",
+                                                 "https://auth.example.edu/link?code=WXYZ-9012", out, sizeof(out),
+                                                 NULL),
+                     0);
+    static const char *const golden = "Scan this QR code with your phone's camera to open the verification page:\n"
+                                      "                                         \n"
+                                      "                                         \n"
+                                      "    █▀▀▀▀▀█  ▀█ ▀██▄▄█▀▀▀ ▄▀▄ █▀▀▀▀▀█    \n"
+                                      "    █ ███ █ █  ▄ ▀▄ ▄▀▀██▄▄█▄ █ ███ █    \n"
+                                      "    █ ▀▀▀ █ █▄▀▀▄█▄█▄ ▀ ▄█▄ █ █ ▀▀▀ █    \n"
+                                      "    ▀▀▀▀▀▀▀ █ █ ▀ █▄▀ ▀ ▀▄█▄█ ▀▀▀▀▀▀▀    \n"
+                                      "    ▀▄█▀██▀▄ ██▄ ▀▀▀▄▀▄▄ ▄█▄█ ██▀██ ▄    \n"
+                                      "    ▀▀▄ ██▀ █ ▀▀  ▄▀▄ ▀ ██▄ █ █ █▄█▀     \n"
+                                      "    ▄█▄▄▀ ▀▀ ▄ ▀▄ ▄▄▄ ▀ ▄▀▄█▄ ▄  █▄█▄    \n"
+                                      "     ▀▄█ ▄▀██▄▀█▀▄█ ▄ ▄█▄█  ▄██▄▄▀█▀     \n"
+                                      "     ▀██▀ ▀██▀▀▀▄ █ ▄█ █▄ ▀▄▀▀▄█▀█▄ █    \n"
+                                      "    ▀ ▄ ▄ ▀▄▄ ▄█▀█ █▀█▄ ▄ ▀ ▀█▀██▄██▄    \n"
+                                      "    ██ ▀▀▄▀▄  █▀█▄▄▄▀ ▄▀▀█▀▄▄▄▄  █ ▀█    \n"
+                                      "    █ █▄ █▀▀ ▄█▄██▄█▀   ▀█▄ █▄ █▄██▀     \n"
+                                      "    ▀ ▀▀  ▀▀▄▄▀ █▄▀▀▄▀█▄▄▄▀▄█▀▀▀█▀█▀█    \n"
+                                      "    █▀▀▀▀▀█ ▄█  ▄▀ █▄ ▀  █▄██ ▀ █▄██▄    \n"
+                                      "    █ ███ █ ██▀█▄█ ▄▄▄▀ ▄▀▄▄██▀▀██▄ ▄    \n"
+                                      "    █ ▀▀▀ █ ▀▀▀██▄▄ ▄▀ █▄███▀▀█▀▄█▄      \n"
+                                      "    ▀▀▀▀▀▀▀ ▀ ▀  ▀   ▀ ▀▀ ▀ ▀▀ ▀ ▀▀▀     \n"
+                                      "                                         \n"
+                                      "                                         \n"
+                                      "\n";
+    assert_string_equal(out, golden);
+}
+
 /**
  * @brief Execution entry point for the CMocka test runner suite[cite: 7].
  *
  * Registers and executes unit tests for URL encoding, loglevel parsing, identity claim mapping,
- * input sanitization, prompt message rendering, JWT metadata verification, and configuration
- * stream parsing (parse_config_file)[cite: 7].
+ * input sanitization, prompt message rendering, JWT metadata verification, configuration
+ * stream parsing (parse_config_file), and terminal QR code encoding/rendering (qr.c).
  *
  * @return 0 if all unit tests pass, non-zero return code if any test fails[cite: 7].
  */
@@ -1585,6 +1894,11 @@ int main(void) {
         cmocka_unit_test(test_discovery_probe_pkce_failsafe_malformed_document),
         cmocka_unit_test(test_discovery_probe_pkce_support_matrix),
         cmocka_unit_test(test_discovery_probe_pkce_null_args),
+        cmocka_unit_test(test_qr_config_parsing),
+        cmocka_unit_test(test_qr_render_matrix),
+        cmocka_unit_test(test_qr_encode_uri),
+        cmocka_unit_test(test_qr_render_verification_code),
+        cmocka_unit_test(test_qr_render_golden_utf8),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

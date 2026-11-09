@@ -60,6 +60,12 @@ typedef struct {
     unsigned int group_claim_field : 1;             /**< Flag set when group_claim_field key is parsed. */
     unsigned int use_pkce : 1;                      /**< Flag set when use_pkce key is parsed. */
     unsigned int discovery_endpoint : 1;            /**< Flag set when discovery_endpoint key is parsed. */
+    unsigned int qr_enabled : 1;                    /**< Flag set when qr `enabled` key is parsed. */
+    unsigned int qr_style : 1;                      /**< Flag set when qr `style` key is parsed. */
+    unsigned int qr_block_char : 1;                 /**< Flag set when qr `block_char` key is parsed. */
+    unsigned int qr_scale : 1;                      /**< Flag set when qr `scale` key is parsed. */
+    unsigned int qr_ec_level : 1;                   /**< Flag set when qr `ec_level` key is parsed. */
+    unsigned int qr_uri : 1;                        /**< Flag set when qr `uri` key is parsed. */
 } config_seen_t;
 
 /**
@@ -295,6 +301,104 @@ static int parse_int_range(const char *val, int min_v, int max_v, int *out) {
     }
     *out = (int)v;
     return 0;
+}
+
+/**
+ * @brief Parses the QR terminal rendering style ("utf8" or "ascii", case-insensitive).
+ *
+ * @param[in]  val Raw string setting value.
+ * @param[out] out Target qr_style_t pointer receiving parsed style.
+ * @return 0 on success, -1 on unknown or invalid setting string.
+ */
+static int parse_qr_style(const char *val, qr_style_t *out) {
+    if (!val || !out) {
+        return -1;
+    }
+    if (strcasecmp(val, "utf8") == 0) {
+        *out = QR_STYLE_UTF8;
+        return 0;
+    }
+    if (strcasecmp(val, "ascii") == 0) {
+        *out = QR_STYLE_ASCII;
+        return 0;
+    }
+    return -1;
+}
+
+/**
+ * @brief Parses the QR block character (exactly one printable, non-space ASCII character).
+ *
+ * @param[in]  val Raw string setting value (e.g. "#", "@").
+ * @param[out] out 2-byte destination buffer receiving the character plus NUL.
+ * @return 0 on success, -1 if the value is not a single printable ASCII character 0x21-0x7E.
+ */
+static int parse_qr_block_char(const char *val, char *out) {
+    if (!val || !out || strlen(val) != 1) {
+        return -1;
+    }
+    unsigned char c = (unsigned char)val[0];
+    if (c < 0x21U || c > 0x7EU) {
+        return -1;
+    }
+    out[0] = (char)c;
+    out[1] = '\0';
+    return 0;
+}
+
+/**
+ * @brief Parses the QR error-correction level ("L", "M", "Q", "H", case-insensitive).
+ *
+ * @param[in]  val Raw string setting value.
+ * @param[out] out Target qr_ec_t pointer receiving parsed level.
+ * @return 0 on success, -1 on unknown or invalid setting string.
+ */
+static int parse_qr_ec_level(const char *val, qr_ec_t *out) {
+    if (!val || !out || strlen(val) != 1) {
+        return -1;
+    }
+    unsigned char c = (unsigned char)val[0];
+    if (c >= 'a' && c <= 'z') {
+        c = (unsigned char)(c - 'a' + 'A');
+    }
+    switch (c) {
+    case 'L':
+        *out = QR_EC_LOW;
+        return 0;
+    case 'M':
+        *out = QR_EC_MEDIUM;
+        return 0;
+    case 'Q':
+        *out = QR_EC_QUARTILE;
+        return 0;
+    case 'H':
+        *out = QR_EC_HIGH;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/**
+ * @brief Parses the QR source URI preference ("complete" or "plain", case-insensitive).
+ *
+ * @param[in]  val Raw string setting value.
+ * @param[out] out Integer receiving 1 (embed user code via verification_uri_complete) or 0
+ *                 (plain verification_uri with manual code entry).
+ * @return 0 on success, -1 on unknown or invalid setting string.
+ */
+static int parse_qr_uri(const char *val, int *out) {
+    if (!val || !out) {
+        return -1;
+    }
+    if (strcasecmp(val, "complete") == 0) {
+        *out = 1;
+        return 0;
+    }
+    if (strcasecmp(val, "plain") == 0) {
+        *out = 0;
+        return 0;
+    }
+    return -1;
 }
 
 /**
@@ -548,6 +652,44 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             seen->loglevel = 1;
             return parse_loglevel(val, &cfg->loglevel);
         }
+    } else if (sec == SEC_QR) {
+        if (strcasecmp(key, "enabled") == 0) {
+            if (seen->qr_enabled) {
+                goto duplicate_key;
+            }
+            seen->qr_enabled = 1;
+            return parse_bool(val, &cfg->qr_enabled);
+        } else if (strcasecmp(key, "style") == 0) {
+            if (seen->qr_style) {
+                goto duplicate_key;
+            }
+            seen->qr_style = 1;
+            return parse_qr_style(val, &cfg->qr_style);
+        } else if (strcasecmp(key, "block_char") == 0) {
+            if (seen->qr_block_char) {
+                goto duplicate_key;
+            }
+            seen->qr_block_char = 1;
+            return parse_qr_block_char(val, cfg->qr_block_char);
+        } else if (strcasecmp(key, "scale") == 0) {
+            if (seen->qr_scale) {
+                goto duplicate_key;
+            }
+            seen->qr_scale = 1;
+            return parse_int_range(val, 1, 3, &cfg->qr_scale);
+        } else if (strcasecmp(key, "ec_level") == 0) {
+            if (seen->qr_ec_level) {
+                goto duplicate_key;
+            }
+            seen->qr_ec_level = 1;
+            return parse_qr_ec_level(val, &cfg->qr_ec_level);
+        } else if (strcasecmp(key, "uri") == 0) {
+            if (seen->qr_uri) {
+                goto duplicate_key;
+            }
+            seen->qr_uri = 1;
+            return parse_qr_uri(val, &cfg->qr_uri_complete);
+        }
     }
 
     if (pamh) {
@@ -631,6 +773,8 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
                 current_sec = SEC_PROMPT;
             } else if (strcasecmp(sec, "runtime") == 0) {
                 current_sec = SEC_RUNTIME;
+            } else if (strcasecmp(sec, "qr") == 0) {
+                current_sec = SEC_QR;
             } else {
                 if (pamh) {
                     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "Unknown section [%s] at line %d", sec,
@@ -771,6 +915,14 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     cfg->require_exp_claim = 0;
     cfg->use_pkce = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
+    /* QR terminal rendering defaults: disabled, compact UTF-8 style, single-scale, medium
+     * error correction, and the code-embedded complete URI when the provider offers it. */
+    cfg->qr_enabled = 0;
+    cfg->qr_style = QR_STYLE_UTF8;
+    (void)copy_checked(cfg->qr_block_char, sizeof(cfg->qr_block_char), "#");
+    cfg->qr_scale = 1;
+    cfg->qr_ec_level = QR_EC_MEDIUM;
+    cfg->qr_uri_complete = 1;
 
     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Loading configuration file: %s", path);
 

@@ -344,7 +344,7 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
     if (json_object_is_type(j_group, json_type_array)) {
         size_t arr_len = json_object_array_length(j_group);
         for (size_t i = 0; i < arr_len; i++) {
-            struct json_object *item = json_object_array_get_idx(j_group, i);
+            struct json_object *item = json_object_array_get_idx(j_group, (int)i);
             if (item && json_object_is_type(item, json_type_string)) {
                 const char *val = json_object_get_string(item);
                 if (group_value_denied(val, cfg, cs)) {

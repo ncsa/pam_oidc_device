@@ -178,7 +178,9 @@ int discovery_json_advertises_s256(const struct json_object *doc) {
     }
     size_t len = json_object_array_length(arr);
     for (size_t i = 0; i < len; i++) {
-        struct json_object *el = json_object_array_get_idx(arr, i);
+        /* json-c's array index is a plain int; provider-supplied arrays cannot realistically
+         * exceed INT_MAX entries, and the array length bounds this loop. */
+        struct json_object *el = json_object_array_get_idx(arr, (int)i);
         if (!el || json_object_get_type(el) != json_type_string) {
             continue;
         }

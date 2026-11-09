@@ -26,8 +26,13 @@
 #include <stdint.h>
 #include <string.h>
 
-/** @brief Unpadded Base64URL alphabet per RFC 4648 §5 (`+` -> `-`, `/` -> `_`). */
-static const char B64URL_ALPHABET[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+/**
+ * @brief Unpadded Base64URL alphabet per RFC 4648 §5 (`+` -> `-`, `/` -> `_`).
+ *
+ * Sized 65 so the 64-character alphabet is NUL-terminated in memory; the
+ * encoder indexes positions 0..63 only.
+ */
+static const char B64URL_ALPHABET[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /**
  * @brief Encodes raw bytes as unpadded Base64URL (RFC 4648 §5, no `=` padding).

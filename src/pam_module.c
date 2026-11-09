@@ -190,7 +190,7 @@ static void secure_zero_json_tree(struct json_object *obj) { // NOLINT(misc-no-r
     case json_type_array: {
         size_t count = json_object_array_length(obj);
         for (size_t i = 0; i < count; i++) {
-            secure_zero_json_tree(json_object_array_get_idx(obj, i));
+            secure_zero_json_tree(json_object_array_get_idx(obj, (int)i));
         }
         break;
     }
@@ -341,7 +341,8 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
  * 1. Parses PAM module parameters (`config=...`, `loglevel=...`).
  * 2. Loads module configuration settings (`load_config`).
  * 3. Sends POST request to Device Authorization Endpoint to obtain `device_code` and `user_code`.
- * 4. Displays prompt instruction to user via PAM conversation function (`pam_prompt`).
+ * 4. Displays prompt instruction to user via PAM conversation function (`pam_prompt`),
+ *    optionally preceded by a scannable terminal QR code of the verification URI (`[qr]` section).
  * 5. Polls Token Endpoint using monotonic clock timing until token issuance, expiration, or user denial.
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
@@ -640,6 +641,22 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         }
         retval = PAM_SERVICE_ERR;
         goto cleanup;
+    }
+
+    /* Step 4b: Optionally present the verification URI as a scannable terminal QR code so the
+     * user can open the page with a phone camera instead of typing. The block is informational
+     * (PAM_TEXT_INFO); any rendering failure is logged at debug level and non-fatal, because the
+     * text prompt below always carries the URL and user code. */
+    if (cfg.qr_enabled) {
+        char qr_buf[QR_RENDER_BUF_MAX];
+        if (qr_render_verification_code(&cfg, active_loglevel, url_str, url_comp_str, qr_buf, sizeof(qr_buf), pamh) ==
+            0) {
+            int qr_res = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", qr_buf);
+            if (qr_res != PAM_SUCCESS) {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "QR code prompt not displayed (conversation returned %d); text prompt follows", qr_res);
+            }
+        }
     }
 
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
