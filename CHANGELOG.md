@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **User-code format policy:** The README and threat model now state that the RFC 8628 §3.1 character-set, chunking, and ambiguous-character recommendations are identity-provider (server-side) choices, and that the module deliberately displays codes as issued, enforcing terminal-safety filtering only (no rejection or reformatting of vowel/ambiguous-character/un-chunked codes).
+
 ### Features
 - **On-screen device-code expiry countdown:** New optional `show_countdown = true` setting in the `[prompt]` section makes the module keep a "Code expires in MM:SS" line on the SSH terminal while it waits for the device authorization (RFC 8628 encourages client-side expiry timers based on `expires_in`). The line repaints in place — a carriage-return overwrite of the same terminal line, refreshed every 5 s and space-padded so shorter times fully overwrite longer ones — instead of printing a new line per update, and a terminating newline is emitted when polling ends. The countdown is derived from the provider `expires_in` (capped by `max_poll_seconds`); enabling it only slices the inter-poll sleep, so the token endpoint is never polled more frequently than the provider's `interval` allows. Disabled by default (`false`); display failures are non-fatal, and an interrupted display aborts with `PAM_ABORT` like other conversation failures.
 
