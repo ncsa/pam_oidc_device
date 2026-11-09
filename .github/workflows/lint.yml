@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install clang-tidy & headers
         run: sudo apt-get update && sudo apt-get install -y clang-tidy libpam0g-dev libcurl4-openssl-dev libjson-c-dev
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y cppcheck libpam0g-dev libcurl4-openssl-dev libjson-c-dev
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v7.0.1
 
       - name: Install Flawfinder
         run: pip install flawfinder==2.0.19
