@@ -1,0 +1,5 @@
+# Sandbox PAM stack for the e2e service name "e2e" (tests/e2e/run_e2e.sh
+# installs this as /etc/pam.d/e2e).  `requisite` propagates the module's PAM
+# return value to the test driver verbatim and stops the stack immediately,
+# so the harness can assert on exact module outcomes.
+auth requisite pam_oidc_device.so loglevel=debug

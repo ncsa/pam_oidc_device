@@ -112,7 +112,9 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
         return 0;
     }
 
-    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+    /* The raw claim value is PII: log it only at VERBOSE, never at DEBUG, consistent with the
+     * redacted (size + claim field) DEBUG-level UserInfo receipt in pam_sm_authenticate(). */
+    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
                   "Verifying claim field '%s' (raw value: '%s') for user '%s'", cfg->claim_field, raw_claim, pam_user);
 
     /* Step 2: Compile user-specified POSIX extended regular expression pattern */
@@ -356,7 +358,7 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
     if (json_object_is_type(j_group, json_type_array)) {
         size_t arr_len = json_object_array_length(j_group);
         for (size_t i = 0; i < arr_len; i++) {
-            struct json_object *item = json_object_array_get_idx(j_group, (int)i);
+            struct json_object *item = json_object_array_get_idx(j_group, JSON_ARRAY_IDX(i));
             if (item && json_object_is_type(item, json_type_string)) {
                 const char *val = json_object_get_string(item);
                 if (group_value_denied(val, cfg, cs)) {

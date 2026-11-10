@@ -66,6 +66,7 @@ typedef struct {
     unsigned int qr_scale : 1;                      /**< Flag set when qr `scale` key is parsed. */
     unsigned int qr_ec_level : 1;                   /**< Flag set when qr `ec_level` key is parsed. */
     unsigned int qr_uri : 1;                        /**< Flag set when qr `uri` key is parsed. */
+    unsigned int qr_vquiet : 1;                     /**< Flag set when qr `vertical_quiet_zone` key is parsed. */
 } config_seen_t;
 
 /**
@@ -677,6 +678,12 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->qr_scale = 1;
             return parse_int_range(val, 1, 3, &cfg->qr_scale);
+        } else if (strcasecmp(key, "vertical_quiet_zone") == 0) {
+            if (seen->qr_vquiet) {
+                goto duplicate_key;
+            }
+            seen->qr_vquiet = 1;
+            return parse_int_range(val, 0, QR_QUIET_ZONE, &cfg->qr_vertical_quiet_zone);
         } else if (strcasecmp(key, "ec_level") == 0) {
             if (seen->qr_ec_level) {
                 goto duplicate_key;
@@ -916,13 +923,15 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     cfg->use_pkce = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
     /* QR terminal rendering defaults: disabled, compact UTF-8 style, single-scale, medium
-     * error correction, and the code-embedded complete URI when the provider offers it. */
+     * error correction, the code-embedded complete URI when the provider offers it, and the
+     * ISO/IEC 18004 4-module vertical quiet zone (lowerable via vertical_quiet_zone). */
     cfg->qr_enabled = 0;
     cfg->qr_style = QR_STYLE_UTF8;
     (void)copy_checked(cfg->qr_block_char, sizeof(cfg->qr_block_char), "#");
     cfg->qr_scale = 1;
     cfg->qr_ec_level = QR_EC_MEDIUM;
     cfg->qr_uri_complete = 1;
+    cfg->qr_vertical_quiet_zone = QR_QUIET_ZONE;
 
     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Loading configuration file: %s", path);
 

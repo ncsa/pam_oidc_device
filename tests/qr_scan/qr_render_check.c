@@ -86,14 +86,14 @@ int main(int argc, char **argv) {
     }
 
     char art[QR_RENDER_BUF_MAX];
-    if (qr_render_matrix(qr, size, QR_STYLE_UTF8, scale, '#', art, sizeof(art)) != 0) {
+    if (qr_render_matrix(qr, size, QR_STYLE_UTF8, scale, '#', QR_QUIET_ZONE, art, sizeof(art)) != 0) {
         fprintf(stderr, "error: UTF-8 rendering failed\n");
         return 1;
     }
     if (write_art_file(utf8_path, art) != 0) {
         return 1;
     }
-    if (qr_render_matrix(qr, size, QR_STYLE_ASCII, scale, '#', art, sizeof(art)) != 0) {
+    if (qr_render_matrix(qr, size, QR_STYLE_ASCII, scale, '#', QR_QUIET_ZONE, art, sizeof(art)) != 0) {
         fprintf(stderr, "error: ASCII rendering failed\n");
         return 1;
     }
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
 
     /* Scale-1 ASCII art on stdout: compact enough for the CI job summary and
      * readable/scannable by a phone camera when printed to a terminal. */
-    if (qr_render_matrix(qr, size, QR_STYLE_ASCII, 1, '#', art, sizeof(art)) != 0) {
+    if (qr_render_matrix(qr, size, QR_STYLE_ASCII, 1, '#', QR_QUIET_ZONE, art, sizeof(art)) != 0) {
         fprintf(stderr, "error: summary ASCII rendering failed\n");
         return 1;
     }

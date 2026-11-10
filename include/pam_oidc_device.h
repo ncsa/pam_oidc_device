@@ -23,6 +23,7 @@
 
 #include <curl/curl.h>
 #include <json-c/json.h>
+#include <json-c/json_c_version.h>
 #include <pthread.h>
 #include <regex.h>
 #include <security/pam_ext.h>
@@ -33,6 +34,26 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
+
+/* ============================================================================
+ * json-c Array-Index Compatibility
+ * ============================================================================ */
+
+/*
+ * json-c 0.17 changed json_object_array_get_idx()'s index parameter from
+ * `int` to `size_t`. Casting a `size_t` loop index to the parameter type the
+ * linked json-c release expects keeps -Wconversion / -Wsign-conversion quiet
+ * on both old (e.g. EL8's json-c 0.13) and new (>= 0.17) platforms. Callers
+ * iterate with indices bounded by json_object_array_length(), which is always
+ * far below INT_MAX, so the narrowing cast on pre-0.17 releases cannot lose
+ * data.
+ */
+#if defined(JSON_C_MAJOR_VERSION) && defined(JSON_C_MINOR_VERSION) &&                                                  \
+    (JSON_C_MAJOR_VERSION > 0 || JSON_C_MINOR_VERSION >= 17)
+#define JSON_ARRAY_IDX(i) (i)
+#else
+#define JSON_ARRAY_IDX(i) ((int)(i))
+#endif
 
 /* ============================================================================
  * Configuration & Runtime Constants
@@ -68,7 +89,9 @@
 /** @brief Length of the Base64URL (no padding) encoding of an S256 PKCE code challenge (32 digest bytes). */
 #define PKCE_S256_CHALLENGE_LEN 43
 
-/** @brief Number of light (quiet-zone) modules drawn on every side of the terminal QR code (ISO/IEC 18004 requires 4).
+/** @brief Light (quiet-zone) modules drawn left and right of the terminal QR code, and the default vertical
+ *  quiet zone. ISO/IEC 18004 requires 4 on every side; the [qr] vertical_quiet_zone option may lower the
+ *  vertical zone (never the horizontal one) for a more compact terminal display.
  */
 #define QR_QUIET_ZONE 4
 
@@ -192,6 +215,10 @@ typedef struct {
     char qr_block_char[2];        /**< Single printable ASCII character used for dark modules in the
                                    *  QR_STYLE_ASCII style (default "#"). */
     int qr_scale;                 /**< Integer enlargement factor for rendered QR modules, 1-3 (default 1). */
+    int qr_vertical_quiet_zone;   /**< Light (quiet-zone) module rows rendered above and below the QR symbol,
+                                   *  0-QR_QUIET_ZONE (default QR_QUIET_ZONE = the ISO/IEC 18004 minimum).
+                                   *  Lower values shrink the terminal block at the cost of scanner
+                                   *  robustness; the horizontal quiet zone always stays QR_QUIET_ZONE. */
     qr_ec_t qr_ec_level;          /**< QR error-correction level (default QR_EC_MEDIUM). */
     int qr_uri_complete;          /**< Flag: 1 (default) to encode `verification_uri_complete` when the provider
                                    *  supplies it (the code is embedded, so no typing is needed on the second
@@ -249,6 +276,18 @@ int parse_loglevel(const char *val, loglevel_t *out);
  * @param[in]     n Size of memory buffer in bytes.
  */
 void secure_memzero(void *v, size_t n);
+
+/**
+ * @brief Recursively zero-fills every string value in a parsed json-c object tree.
+ *
+ * json-c retains a private heap copy of each parsed string; `json_object_put()`
+ * releases those copies with a plain `free()`, so credential and PII bytes
+ * would otherwise remain in the process heap until the allocator reuses the
+ * region. Call this on a provider-parsed tree before `json_object_put()`.
+ *
+ * @param[in] obj Root json-c node to scrub (any type, or NULL).
+ */
+void secure_zero_json_tree(struct json_object *obj);
 
 /**
  * @brief Safe bounds-checked string buffer copy wrapper.
@@ -435,12 +474,14 @@ int qr_encode_uri(const char *url, qr_ec_t ec, uint8_t *qrdata, size_t qrdata_ca
  * @param[in]  scale      Enlargement factor, 1-3.
  * @param[in]  block_char Dark-module character for QR_STYLE_ASCII (printable ASCII; ignored for
  *                        QR_STYLE_UTF8, where the fixed half-block glyphs are used).
+ * @param[in]  vquiet     Vertical quiet zone in light module rows, 0-QR_QUIET_ZONE (the horizontal quiet
+ *                        zone is always QR_QUIET_ZONE modules).
  * @param[out] out        Buffer receiving the rendered block.
  * @param[in]  out_len    Byte capacity of out.
  * @return 0 on success, -1 on invalid arguments or output-buffer overflow.
  */
-int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scale, char block_char, char *out,
-                     size_t out_len);
+int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scale, char block_char, int vquiet,
+                     char *out, size_t out_len);
 
 /**
  * @brief Renders the verification URI as a scannable terminal QR code block with a header line.
