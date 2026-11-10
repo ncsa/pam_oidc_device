@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Pre-commit gate: run the canonical lint gate (scripts/lint.sh) so that
-# clang-format / clang-tidy / cppcheck / flawfinder findings are caught
-# BEFORE the commit is created.
+# clang-format / clang-tidy / cppcheck / flawfinder / memory-scrub findings
+# are caught BEFORE the commit is created.
 #
 # Enable it once per clone (this makes git use .githooks/ instead of the
 # built-in .git/hooks/):

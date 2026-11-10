@@ -27,13 +27,22 @@ on:
       - "scripts/check_qrcodegen_upstream.sh"
       - ".github/workflows/vendor-audit.yml"
 
+# Least privilege: this workflow only needs to read the repository contents.
+permissions:
+  contents: read
+
+# Cancel superseded runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   qrcodegen:
     name: Nayuki qrcodegen upstream-drift check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run upstream drift audit
         run: sh scripts/check_qrcodegen_upstream.sh

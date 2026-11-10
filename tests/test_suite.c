@@ -318,6 +318,19 @@ static void test_prompt_rendering(void **state) {
     int def_res = render_prompt_message(&def_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123",
                                         def_out, sizeof(def_out));
     assert_int_equal(def_res, 0);
+    /* The compact default template carries no leading blank line (the QR block's bottom quiet
+     * zone provides separation when the QR code is shown) and no internal blank line[cite: 7] */
+    assert_string_equal(def_out,
+                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+                        "  (Direct: https://auth.edu/dev?c=1)\n"
+                        "Waiting for your approval; this session completes automatically once you sign in.\n");
+    char def_plain_out[512];
+    assert_int_equal(
+        render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123", def_plain_out, sizeof(def_plain_out)),
+        0);
+    assert_string_equal(def_plain_out,
+                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+                        "Waiting for your approval; this session completes automatically once you sign in.\n");
 
     /* Rendered-prompt terminal-injection defense: ANSI escape bytes in the template,
      * the provider URL, or the user code must fail rendering[cite: 7] */
@@ -980,6 +993,7 @@ static void init_config_defaults(config_t *cfg) {
     cfg->qr_scale = 1;
     cfg->qr_ec_level = QR_EC_MEDIUM;
     cfg->qr_uri_complete = 1;
+    cfg->qr_vertical_quiet_zone = QR_QUIET_ZONE;
 }
 
 /**
@@ -1030,6 +1044,7 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.qr_scale, 1);
     assert_int_equal(cfg.qr_ec_level, QR_EC_MEDIUM);
     assert_int_equal(cfg.qr_uri_complete, 1);
+    assert_int_equal(cfg.qr_vertical_quiet_zone, QR_QUIET_ZONE);
 }
 
 /**
@@ -1118,6 +1133,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "style = ascii\n"
                                     "block_char = @\n"
                                     "scale = 2\n"
+                                    "vertical_quiet_zone = 2\n"
                                     "ec_level = h\n"
                                     "uri = plain\n";
     config_t cfg;
@@ -1157,6 +1173,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.qr_style, QR_STYLE_ASCII);
     assert_string_equal(cfg.qr_block_char, "@");
     assert_int_equal(cfg.qr_scale, 2);
+    assert_int_equal(cfg.qr_vertical_quiet_zone, 2);
     assert_int_equal(cfg.qr_ec_level, QR_EC_HIGH);
     assert_int_equal(cfg.qr_uri_complete, 0);
 }
@@ -1582,6 +1599,7 @@ static void test_qr_config_parsing(void **state) {
                                "style = UTF8\n"
                                "block_char = x\n"
                                "scale = 3\n"
+                               "vertical_quiet_zone = 3\n"
                                "ec_level = q\n"
                                "uri = Complete\n");
     init_config_defaults(&cfg);
@@ -1593,14 +1611,27 @@ static void test_qr_config_parsing(void **state) {
     assert_int_equal(cfg.qr_style, QR_STYLE_UTF8);
     assert_string_equal(cfg.qr_block_char, "x");
     assert_int_equal(cfg.qr_scale, 3);
+    assert_int_equal(cfg.qr_vertical_quiet_zone, 3);
     assert_int_equal(cfg.qr_ec_level, QR_EC_QUARTILE);
     assert_int_equal(cfg.qr_uri_complete, 1);
 
     /* Every malformed or duplicated [qr] entry must fail the whole parse. */
     static const char *const bad_entries[] = {
-        "enabled = maybe\n", "style = unicode\n", "style = utf8x\n", "block_char = ab\n",
-        "block_char = \n",   "scale = 0\n",       "scale = 4\n",     "scale = 2x\n",
-        "ec_level = x\n",    "ec_level = MM\n",   "uri = both\n",    "enabled = true\nenabled = false\n",
+        "enabled = maybe\n",
+        "style = unicode\n",
+        "style = utf8x\n",
+        "block_char = ab\n",
+        "block_char = \n",
+        "scale = 0\n",
+        "scale = 4\n",
+        "scale = 2x\n",
+        "vertical_quiet_zone = -1\n",
+        "vertical_quiet_zone = 5\n",
+        "vertical_quiet_zone = 4x\n",
+        "ec_level = x\n",
+        "ec_level = MM\n",
+        "uri = both\n",
+        "enabled = true\nenabled = false\n",
         "foo = 1\n",
     };
     for (size_t i = 0; i < sizeof(bad_entries) / sizeof(bad_entries[0]); i++) {
@@ -1644,7 +1675,7 @@ static void test_qr_render_matrix(void **state) {
             expect[pos++] = '\n';
         }
         expect[pos] = '\0';
-        assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, block, out, sizeof(out)), 0);
+        assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, block, 4, out, sizeof(out)), 0);
         assert_string_equal(out, expect);
     }
 
@@ -1661,7 +1692,20 @@ static void test_qr_render_matrix(void **state) {
         }
     }
     expect[pos] = '\0';
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 2, '#', out, sizeof(out)), 0);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 2, '#', 4, out, sizeof(out)), 0);
+    assert_string_equal(out, expect);
+
+    /* ASCII style, compact vertical quiet zone (2): two light rows above and below. */
+    pos = 0;
+    for (int y = 0; y < 25; y++) {
+        for (int x = 0; x < 29; x++) {
+            int dark = (y >= 2 && y < 23) && (x >= 4 && x < 25);
+            expect[pos++] = (char)(dark ? '#' : ' ');
+        }
+        expect[pos++] = '\n';
+    }
+    expect[pos] = '\0';
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', 2, out, sizeof(out)), 0);
     assert_string_equal(out, expect);
 
     /* UTF-8 style, scale 1: stacked module pairs become block glyphs. */
@@ -1686,20 +1730,47 @@ static void test_qr_render_matrix(void **state) {
         expect[pos++] = '\n';
     }
     expect[pos] = '\0';
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', out, sizeof(out)), 0);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', 4, out, sizeof(out)), 0);
+    assert_string_equal(out, expect);
+
+    /* UTF-8 style, compact vertical quiet zone (2): one blank line above and below. */
+    pos = 0;
+    for (int y = 0; y < 25; y += 2) {
+        for (int x = 0; x < 29; x++) {
+            int top = (y >= 2 && y < 23) && (x >= 4 && x < 25);
+            int bot = (y + 1 < 25) && (y + 1 >= 2 && y + 1 < 23) && (x >= 4 && x < 25);
+            if (top && bot) {
+                memcpy(expect + pos, "\342\226\210", 3); /* U+2588 */
+                pos += 3;
+            } else if (top) {
+                memcpy(expect + pos, "\342\226\200", 3); /* U+2580 */
+                pos += 3;
+            } else if (bot) {
+                memcpy(expect + pos, "\342\226\204", 3); /* U+2584 */
+                pos += 3;
+            } else {
+                expect[pos++] = ' ';
+            }
+        }
+        expect[pos++] = '\n';
+    }
+    expect[pos] = '\0';
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', 2, out, sizeof(out)), 0);
     assert_string_equal(out, expect);
 
     /* Error paths. */
-    assert_int_equal(qr_render_matrix(m, 20, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 99, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 0, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 4, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, ' ', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '\033', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, (qr_style_t)9, 1, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', out, 4), -1);
-    assert_int_equal(qr_render_matrix(NULL, 21, QR_STYLE_ASCII, 1, '#', out, sizeof(out)), -1);
-    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', NULL, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 20, QR_STYLE_ASCII, 1, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 99, QR_STYLE_ASCII, 1, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 0, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 4, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, ' ', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '\033', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, (qr_style_t)9, 1, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', -1, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', 5, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_ASCII, 1, '#', 4, out, 4), -1);
+    assert_int_equal(qr_render_matrix(NULL, 21, QR_STYLE_ASCII, 1, '#', 4, out, sizeof(out)), -1);
+    assert_int_equal(qr_render_matrix(m, 21, QR_STYLE_UTF8, 1, '#', 4, NULL, sizeof(out)), -1);
 }
 /**
  * @brief Unit test for qr_encode_uri: version sizing, error-correction scaling, determinism, errors.
@@ -1794,6 +1865,50 @@ static void test_qr_render_verification_code(void **state) {
     assert_int_equal(qr_render_verification_code(NULL, LOGLEVEL_DEBUG, url_plain, NULL, out, sizeof(out), NULL), -1);
     assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, "", NULL, out, sizeof(out), NULL), -1);
     assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, 16, NULL), -1);
+    /* Undersized buffers must be rejected before the `out_len - 1` size arithmetic: with
+     * out_len == 0 that subtraction underflowed to SIZE_MAX and made snprintf() effectively
+     * unbounded. Must match QR_HEADER_LINE in src/qr.c. */
+    const char *const header = "Scan this QR code with your phone's camera to open the verification page:";
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, 0, NULL), -1);
+    out[0] = 'X';
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, 1, NULL), -1);
+    assert_true(out[0] == 'X'); /* rejected before writing anything */
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, 2, NULL), -1);
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, strlen(header) + 1, NULL),
+                     -1);
+    /* The smallest buffer passing the guard (header + newline + NUL) still cannot hold any
+     * rendered art and must fail cleanly at the header-capacity check, not overflow. */
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, strlen(header) + 2, NULL),
+                     -1);
+    /* One byte past the header still cannot hold the first art line: fails cleanly, no overflow. */
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, NULL, out, strlen(header) + 3, NULL),
+                     -1);
+
+    /* The compact vertical quiet zone (2) removes exactly one blank line above and one below the
+     * art (and no separator blank line is appended any more), for two fewer lines overall. */
+    cfg.qr_style = QR_STYLE_UTF8;
+    cfg.qr_scale = 1;
+    assert_int_equal(qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, url_complete, out, sizeof(out), NULL),
+                     0);
+    size_t newlines_default = 0;
+    for (size_t i = 0; out[i] != '\0'; i++) {
+        if (out[i] == '\n') {
+            newlines_default++;
+        }
+    }
+    cfg.qr_vertical_quiet_zone = 2;
+    assert_int_equal(
+        qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, url_plain, url_complete, out2, sizeof(out2), NULL), 0);
+    size_t newlines_compact = 0;
+    for (size_t i = 0; out2[i] != '\0'; i++) {
+        if (out2[i] == '\n') {
+            newlines_compact++;
+        }
+    }
+    assert_int_equal(newlines_compact + 2, newlines_default);
+    /* No trailing separator blank line: the block ends with the art's own final newline. */
+    assert_true(out2[strlen(out2) - 1] == '\n');
+    assert_true(out2[strlen(out2) - 2] != '\n');
 }
 /**
  * @brief Unit test pinning the exact UTF-8 terminal rendering of a fixed verification URI.
@@ -1834,8 +1949,7 @@ static void test_qr_render_golden_utf8(void **state) {
                                       "    █ ▀▀▀ █ ▀▀▀██▄▄ ▄▀ █▄███▀▀█▀▄█▄      \n"
                                       "    ▀▀▀▀▀▀▀ ▀ ▀  ▀   ▀ ▀▀ ▀ ▀▀ ▀ ▀▀▀     \n"
                                       "                                         \n"
-                                      "                                         \n"
-                                      "\n";
+                                      "                                         \n";
     assert_string_equal(out, golden);
 }
 
@@ -1855,11 +1969,12 @@ static void test_qr_render_golden_utf8(void **state) {
  * @param[in]  art         Rendered art (quiet zone included, no header).
  * @param[in]  art_path    Art file path (created/overwritten).
  * @param[in]  pgm_path    Rasterized P5 PGM path (created/overwritten).
+ * @param[in]  vquiet      Vertical quiet zone in module rows (forwarded to art2png.py).
  * @param[out] decoded     Buffer for the decoded payload.
  * @param[in]  decoded_cap Capacity of decoded (NUL included).
  * @return 0 on a successful decode, -1 on any failure.
  */
-static int qr_scan_decode_art(const char *art, const char *art_path, const char *pgm_path, char *decoded,
+static int qr_scan_decode_art(const char *art, const char *art_path, const char *pgm_path, int vquiet, char *decoded,
                               size_t decoded_cap) {
     char cmd[512];
     FILE *f = fopen(art_path, "w");
@@ -1868,7 +1983,7 @@ static int qr_scan_decode_art(const char *art, const char *art_path, const char 
     }
     fputs(art, f);
     fclose(f);
-    snprintf(cmd, sizeof(cmd), "python3 tests/qr_scan/art2png.py %s %s 3 >/dev/null", art_path, pgm_path);
+    snprintf(cmd, sizeof(cmd), "python3 tests/qr_scan/art2png.py %s %s 3 %d >/dev/null", art_path, pgm_path, vquiet);
     if (system(cmd) != 0) {
         return -1;
     }
@@ -1891,7 +2006,8 @@ static int qr_scan_decode_art(const char *art, const char *art_path, const char 
  * @brief End-to-end terminal QR round trip through an independent scanner.
  *
  * Renders the verification-URI art through the production code path
- * (qr_render_verification_code) in BOTH terminal styles, rasterizes it exactly
+ * (qr_render_verification_code) in BOTH terminal styles at BOTH the ISO default
+ * (4-module) and the compact (2-module) vertical quiet zone, rasterizes it exactly
  * as a monospace terminal displays it, and requires zbarimg to recover the
  * exact complete verification URI. This is the CI-enforced leg of the
  * "independent scanner" check; the phone-camera leg (manual scan of the
@@ -1922,8 +2038,6 @@ static void test_qr_scan_roundtrip(void **state) {
 
     init_config_defaults(&cfg);
     cfg.qr_scale = 3;
-    assert_int_equal(
-        qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, uri_plain, uri_complete, full, sizeof(full), NULL), 0);
 
     int fd = mkstemp(art_path);
     assert_int_not_equal(fd, -1);
@@ -1932,19 +2046,19 @@ static void test_qr_scan_roundtrip(void **state) {
 
     for (int style = 0; style <= QR_STYLE_ASCII; style++) {
         cfg.qr_style = (style == 0) ? QR_STYLE_UTF8 : QR_STYLE_ASCII;
-        assert_int_equal(
-            qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, uri_plain, uri_complete, full, sizeof(full), NULL), 0);
-        /* art = everything after the one-line instruction header, minus the
-         * trailing separator blank line the verification-code glue appends. */
-        const char *art_start = strchr(full, '\n') + 1;
-        size_t art_len = strlen(art_start);
-        if (art_len > 0 && art_start[art_len - 1] == '\n') {
-            art_len--;
+        /* Both the ISO default vertical quiet zone (4) and the compact setting (2) must survive
+         * the independent decode; the art is everything after the one-line instruction header
+         * (no trailing separator blank line is appended any more). */
+        for (int vq = 2; vq <= QR_QUIET_ZONE; vq += 2) {
+            cfg.qr_vertical_quiet_zone = vq;
+            assert_int_equal(
+                qr_render_verification_code(&cfg, LOGLEVEL_DEBUG, uri_plain, uri_complete, full, sizeof(full), NULL),
+                0);
+            const char *art_start = strchr(full, '\n') + 1;
+            memcpy(art, art_start, strlen(art_start) + 1);
+            assert_int_equal(qr_scan_decode_art(art, art_path, pgm_path, vq, decoded, sizeof(decoded)), 0);
+            assert_string_equal(decoded, uri_complete);
         }
-        memcpy(art, art_start, art_len);
-        art[art_len] = '\0';
-        assert_int_equal(qr_scan_decode_art(art, art_path, pgm_path, decoded, sizeof(decoded)), 0);
-        assert_string_equal(decoded, uri_complete);
     }
 
     unlink(art_path);

@@ -6,13 +6,23 @@ on:
   pull_request:
     branches: [ main ]
 
+# Least privilege: every job in this workflow only needs to read the
+# repository contents.
+permissions:
+  contents: read
+
+# Cancel superseded runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   formatting:
     name: Check Code Formatting (clang-format)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
@@ -25,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install clang-tidy & headers
         run: sudo apt-get update && sudo apt-get install -y clang-tidy libpam0g-dev libcurl4-openssl-dev libjson-c-dev
@@ -38,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y cppcheck libpam0g-dev libcurl4-openssl-dev libjson-c-dev
@@ -59,10 +69,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Flawfinder
         run: pip install flawfinder==2.0.19
 
       - name: Run Flawfinder security audit
         run: flawfinder --minlevel=3 --error-level=3 src/ include/
+
+  # Memory-management inspection (AGENTS.md §4.1): scripts/
+  # check-memory-scrubbing.sh verifies that sensitive buffers (OAuth tokens,
+  # PKCE verifier/challenge, client secret, form POST fields, HTTP response
+  # bodies, provider-parsed JSON trees) are zeroed with an anti-dead-code-
+  # elimination primitive (secure_memzero()/explicit_bzero()/
+  # secure_zero_json_tree()) before every release (free()/json_object_put()).
+  # Pure bash/grep — no build toolchain or dev headers required.
+  memory-scrub:
+    name: Memory Scrub Inspection (secret disposal)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify sensitive buffers are scrubbed before release
+        run: ./scripts/check-memory-scrubbing.sh

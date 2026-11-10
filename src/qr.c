@@ -48,12 +48,13 @@
  * @param[in] qrdata Packed QR module grid (no quiet zone).
  * @param[in] size   Symbol width/height in modules.
  * @param[in] x      Grid column, 0..size+2*QR_QUIET_ZONE-1.
- * @param[in] y      Grid row, 0..size+2*QR_QUIET_ZONE-1.
+ * @param[in] y      Grid row, 0..size+2*vquiet-1.
+ * @param[in] vquiet Vertical quiet zone in module rows (0..QR_QUIET_ZONE).
  * @return 1 if the module is dark, 0 if light (including quiet-zone positions).
  */
-static int qr_module_is_dark(const uint8_t *qrdata, int size, int x, int y) {
+static int qr_module_is_dark(const uint8_t *qrdata, int size, int x, int y, int vquiet) {
     int mx = x - QR_QUIET_ZONE;
-    int my = y - QR_QUIET_ZONE;
+    int my = y - vquiet;
     if (mx < 0 || my < 0 || mx >= size || my >= size) {
         return 0;
     }
@@ -109,19 +110,20 @@ static int qr_append_line(char *out, size_t out_len, size_t *out_pos, const char
  * @param[out] line_len    Byte length of the rendered line.
  * @param[in]  qrdata      Packed QR module grid.
  * @param[in]  size        Symbol width/height in modules.
- * @param[in]  total       Padded grid width (size + 2 * QR_QUIET_ZONE).
+ * @param[in]  width       Padded grid width (size + 2 * QR_QUIET_ZONE).
  * @param[in]  y0          First module row index (the UTF-8 style pairs rows y0 and y0+1).
- * @param[in]  single_row  1 when y0+1 is outside the grid (odd padded width, UTF-8 style).
+ * @param[in]  single_row  1 when y0+1 is outside the grid (odd padded height, UTF-8 style).
  * @param[in]  style       Rendering style.
  * @param[in]  scale       Enlargement factor.
+ * @param[in]  vquiet      Vertical quiet zone in module rows (0..QR_QUIET_ZONE).
  * @param[in]  block_char  Dark-module character (QR_STYLE_ASCII only).
  * @return 0 on success, -1 on an unexpected rendering error.
  */
-static int qr_render_line(char *line, size_t *line_len, const uint8_t *qrdata, int size, int total, int y0,
-                          int single_row, qr_style_t style, int scale, char block_char) {
+static int qr_render_line(char *line, size_t *line_len, const uint8_t *qrdata, int size, int width, int y0,
+                          int single_row, qr_style_t style, int scale, int vquiet, char block_char) {
     size_t pos = 0;
-    for (int x = 0; x < total; x++) {
-        int dark = qr_module_is_dark(qrdata, size, x, y0);
+    for (int x = 0; x < width; x++) {
+        int dark = qr_module_is_dark(qrdata, size, x, y0, vquiet);
         if (style == QR_STYLE_ASCII) {
             for (int s = 0; s < scale; s++) {
                 if (pos + 2 >= QR_LINE_BUF_MAX) {
@@ -130,7 +132,7 @@ static int qr_render_line(char *line, size_t *line_len, const uint8_t *qrdata, i
                 line[pos++] = (char)(dark ? (unsigned char)block_char : ' ');
             }
         } else {
-            int dark2 = single_row ? 0 : qr_module_is_dark(qrdata, size, x, y0 + 1);
+            int dark2 = single_row ? 0 : qr_module_is_dark(qrdata, size, x, y0 + 1, vquiet);
             const char *glyph = " ";
             if (dark && dark2) {
                 glyph = "\342\226\210"; /* U+2588 FULL BLOCK */
@@ -159,10 +161,10 @@ static int qr_render_line(char *line, size_t *line_len, const uint8_t *qrdata, i
     return 0;
 }
 
-int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scale, char block_char, char *out,
-                     size_t out_len) {
+int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scale, char block_char, int vquiet,
+                     char *out, size_t out_len) {
     if (!qrdata || !out || out_len == 0 || size < 21 || size > QR_MAX_SIZE || style > QR_STYLE_ASCII || scale < 1 ||
-        scale > 3) {
+        scale > 3 || vquiet < 0 || vquiet > QR_QUIET_ZONE) {
         return -1;
     }
     /* The ASCII block character must be a single printable, non-space character so dark
@@ -171,14 +173,17 @@ int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scal
         return -1;
     }
 
-    int total = size + (2 * QR_QUIET_ZONE);
+    /* The horizontal quiet zone always keeps the ISO/IEC 18004 4-module minimum (it separates the symbol
+     * from the surrounding terminal text); only the vertical zone is configurable, for compactness. */
+    int width = size + (2 * QR_QUIET_ZONE);
+    int height = size + (2 * vquiet);
     size_t out_pos = 0;
     char line[QR_LINE_BUF_MAX];
     size_t line_len = 0;
 
     if (style == QR_STYLE_UTF8) {
-        for (int y = 0; y < total; y += 2) {
-            if (qr_render_line(line, &line_len, qrdata, size, total, y, y + 1 >= total, QR_STYLE_UTF8, scale,
+        for (int y = 0; y < height; y += 2) {
+            if (qr_render_line(line, &line_len, qrdata, size, width, y, y + 1 >= height, QR_STYLE_UTF8, scale, vquiet,
                                block_char) != 0) {
                 return -1;
             }
@@ -187,8 +192,9 @@ int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scal
             }
         }
     } else {
-        for (int y = 0; y < total; y++) {
-            if (qr_render_line(line, &line_len, qrdata, size, total, y, 1, QR_STYLE_ASCII, scale, block_char) != 0) {
+        for (int y = 0; y < height; y++) {
+            if (qr_render_line(line, &line_len, qrdata, size, width, y, 1, QR_STYLE_ASCII, scale, vquiet, block_char) !=
+                0) {
                 return -1;
             }
             for (int s = 0; s < scale; s++) {
@@ -205,7 +211,10 @@ int qr_render_matrix(const uint8_t *qrdata, int size, qr_style_t style, int scal
 
 int qr_render_verification_code(const config_t *cfg, loglevel_t loglevel, const char *url_plain,
                                 const char *url_complete, char *out, size_t out_len, pam_handle_t *pamh) {
-    if (!cfg || !url_plain || url_plain[0] == '\0' || !out || out_len == 0) {
+    /* Reject undersized buffers before the `out_len - 1` size arithmetic below can underflow
+     * (out_len == 0 would wrap to SIZE_MAX and make snprintf() effectively unbounded):
+     * the smallest renderable output still needs the header line, its newline, and a NUL. */
+    if (!cfg || !url_plain || url_plain[0] == '\0' || !out || out_len < strlen(QR_HEADER_LINE) + 2) {
         return -1;
     }
 
@@ -225,25 +234,21 @@ int qr_render_verification_code(const config_t *cfg, loglevel_t loglevel, const 
         return -1;
     }
 
-    /* Reserve one byte for the trailing blank line and one for the NUL terminator. */
-    int header_len = snprintf(out, out_len - 2, "%s\n", QR_HEADER_LINE);
-    if (header_len < 0 || (size_t)header_len >= out_len - 2) {
+    /* Reserve one byte for the NUL terminator. No trailing separator blank line is appended: the bottom
+     * quiet zone already separates the rendered art from the text prompt that follows it. */
+    int header_len = snprintf(out, out_len - 1, "%s\n", QR_HEADER_LINE);
+    if (header_len < 0 || (size_t)header_len >= out_len - 1) {
         return -1;
     }
-    size_t art_cap = out_len - (size_t)header_len - 2;
-    if (qr_render_matrix(qrdata, size, cfg->qr_style, cfg->qr_scale, cfg->qr_block_char[0], out + header_len,
-                         art_cap) != 0) {
+    size_t art_cap = out_len - (size_t)header_len - 1;
+    if (qr_render_matrix(qrdata, size, cfg->qr_style, cfg->qr_scale, cfg->qr_block_char[0], cfg->qr_vertical_quiet_zone,
+                         out + header_len, art_cap) != 0) {
         if (pamh) {
             pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                           "QR code skipped: rendered output exceeds the terminal buffer capacity");
         }
         return -1;
     }
-    /* Append one blank line of separation before the text prompt: the rendered art ends with
-     * its own trailing newline, followed by the NUL written by qr_render_matrix(). */
-    size_t art_len = strlen(out + header_len);
-    size_t tail = (size_t)header_len + art_len;
-    out[tail] = '\n';
-    out[tail + 1] = '\0';
+    /* qr_render_matrix() NUL-terminates the art after its final newline, so the block is complete. */
     return 0;
 }

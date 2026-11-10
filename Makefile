@@ -9,16 +9,22 @@
 #
 # Each value uses `?=` so it remains a default that can still be overridden
 # from the environment or command line, e.g.:
-#     make VERSION=0.2.0
+#     make VERSION=0.3.0
 # Keep these in sync with include/metadata.h when the metadata changes.
 NAME        ?= pam_oidc_device
-VERSION     ?= 0.2.0
+VERSION     ?= 0.3.0
 DESCRIPTION ?= PAM authentication module for OAuth 2.0 Device Authorization Grant
 
 CC ?= gcc
 CPPFLAGS += -Iinclude -D_GNU_SOURCE
 CFLAGS ?= -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
-          -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wformat-security -O2 -g
+          -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wformat-security -fPIE -O2 -g
+# NOTE: no -pie at link time. -pie is an *executable* link flag: with -shared
+# the gcc driver still pulls in the executable CRT start file (Scrt1.o), whose
+# _start references main, breaking the link ("undefined reference to `main'").
+# The module is a shared library: -fPIC/-fPIE objects plus -shared already make
+# it fully position-independent on all target distros; -pie is redundant and,
+# on modern binutils (e.g. Ubuntu gcc 14), actively harmful here.
 LDFLAGS ?= -Wl,-z,relro,-z,now
 # -lpthread is required on EL8 (glibc < 2.34, where libpthread is still a
 # separate library; src/http.c uses pthread_once) and is a harmless no-op on
@@ -33,6 +39,11 @@ LIBS = -lpam -lcurl -ljson-c -lcrypto -lpthread
 SAN_FLAGS  = -fsanitize=address -fsanitize=undefined -fsanitize=leak -fno-omit-frame-pointer
 SAN_RUNNER = build/sanitize/runner
 
+# Extra flags appended to every compile recipe. CI passes
+# `EXTRA_CFLAGS=-Werror` to mechanically enforce the documented zero-warning
+# bar (see .github/workflows/build.yml); the default is empty for local builds.
+EXTRA_CFLAGS =
+
 TARGET = $(NAME).so
 OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pkce.o src/qr.o third_party/qrcodegen/qrcodegen.o src/pam_module.o
 CONFIG_DEFAULT = config/$(NAME).conf
@@ -40,38 +51,75 @@ CONFIG_DEFAULT = config/$(NAME).conf
 PAM_DIR ?= /lib64/security
 CONFIG_DIR ?= /etc
 
-.PHONY: all build lint sanitize test test-sanitize install uninstall clean rpm
+.PHONY: all build lint check-scrub check-licenses sanitize test test-sanitize sandbox sandbox-shell install uninstall clean rpm deb
 
 all: build
 
 build: $(TARGET)
 
 # Run the local lint/static-analysis gate (clang-format + clang-tidy +
-# cppcheck + flawfinder), mirroring .github/workflows/lint.yml exactly.
-# See scripts/lint.sh for the single source of truth.
+# cppcheck + flawfinder + memory-scrub inspection), mirroring
+# .github/workflows/lint.yml exactly. See scripts/lint.sh for the
+# single source of truth.
 lint:
 	./scripts/lint.sh
 
+# Memory-management inspection (AGENTS.md §4.1): verifies that sensitive
+# buffers (tokens, secrets, PKCE material, HTTP response bodies, JSON PII
+# trees) are zeroed with secure_memzero()/explicit_bzero()/
+# secure_zero_json_tree() before every release (free()/json_object_put()).
+# Pure bash — runs on any host; also part of `make lint` and the CI
+# "memory-scrub" job.
+check-scrub:
+	./scripts/check-memory-scrubbing.sh
+
+# Third-party license compliance (THIRD_PARTY_NOTICES.md): notices file present
+# at the repo root, every third_party/*/ component carries license text +
+# attribution + provenance pin, no copyleft text in third_party/, and every
+# runtime dependency from the RPM spec's Requires: line is declared in the
+# notices file. Pure bash — runs on any host; also the CI "license-compliance"
+# job in .github/workflows/license-audit.yml.
+check-licenses:
+	./scripts/check-licenses.sh
+
+# One-command end-to-end sandbox (docs/testing.md): builds an Ubuntu 24.04
+# image with the module installed exactly like production, then runs the full
+# device-flow scenario suite (tests/e2e/run_e2e.sh) against the in-image mock
+# OIDC provider.  The host system is never modified.
+sandbox:
+	@command -v docker >/dev/null 2>&1 || { echo "make sandbox: 'docker' not found in PATH" >&2; exit 1; }
+	docker build -f tests/e2e/Dockerfile -t $(NAME)-e2e:local .
+	docker run --rm --name $(NAME)-e2e $(NAME)-e2e:local /opt/pam_oidc_device/tests/e2e/run_e2e.sh
+
+# Same image, interactive shell: explore manually, e.g.
+#   python3 tests/e2e/mock_oidc.py ... &      then
+#   tests/e2e/pam_driver e2e alice            or
+#   pamtester e2e alice authenticate
+sandbox-shell:
+	@command -v docker >/dev/null 2>&1 || { echo "make sandbox-shell: 'docker' not found in PATH" >&2; exit 1; }
+	docker build -f tests/e2e/Dockerfile -t $(NAME)-e2e:local .
+	docker run --rm -it --name $(NAME)-e2e-shell $(NAME)-e2e:local
+
 src/%.o: src/%.c
-	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 # Vendored third-party code (Nayuki QR Code generator) is kept outside src/ so it
 # is not subject to the project's lint/static-analysis gates; it is still
 # compiled with the full warning CFLAGS.
 third_party/qrcodegen/%.o: third_party/qrcodegen/%.c
-	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
 	$(CC) -shared $(LDFLAGS) -o $@ $^ $(LIBS)
 
 sanitize:
 	@mkdir -p build/sanitize
-	$(CC) $(CPPFLAGS) -fPIC -shared -Wall -Wextra -g \
+	$(CC) $(CPPFLAGS) -fPIC -shared -Wall -Wextra $(EXTRA_CFLAGS) -g \
 		-fsanitize=address -fsanitize=undefined -fsanitize=leak \
 		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c $(LIBS)
 
 test: $(OBJS)
-	$(CC) $(CPPFLAGS) -Wall -Wextra -g tests/test_suite.c $(OBJS) \
+	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g tests/test_suite.c $(OBJS) \
 		-o tests/runner -lcmocka $(LIBS)
 	./tests/runner
 	@rm -f tests/runner
@@ -89,7 +137,7 @@ test: $(OBJS)
 # standalone test binary would otherwise report as leaks at exit.
 test-sanitize:
 	@mkdir -p build/sanitize
-	$(CC) $(CPPFLAGS) -Wall -Wextra -g $(SAN_FLAGS) \
+	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g $(SAN_FLAGS) \
 		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c \
 		-o $(SAN_RUNNER) -lcmocka $(LIBS)
 	ASAN_OPTIONS=detect_leaks=1 \
@@ -113,10 +161,13 @@ clean:
 	rm -f src/*.o third_party/qrcodegen/*.o $(TARGET) tests/runner
 	rm -rf build/ rpmbuild/
 
-rpm:
+# `rpm` always starts from `clean` so the source tarball is packaged from a
+# pristine tree: a prior local build's stale *.o files (or the module .so)
+# must never leak into the distributed source tarball.
+rpm: clean
 	mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 	tar --transform 's,^,$(NAME)-$(VERSION)/,' -czf rpmbuild/SOURCES/$(NAME)-$(VERSION).tar.gz \
-		src include third_party config packaging Makefile README.md LICENSE SECURITY.md CHANGELOG.md tests
+		src include third_party config packaging Makefile README.md LICENSE THIRD_PARTY_NOTICES.md SECURITY.md CHANGELOG.md tests
 	cp packaging/$(NAME).spec rpmbuild/SPECS/
 	python3 packaging/gen-changelog.py CHANGELOG.md include/metadata.h >> rpmbuild/SPECS/$(NAME).spec
 	rpmbuild --define "_topdir $(CURDIR)/rpmbuild" \
@@ -124,3 +175,14 @@ rpm:
 		--define "mod_version $(VERSION)" \
 		--define "mod_summary $(DESCRIPTION)" \
 		-ba rpmbuild/SPECS/$(NAME).spec
+
+# DEB packaging (Debian / Ubuntu): binary .deb hand-crafted by
+# packaging/build-deb.sh (dpkg-deb + dpkg-shlibdeps — no debhelper toolchain
+# needed; `dpkg-shlibdeps` derives distribution-correct runtime Depends).
+# Requires a Debian/Ubuntu host with dpkg-dev plus the build dependencies:
+#   sudo apt-get install -y build-essential dpkg-dev python3 \
+#     libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+# CI: the "distro-build" job in .github/workflows/distro-build.yml runs
+# `make deb` on Debian 13 and Ubuntu 26.04 LTS.
+deb:
+	./packaging/build-deb.sh $(NAME) $(VERSION) "$(DESCRIPTION)"

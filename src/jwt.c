@@ -215,6 +215,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
 
     if (!payload_json || !json_object_is_type(payload_json, json_type_object)) {
         if (payload_json) {
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
         }
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "JWT payload is not a valid JSON object");
@@ -245,17 +246,20 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         } else {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Malformed JWT 'exp' claim: expected a NumericDate (numeric) value");
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
         if ((double)now > exp_val + (double)leeway) {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Token has expired (exp: %.3f, current_time: %ld, leeway: %ds)", exp_val, (long)now, leeway);
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
     } else if (cfg->require_exp_claim) {
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "Token is missing the required 'exp' claim");
+        secure_zero_json_tree(payload_json);
         json_object_put(payload_json);
         return -1;
     }
@@ -276,6 +280,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         } else {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Malformed JWT 'nbf' claim: expected a NumericDate (numeric) value");
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
@@ -283,6 +288,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Token not yet valid (nbf: %.3f, current_time: %ld, leeway: %ds)", nbf_val, (long)now,
                           leeway);
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
@@ -296,6 +302,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Token issuer mismatch (expected: '%s', received: '%s')", cfg->issuer,
                           j_iss ? json_object_get_string(j_iss) : "(null)");
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
@@ -330,7 +337,7 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
                         } else if (json_object_is_type(j_aud, json_type_array)) {
                             size_t array_len = json_object_array_length(j_aud);
                             for (size_t i = 0; i < array_len; i++) {
-                                struct json_object *item = json_object_array_get_idx(j_aud, (int)i);
+                                struct json_object *item = json_object_array_get_idx(j_aud, JSON_ARRAY_IDX(i));
                                 if (item && json_object_is_type(item, json_type_string) &&
                                     strcmp(json_object_get_string(item), expected_aud) == 0) {
                                     aud_valid = 1;
@@ -348,11 +355,13 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Token audience mismatch (expected: '%s', received: %s)", cfg->audience,
                           j_aud ? json_object_to_json_string(j_aud) : "(null)");
+            secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
         }
     }
 
+    secure_zero_json_tree(payload_json);
     json_object_put(payload_json);
     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "JWT metadata and claim checks passed successfully");
     return 0;

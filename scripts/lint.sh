@@ -10,6 +10,7 @@
 #   2. clang-tidy    src/*.c -- -Iinclude -D_GNU_SOURCE
 #   3. cppcheck      --enable=all ... src/
 #   4. flawfinder    --minlevel=3 --error-level=3 src/ include/
+#   5. check-memory-scrubbing.sh          (sensitive-buffer scrub discipline)
 #
 # Run it directly (./scripts/lint.sh), via `make lint`, or through the
 # .githooks/pre-commit hook.
@@ -93,6 +94,13 @@ if command -v flawfinder >/dev/null 2>&1; then
   fi
 else
   skip "flawfinder" "flawfinder not installed"
+fi
+
+# --- 5. memory-scrub inspection (pure bash; no tools or headers required) ----
+note "./scripts/check-memory-scrubbing.sh"
+if ! ./scripts/check-memory-scrubbing.sh; then
+  echo "memory-scrub inspection FAILED (see findings above)." >&2
+  status=1
 fi
 
 # --- Summary ----------------------------------------------------------------

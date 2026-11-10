@@ -131,7 +131,9 @@ char *url_encode_param(CURL *curl, const char *str) {
 void free_http_response(http_response_t *resp) {
     if (resp) {
         if (resp->body) {
-            secure_memzero(resp->body, resp->size);
+            /* Scrub the payload plus its NUL terminator (write_callback always terminates the
+             * buffer), matching the module's strlen + 1 scrubbing convention. */
+            secure_memzero(resp->body, resp->size + 1);
             free(resp->body);
             resp->body = NULL;
         }
@@ -178,9 +180,8 @@ int discovery_json_advertises_s256(const struct json_object *doc) {
     }
     size_t len = json_object_array_length(arr);
     for (size_t i = 0; i < len; i++) {
-        /* json-c's array index is a plain int; provider-supplied arrays cannot realistically
-         * exceed INT_MAX entries, and the array length bounds this loop. */
-        struct json_object *el = json_object_array_get_idx(arr, (int)i);
+        /* JSON_ARRAY_IDX (public header) selects the index type the linked json-c expects. */
+        struct json_object *el = json_object_array_get_idx(arr, JSON_ARRAY_IDX(i));
         if (!el || json_object_get_type(el) != json_type_string) {
             continue;
         }
