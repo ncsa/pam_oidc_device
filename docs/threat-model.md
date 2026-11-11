@@ -2,6 +2,8 @@
 
 `pam_oidc_device` is a Linux Pluggable Authentication Module (PAM) executing inside privileged process spaces (such as OpenSSH `sshd`) to authenticate system users via the [OAuth 2.0 Device Authorization Grant](https://oauth.net/2/device-flow/) ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Because authentication modules operate at the primary security boundary of the operating system, this document details the system trust boundaries, threat matrix, defense mechanisms, and implementation specifics.
 
+> **Security disclosures.** To report a vulnerability in `pam_oidc_device`, follow the [Security Policy](../SECURITY.md).
+
 ## Table of Contents
 
 * [Trust Boundaries](#trust-boundaries)
@@ -15,6 +17,7 @@
   * [6. HTTP Transport Security & Network Resilience](#6-http-transport-security--network-resilience)
   * [7. PKCE Device-Flow Binding (RFC 7636)](#7-pkce-device-flow-binding-rfc-7636)
 * [Out-of-Scope Security Assumptions](#out-of-scope-security-assumptions)
+* [Related Documents](#related-documents)
 
 ---
 
@@ -176,7 +179,7 @@ The [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) device flow treats the `d
 * **Config Gate**: `use_pkce` in the `[oauth]` section — three states: `false` (default, off), `true` (always on; the provider must support device-flow PKCE or it will reject the device-authorization request, and a load-time advisory reminds operators to confirm support), and `auto` (probe the `discovery_endpoint` metadata document once per attempt and enable PKCE only when it advertises S256 in `code_challenge_methods_supported` *and* a `device_authorization_endpoint`; probe failures fail safe to off). Because no standard discovery field advertises device-flow PKCE specifically, `auto` is a heuristic gate documented as such (see examples/README.md).
 * **CSPRNG Verifier**: When enabled, `pkce_generate_code_verifier()` derives a 64-character Base64URL (no padding) `code_verifier` from 48 bytes of OpenSSL `RAND_bytes()` on every authentication attempt, and `pkce_compute_s256_challenge()` computes `BASE64URL(SHA256(ASCII(code_verifier)))` (43 characters) per RFC 7636 §4.2.
 * **Flow Binding**: The `code_challenge` and `code_challenge_method=S256` are included in the device-authorization POST; the `code_verifier` itself is included only in the token-endpoint POSTs. The verifier is never displayed on the terminal, embedded in the verification URI, or written to logs.
-* **Secret Disposal**: The verifier and challenge stack buffers are scrubbed with `secure_memzero()` at the module's `cleanup` point on every exit path; their URL-encoded copies inside the POST field buffers are scrubbed together with `postfields`/`token_postfields`.
+* **Secret Disposal**: The verifier and challenge stack buffers are scrubbed with `secure_memzero()` at the module's `cleanup` point on every exit path; their URL-encoded copies inside the POST field buffers are scrubbed together with `postfields`/`token_postfields`. This scrub-before-release discipline is enforced mechanically on every push/PR by `scripts/check-memory-scrubbing.sh` (CI `memory-scrub` job; `make check-scrub`, part of `make lint`): sensitive heap buffers must be zeroed with `secure_memzero()`/`explicit_bzero()` before `free()` (plain `memset()` is never sufficient on its own), and provider-parsed JSON trees — including the ID-token payload in `src/jwt.c` — must pass through `secure_zero_json_tree()` before `json_object_put()`.
 
 ---
 
@@ -186,4 +189,14 @@ The following factors fall outside the module's operational scope and must be ma
 
 1. **Identity Provider Security**: The security, signature integrity, and account lifecycle management of the external OAuth 2.0 / OpenID Connect provider.
 2. **Terminal Emulator Integrity**: The safety of the remote user's client terminal software when processing standard printable ASCII characters.
-3. **PAM Stack Configuration**: Proper positioning of `pam_oidc_device.so` within system PAM files (e.g., `/etc/pam.d/sshd`) to ensure pre-login checks and environment initializations execute correctly. Refer to the [PAM & OpenSSH Setup Guide](pam-ssh-setup.md) for recommended stack positioning.
+3. **PAM Stack Configuration**: Proper positioning of `pam_oidc_device.so` within system PAM files (e.g., `/etc/pam.d/sshd`) to ensure pre-login checks and environment initializations execute correctly. Refer to the [Getting Started guide](getting-started.md) for recommended stack positioning.
+
+---
+
+## Related Documents
+
+* [Security Policy](../SECURITY.md) — vulnerability disclosure procedure and index to the project's security documentation.
+* [Local JWT Claim Inspection](jwt-validation.md) — configuring `verify_jwt_claims`, issuer (`iss`), and audience (`aud`) checks.
+* [Account & Group Access Control](access-control.md) — configuring `allow_users`, `deny_users`, `allow_groups`, and `deny_groups`.
+* [Getting Started](getting-started.md) — installation, configuration, and recommended PAM stack positioning plus OpenSSH configuration.
+* [Identity Provider Integration Examples](../examples/README.md) — complete config templates for Microsoft Entra ID, Okta, Keycloak, Auth0, and CILogon.

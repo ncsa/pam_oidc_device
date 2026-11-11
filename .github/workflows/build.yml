@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [ main ]
 
+# Least privilege: every job in this workflow only needs to read the
+# repository contents.
+permissions:
+  contents: read
+
+# Cancel superseded runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compile-matrix:
     name: Compile & Test (${{ matrix.compiler }})
@@ -17,18 +27,20 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.compiler }} libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev zbar-tools
+          sudo apt-get install -y ${{ matrix.compiler }} libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
 
+      # EXTRA_CFLAGS=-Werror mechanically enforces the documented
+      # zero-warning bar for both compilers.
       - name: Build shared module
-        run: make CC=${{ matrix.compiler }}
+        run: make CC=${{ matrix.compiler }} EXTRA_CFLAGS=-Werror
 
       - name: Run unit test suite
-        run: make test CC=${{ matrix.compiler }}
+        run: make test CC=${{ matrix.compiler }} EXTRA_CFLAGS=-Werror
 
   # ASan/UBSan/LSan execution gate (B1/B3): `make test-sanitize` builds AND RUNS
   # the CMocka suite under the sanitizers. The compile-only `make sanitize`
@@ -44,15 +56,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev zbar-tools
+          sudo apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
 
       - name: Build and run unit test suite under ASan/UBSan/LSan
-        run: make test-sanitize CC=clang
+        run: make test-sanitize CC=clang EXTRA_CFLAGS=-Werror
 
   # Independent QR scanner gate: renders the verification-URI terminal art with
   # the production code path (tests/qr_scan/qr_render_check.c over src/qr.c +
@@ -69,7 +81,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install scanner and headers
         run: |
@@ -111,6 +123,44 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # End-to-end device-flow gate: the installed module is driven through a real
+  # PAM stack (auth requisite pam_oidc_device.so under /etc/pam.d/e2e) against
+  # a local HTTPS mock OIDC provider (tests/e2e/mock_oidc.py).  Covers the full
+  # RFC 8628 loop — device code, PKCE S256 binding, claims-only JWT inspection,
+  # UserInfo, claim mapping, slow_down backoff, provider denial, code expiry,
+  # root denial, and fail-closed config-permission checks — exactly like
+  # `make sandbox` in Docker, without docker-in-docker.
+  e2e-sandbox:
+    name: E2E Device-Flow Sandbox (PAM stack + mock OIDC)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build dependencies and PAM test tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make dpkg-dev libpam0g-dev libcurl4-openssl-dev \
+            libjson-c-dev libcmocka-dev libssl-dev openssl python3 ca-certificates
+
+      - name: Build the shared module
+        run: make CC=gcc EXTRA_CFLAGS=-Werror
+
+      - name: Create sandbox users and install the module
+        run: |
+          sudo useradd --no-create-home --shell /usr/sbin/nologin alice
+          sudo useradd --no-create-home --shell /usr/sbin/nologin bob
+          sudo cp tests/e2e/pam_oidc_device.e2e.conf /etc/pam_oidc_device.conf
+          sudo chown root:root /etc/pam_oidc_device.conf
+          sudo chmod 0600 /etc/pam_oidc_device.conf
+          PAM_DIR="$( [ -d /lib64/security ] && echo /lib64/security \
+            || echo "/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security" )"
+          sudo make install PAM_DIR="$PAM_DIR" CONFIG_DIR=/etc
+
+      - name: Run the device-flow e2e scenario suite
+        run: ./tests/e2e/run_e2e.sh
+
   rpm-build:
     name: Native ${{ matrix.distro.name }} RPM Package Build
     runs-on: ubuntu-latest
@@ -135,7 +185,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Enable optional repo and install build dependencies
         run: |
@@ -149,6 +199,6 @@ jobs:
       - name: Verify generated RPM package
         run: |
           MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm")
-          dnf localinstall -y "$MAIN_RPM"
+          dnf install -y "$MAIN_RPM"
           ls -la /lib64/security/pam_oidc_device.so
           ls -la /etc/pam_oidc_device.conf

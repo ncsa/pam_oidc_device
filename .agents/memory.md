@@ -38,12 +38,25 @@
   Authoritative gates run on Linux (CI or a `ubuntu:24.04` container mirroring CI; see
   `AGENTS.md` §3 — Non-Linux Hosts).
 - **CI-enforced gate set, in order (see `AGENTS.md` §3, aligned with `lint.yml` + `build.yml`):**
-  `make lint` (clang-format → clang-tidy `src/*.c` → cppcheck → flawfinder, all CI-mirrored) →
+  `make lint` (clang-format → clang-tidy `src/*.c` → cppcheck → flawfinder →
+  `scripts/check-memory-scrubbing.sh`, all CI-mirrored; the scrub step is the `memory-scrub`
+  job) →
   build + CMocka suite under **both** compilers (`make CC=gcc && make test CC=gcc`,
   `make CC=clang && make test CC=clang` — the `compile-matrix` job) →
   `make test-sanitize CC=clang` (the `sanitize-test` job). `make sanitize` (compile-only) is
   **NOT** a CI gate — no CI job runs it; never report it as a passed gate. CI additionally
-  enforces `make rpm` on EL8/EL9/EL10 (`rpm-build` job) on every push/PR to `main`.
+  enforces `make rpm` on EL8/EL9/EL10 (`rpm-build` job in `build.yml`) and the native-distro
+  `distro-build` jobs (`distro-build.yml`: openSUSE Leap 16.0 RPM; Debian 13 + Ubuntu 26.04
+  LTS DEB via `make deb`) on every push/PR to `main`.
+  `build.yml` also enforces the `e2e-sandbox` job: `tests/e2e/run_e2e.sh` drives the
+  **installed** module through a real PAM stack (`/etc/pam.d/e2e`) against the in-repo HTTPS
+  mock OIDC provider (`tests/e2e/mock_oidc.py`, PKCE S256 enforced) — run it locally with
+  `make sandbox` (Docker). The mock's self-signed CA must be in the system trust store, and
+  the PAM module dir is architecture-specific (never hardcode `/lib/x86_64-linux-gnu`; on
+  Apple-Silicon Docker the image is arm64). Linux-PAM status codes are **not** classic PAM
+  numbering: `PAM_SERVICE_ERR=3, PAM_PERM_DENIED=6, PAM_AUTH_ERR=7, PAM_ABORT=26,
+  PAM_MODULE_UNKNOWN=28`; app-side PAM code includes `<security/pam_appl.h>` (Debian has no
+  `pam_ap.h`).
   `.clang-tidy` has `WarningsAsErrors: '*'` and `HeaderFilterRegex: 'include/.*'`; `tests/*.c` is
   not clang-tidy-gated in CI. Do not mark a task complete until these pass **on Linux**.
 - **Never suppress clang-tidy checks** to make a gate pass — fix the underlying code. The single
@@ -52,6 +65,10 @@
   `access_token`, app-owned `Authorization` header). Use `secure_memzero()` / `explicit_bzero()`.
   Zero json-c string leaves via `secure_zero_json_tree()` before `json_object_put()`. libcurl's
   internal `Authorization` header copy cannot be securely zero-filled through the public cURL API.
+   This is mechanically enforced by `scripts/check-memory-scrubbing.sh` (`make check-scrub`;
+   `lint.sh` step 5; CI `memory-scrub` job). Its S3 allowlist currently exempts only `doc`
+   (http.c OIDC discovery metadata — endpoints/methods only, no tokens/PII); any NEW
+   `json_object_put(handle)` without a same-file `secure_zero_json_tree(handle)` FAILS the gate.
 - **`pam_user` buffer ownership:** the string returned by `pam_get_user()` is owned and freed by
   PAM — the module must NOT free it. (History had a leak↔double-free back-and-forth; the invariant
   is that PAM owns these buffers.)
@@ -142,8 +159,710 @@
   `%build` skip recompilation and `%check` link the wrong-toolchain objects (symptom:
   `undefined reference to '__isoc23_strtol'` + DWARF FORM 0x25 errors on EL9 aarch64).
   Run `make clean` (and `rm -rf rpmbuild`) before mirroring the rpm gate locally.
+- **Third-party licensing:** every `third_party/<name>/` must carry license text (a
+  LICENSE/COPYING file or the upstream in-source license header), an `AUTHORS`/`NOTICE`
+  attribution, and a `vendor-provenance.txt` pin; root `THIRD_PARTY_NOTICES.md` must declare
+  every RPM-spec `Requires:` runtime dependency; any copyleft (GPL/LGPL/AGPL) text in
+  `third_party/` fails the gate. Enforced by `scripts/check-licenses.sh` (`make check-licenses`;
+  CI `license-audit.yml` → `license-compliance` job), the GitHub dependency-graph audit
+  (`scripts/audit-dependency-graph.py`; `dependency-graph-audit` job — no-op until GitHub
+  indexes a recognized manifest; the `dependencyGraph` GraphQL field is feature-gated per
+  account, so the job falls back to the REST `dependencies` endpoint on the schema-level
+  "Field 'dependencyGraph' doesn't exist" error, and a REST 404 — the current state, since
+  all dependency-graph REST endpoints 404 even for public repos and this repo is private —
+  is a clean INFO no-op; the auditor accepts both payload shapes, REST has no license data),
+  and the `vendor-audit.yml` drift gate. The notices file is
+  shipped in the RPM source tarball.
+- **`dpkg-shlibdeps` (dpkg >= 1.17; trixie/resolute ship 1.22) is a source-build tool with
+  two traps.** (1) It does not print a bare dependency list: without `-O` it writes to
+  `debian/substvars` in the cwd (stdout empty); with `-O` it prints substvars lines —
+  `shlibs:Depends: <deps>` and, because `libc6` is `Essential:yes` on Debian/Ubuntu,
+  `shlibs:Pre-Depends: libc6 (>= ...)`. (2) It unconditionally loads `debian/control` from
+  the cwd (`Dpkg::Control::Info->new()` with no args → `error 'cannot read debian/control'`
+  otherwise) and needs a parseable `Build-Depends` in the source stanza — so it cannot be
+  pointed at a .so from an arbitrary directory. `packaging/build-deb.sh` therefore builds a
+  scratch source tree (`mktemp -d` + minimal `debian/control` with `Source:` +
+  `Build-Depends: dpkg-dev`), runs `dpkg-shlibdeps -O <abs .so path>` from that cwd, strips
+  the `shlibs:(Pre-)?Depends:` prefixes (extended-regex sed — BSD/macOS sed lacks `\?` in
+  BRE, so the script uses `sed -nE`), merges both fields into the single control-file
+  `Depends:` line, and captures stderr to a mktemp file that is printed on failure.
 
 ## Interaction Log (newest first)
+
+### 2026-11-12 — Regression fix: remove `-pie` from `LDFLAGS` (shared-library link broke on modern binutils)
+- **Task:** The `-pie` addition from the previous entry broke every link:
+  CI `Debian 13 (DEB)` (and any job linking the module) failed with
+  `/usr/lib/.../Scrt1.o: in function '_start': undefined reference to 'main'`.
+- **Root cause:** `-pie` is an *executable* link flag. Even with `-shared`,
+  modern gcc/binutils (Ubuntu gcc 14) pull in the executable CRT start file
+  `Scrt1.o`, whose `_start` references `main` — absent in a shared library.
+  A `-fPIC`/`-fPIE` object set plus `-shared` already yields a fully
+  position-independent DSO; `-pie` at the `.so` link is redundant and
+  actively harmful. (Audit `-fPIE/-pie` flags only make sense for the
+  *executable* targets — e.g. `tests/e2e/pam_driver`, built with its own
+  flags, untouched.)
+- **Fix:** `LDFLAGS` back to `-Wl,-z,relro,-Wl,-z,now`; `-fPIE` kept in
+  `CFLAGS` (compile-time, harmless, proven by the object-compilation
+  steps that passed in CI). Makefile comment documents why no `-pie`.
+- **Standing invariant:** never add link-time `-pie` to the module's
+  `LDFLAGS`; the only link-time hardening flags are the `-z relro`/`-z now`
+  pair.
+- **Verification:** ubuntu:24.04 Docker container mirroring CI — all pass:
+  gcc + clang builds with `EXTRA_CFLAGS=-Werror`, CMocka suite under both
+  compilers, `clang-tidy` gate, `make test-sanitize CC=clang`, and `make deb`
+  (the previously failing link/packaging step). The first container run
+  (before this fix landed in the mounted Makefile) reproduced the CI error
+  verbatim, confirming the root cause. EL rpm jobs still confirmed via CI.
+
+### 2026-11-12 — Post-review fixes: 0.3.0 version sync, `-fPIE/-pie`, `token_type` + silent-2xx observability, DEB `Homepage`, device-lifetime docs
+- **Task:** Implement the recommendations from the comprehensive §10 audit:
+  (1) fix the post-0.3.0-bump version drift at three sync points;
+  (2) add `-fPIE`/`-pie` to the Makefile; (3) optional polish — silent-2xx
+  token-branch log, `token_type` handling, DEB `Homepage:` field,
+  getting-started note on device-code lifetime.
+- **Changes:** `packaging/pam_oidc_device.spec` fallback `mod_version`
+  0.2.0 → 0.3.0 (the `make rpm` path always passes `--define mod_version`;
+  this only affects bare `rpmbuild` invocations);
+  `packaging/gen-changelog.py` `default_ver` → 0.3.0; `.agents/context.md`
+  §1 → v0.3.0. Makefile: `-fPIE` appended to `CFLAGS`, `-pie` to `LDFLAGS`
+  (compile-time intent; the `-pie` link flag turned out to be wrong for a
+  shared-library link — see the regression-fix entry above). `src/pam_module.c`
+  `poll_for_access_token`: (a) RFC 6749 s5.1 — a present-but-foreign
+  `token_type` (anything other than `"Bearer"`) now fails closed with
+  `PAM_AUTH_ERR`; a missing field is DEBUG-logged and tolerated (some
+  providers omit it; the e2e mock already emits `"token_type": "Bearer"`,
+  so no e2e expectation changed); (b) new LOG_DEBUG line when a 2xx token
+  response carries no usable `access_token` (non-object body, non-string
+  `access_token`, or empty string), replacing the previously silent loop
+  `break`. `packaging/build-deb.sh`: `Homepage:` field added to the DEB
+  control stanza. `docs/getting-started.md` §4: NOTE that the provider's
+  `expires_in` clock starts at the code request — before the ENTER prompt —
+  and that `max_poll_seconds` caps the polling window.
+- **Verification status:** local (macOS) only: no sensitive-buffer or
+  `Requires:` surface touched, so the memory-scrub and license gates are
+  unaffected. **NOT run — requires the Linux gates:** clang-format /
+  clang-tidy / cppcheck (the `src/pam_module.c` edit), gcc+clang builds +
+  tests, `make test-sanitize CC=clang`, e2e sandbox, rpm/deb — the CI
+  compile-matrix / sanitize / e2e-sandbox / distro-build jobs are the
+  confirmation.
+
+### 2026-11-12 — Documentation restructure: end-user journey organization
+- **Task:** Rebase root-level `*.md`, `docs/`, and `examples/` so the initial
+  focus is an end user implementing from scratch (why → getting started →
+  early testing → advanced configuration → security → contributing), while
+  keeping deeper technical content available but not up front; keep using
+  standard GitHub-expected file placement.
+- **Decisions & Rationale:**
+  - `README.md` rewritten as a hub: pre-release warning now links to
+    `docs/developer/review.md`; new "How It Works" plain-English 4-step
+    section added after the intro; quickstart trimmed and points to the new
+    `docs/getting-started.md` and `docs/packaging.md`; "Detailed
+    Documentation & Deep Dives" table replaced with an "I want to…" journey
+    table; the ~60-line "Building & Binary Packaging (RPM & DEB)" section
+    removed (moved verbatim to `docs/packaging.md`).
+  - New `docs/getting-started.md` absorbs the deleted `docs/pam-ssh-setup.md`
+    (sshd directives, stack order, required-vs-sufficient warning, uid>=1000
+    guard, authselect options, loglevel table) plus prerequisites, per-distro
+    source install, and the full sample config (config section → reference
+    table). `docs/pam-ssh-setup.md` deleted.
+  - New `docs/packaging.md` = README packaging section (unchanged content;
+    user confirmed packaging artifacts/scope stay untouched — RPM spec, DEB
+    script, sdist list NOT modified).
+  - `REVIEW.md` → `docs/developer/review.md`; its §4 stale CMake/ctest
+    instructions corrected to `make` / `make test` (project is Make-only, no
+    CMakeLists.txt), `test_suite.c` → `tests/test_suite.c`.
+  - `docs/testing.md` §6 roadmap extracted to `docs/developer/roadmap.md`;
+    all `docs/pam-ssh-setup.md` references updated to `docs/getting-started.md`
+    with new section numbers (§1–2→§2–3, §1→§4, §2→§5); See-also updated.
+  - `docs/threat-model.md`: two `pam-ssh-setup.md` links → `getting-started.md`.
+  - `.agents/context.md`: repo-layout + "Root docs" + §9 project-documents
+    lists updated; §10.3 audit prompt no longer references CMake/CMakeLists;
+    §10.4 doc-accuracy prompt references `docs/` instead of `REVIEW.md`.
+  - `CHANGELOG.md` [Unreleased] Changed entry added for the restructure.
+- **Gotchas & Lessons:**
+  - Shell heredocs in this environment can silently fail to execute (observed
+    a python heredoc "run" that never ran and a `cat -A` macOS failure);
+    prefer the editor tool for file surgery, and re-grep to confirm each edit
+    landed before moving on.
+  - `THIRD_PARTY_NOTICES.md` must stay at repo root (CI `check-licenses.sh`
+    check L1 enforces it); `README.md` "Third-Party Components & Licenses"
+    section heading kept verbatim so its anchor link from the notices file
+    stays valid.
+- **Verification:** All edits verified by re-grep — no remaining references to
+  `REVIEW.md`, `docs/pam-ssh-setup.md`, `CMakeLists`, or the removed README
+  anchor `#building--binary-packaging-rpm--deb` anywhere in the repo; all
+  markdown links in `README.md`, `docs/`, `examples/`, `SECURITY.md` resolve
+  to existing files; `git status` shows only the intended
+  add/delete/modify set. No C code touched, so no build/test/lint gates are
+  affected; CI gates unaffected by docs-only changes.
+- **Follow-ups / Open Items:**
+  - `CODE_OF_CONDUCT.md` intentionally not created (needs an organizational
+    policy decision, out of scope here).
+  - Packages currently ship only root docs (spec `%doc README.md
+    CHANGELOG.md SECURITY.md`, same for DEB docdir); user opted to leave
+    packaging untouched — revisit if we want `docs/`/`examples/` shipped.
+  - Push + verify in CI (docs-only; expect no job changes).
+
+### 2026-11-12 — Fixed `e2e-sandbox` CI job: run_e2e.sh non-root privilege bugs
+- **Task:** The `e2e-sandbox` job in `build.yml` (new in ba9568d, never previously green)
+  aborted with `/etc/pam_oidc_device.conf exists but does not point at the sandbox mock;
+  refusing to overwrite` even though the job had pre-staged the e2e fixture.
+- **Root cause (two bugs, both only outside the Docker sandbox):** the CI job runs the
+  harness as the unprivileged `runner` user; `make sandbox` runs it as root, so neither
+  bug ever showed there.
+  1. The config-reuse check ran `grep` on `/etc/pam_oidc_device.conf` **without** `$SUDO`,
+     but the file is `root:root 0600` — permission-denied, masked by `2>/dev/null`,
+     misreported as "does not point at the sandbox mock".
+  2. `WORKDIR` was created `root:root 0700` (`$SUDO install -d`), yet the scenario file,
+     TLS key/cert, driver binary, mock log, and per-case `.out` files are all written
+     later **without** root — every one of them would have been the next failure.
+- **Fix (commit 5368a6b):** `tests/e2e/run_e2e.sh` — (a) `$SUDO grep` for the mock-URL
+  check; (b) workdir is now created owned by the invoking user (`install -d -m 0700`
+  without sudo), with `$SUDO chown -R "$(id -u):$(id -g)"` takeover of any pre-existing
+  root-owned workdir (idempotent across root/non-root reruns). Root-mode (Docker)
+  behavior is byte-for-byte unchanged (no-ops).
+- **Gotchas & Lessons:**
+  - Any script that mixes `$SUDO` system writes with plain-user I/O must keep the
+    user-I/O area (workdir) user-owned; audit every `>` redirection and `openssl`/`cc`
+    output path for ownership, not just the obviously-root operations.
+  - `2>/dev/null` on a check grep converts "cannot read" into "content mismatch" —
+    distinguish the two when the file has restrictive permissions.
+- **Verification:** `bash -n` clean; `grep -q "127.0.0.1:8443"` confirmed to match the
+  fixture; root-mode paths re-audited (no-op `chown 0:0`, `SUDO=""`). **Still requires
+  CI:** the full 7-scenario run can only happen on the Linux `e2e-sandbox` job.
+
+### 2026-11-11 — Fixed `make deb` CI failure: dpkg-shlibdeps output format (Debian 13 + Ubuntu 26.04 jobs)
+- **Task:** Both DEB jobs in `distro-build.yml` failed at `make deb` with
+  "dpkg-shlibdeps produced no dependencies" even though the module .so built fine.
+- **Root cause:** On dpkg >= 1.17 (trixie/resolute ship 1.22) `dpkg-shlibdeps` prints
+  **nothing** to stdout without `-O` (it writes a `debian/substvars` file in the cwd —
+  confirmed in the 1.22.22 source: `scripts/dpkg-shlibdeps.pl`,
+  `my $varlistfile = 'debian/substvars'`). With `-O` the stdout lines are substvars-formatted
+  (`shlibs:Depends: ...`), and `libc6` lands in `shlibs:Pre-Depends` (Essential:yes). The
+  original `grep -v '^dpkg-shlibdeps'` filter matched a non-existent bare-list format;
+  `2>/dev/null` also hid all diagnostics.
+- **Fix:** `build-deb.sh` now uses `dpkg-shlibdeps -O`, `sed -nE` prefix strip, merges
+  Pre-Depends+Depends, and keeps stderr for failure diagnostics.
+- **Gotchas & Lessons:**
+  - Verify dpkg tooling behavior against the actual distro's source (downloaded
+    `dpkg_1.22.22.tar.xz` from deb.debian.org; git.dpkg.org and salsa are bot-walled).
+  - macOS BSD sed lacks `\?` in BRE — use `sed -E` in repo scripts for portability.
+  - The SUSE RPM job was unaffected (rpmbuild has its own shlibdeps handling).
+- **Verification:** Local: `bash -n` clean; sed pipeline validated against simulated
+  dpkg 1.22 output (merged Pre-Depends+Depends, single-field, and no-match cases);
+  `make check-scrub` + `make check-licenses` pass. Still requires CI: the real
+  `make deb` on Debian 13 / Ubuntu 26.04 in `distro-build.yml`.
+- **Follow-up (second CI round):** the `-O` fix was not enough — CI then failed with
+  `dpkg-shlibdeps: error: cannot read debian/control: No such file or directory`. Second
+  source check (`Dpkg::Control::Info` in the 1.22.22 tarball,
+  `scripts/Dpkg/Control/Info.pm` + `dpkg-shlibdeps.pl` line 168):
+  `Dpkg::Control::Info->new()` is called **unconditionally** and with no args it loads
+  `debian/control` from the cwd, and lines 212–216 require a parseable
+  `Build-Depends`/`Build-Depends-Arch` in the source stanza. Fix: `build-deb.sh` now
+  creates a scratch source tree (`mktemp -d` + minimal `debian/control` with
+  `Source:` + `Build-Depends: dpkg-dev`, EXIT-trap cleanup) and runs
+  `dpkg-shlibdeps -O <abs .so path>` from that cwd. Validated against a fake
+  1.22-behavior `dpkg-shlibdeps` on macOS (old cwd → reproduces the exact CI error;
+  new scratch tree → clean merged `SHLIB`).
+- **Follow-up (third CI round, same day):** scratch tree alone was still not enough —
+  CI then failed `dpkg-shlibdeps produced no dependencies` with **exit 0, empty stdout
+  AND empty stderr** (contradicts a 1.22.22 source walk that says deps must be
+  generated). New root-cause clue found in 1.22.22/1.23.7 source:
+  `Dpkg::Path::get_pkg_root_dir()` walks the **analyzed binary's ancestor dirs** for a
+  `DEBIAN/` subdir, and `dpkg-shlibdeps.pl my_find_library()` searches those package
+  trees first. The .so lived under `build/deb/...`, whose sibling `build/deb/DEBIAN/`
+  (our hand-rolled control) made the **staging dir** the "package root" — an
+  unsupported non-source-tree invocation (also explains why CI showed none of the
+  usual stderr warnings). Note: dpkg 1.23.7 (Ubuntu 26.04 "resolute") is
+  behaviorally identical to 1.22.22 for this code path (diffed `dpkg-shlibdeps.pl`,
+  `Dpkg/Path.pm`, `SymbolFile.pm` — only style changes); trixie symbols files DO
+  populate the `deps` list from the section header (`libcurl.so.4 libcurl4t64
+  #MINVER#`), so the symbols-branch empty-deps theory was disproven with a real
+  trixie `libcurl4t64` .deb.
+  - **Fix attempt 2:** stage the .so at its final install path *inside* FAKESRC
+    (`$FAKESRC/lib/<multiarch>/security/<name>.so`, copied via `install`), run
+    `dpkg-shlibdeps -O` against that copy — canonical `dh_shlibdeps`-style usage
+    (binary under the package build root; `guess_pkg_root_dir` then resolves
+    cleanly and the bogus package-tree search disappears).
+  - A `deb_debug_dump()` (**TEMP-DEBUG**, must be removed) was added to both
+    failure branches: dpkg version, raw stdout/stderr of `dpkg-shlibdeps -O`,
+    `-v -v` re-run, `objdump -p` NEEDED lines, FAKESRC tree. Keep until a green
+    round, then delete the function + its two call sites.
+- **Resolution (fourth CI round, same day):** the TEMP-DEBUG dump proved the
+  FAKESRC staging fix works — dpkg 1.22.22 resolved every NEEDED library and
+  printed `shlibs:Depends=libc6 (>= 2.38), libcurl4t64 (>= 7.16.2),
+  libjson-c5 (>= 0.15), libpam0g (>= 0.99.7.1), libssl3t64 (>= 3.0.0)`.
+  The real last bug: dpkg-shlibdeps `-O` emits the **substvars file format
+  `name=value`** (equals sign), not the man-page-style `shlibs:Depends: `
+  colon form the sed filter expected — so the filter matched nothing on a
+  perfectly good run. Fixed with `sed -nE
+  's/^shlibs:(Pre-)?Depends[:=][[:space:]]*//p'` (accepts both separators)
+  and the TEMP-DEBUG block was removed (commit 06813b5). The full causal
+  chain, for posterity: (1) no `-O` flag → nothing on stdout (and the
+  original filter expected a bare list) — fixed with `dpkg-shlibdeps -O` +
+  sed prefix strip; (2) unconditional `debian/control` load from the cwd —
+  fixed by the FAKESRC scratch source tree; (3) `get_pkg_root_dir`
+  ancestor walk + staging-dir `DEBIAN/` — fixed by staging the .so inside
+  FAKESRC; (4) `=` vs `:` substvars separator — fixed by the `[:=]` filter.
+  Note: on trixie dpkg 1.22.22, `libc6` lands in `shlibs:Depends`, not
+  `shlibs:Pre-Depends` (the merge still handles both).
+- **Verification:** `bash -n` clean; capture pipeline validated locally
+  against a fake `dpkg-shlibdeps` reproducing the exact observed 1.22.22
+  output; `make check-scrub` + `make check-licenses` pass. The remaining
+  proof is the next `distro-build` CI round on Debian 13 + Ubuntu 26.04
+  (Ubuntu's dpkg 1.23.7 emits the same substvars format — diffed
+  `dpkg-shlibdeps.pl`; the dual-separator filter hedges either way). Local
+  Linux hosts are unavailable on this Mac — CI is the only live test bed.
+- **Follow-up (fifth CI round, same day):** the shlibdeps fix worked and
+  `make deb` then reached `dpkg-deb --build`, which failed with
+  `package name has characters that aren't lowercase alphanums or '-+.'`
+  — Debian package names **cannot contain underscores** (this was simply
+  the next pre-existing bug masked by the earlier failure). Fixed
+  (commit 8a6125e): `build-deb.sh` now derives `DEBNAME="${NAME//_/-}"`
+  (`pam-oidc-device`) and uses it for the `Package:` field, the
+  `/usr/share/doc/` dir, and the output filename
+  (`build/pam-oidc-device_<ver>_<arch>.deb`); in-package files keep the
+  underscore module name (`pam_oidc_device.so`, `/etc/pam_oidc_device.conf`).
+  `.github/workflows/distro-build.yml` find-globs and the README install
+  examples updated to the new filename. Divergence from the RPM name
+  (`pam_oidc_device`) is intentional and documented — RPM allows
+  underscores. Remaining proof: next `distro-build` round; any later
+  failure will come from `dpkg-deb --build` staging or `dpkg -i`
+  verification, not from dependency derivation.
+- **Follow-up (SUSE rpm, same day):** the `SUSE: openSUSE Leap 16.0`
+  job failed in `%build` with `ld: cannot find %{build_ldflags}`. The
+  spec's long-standing `%build` line
+  `make CFLAGS="%{build_cflags}" LDFLAGS="%{build_ldflags} ..."` mixes
+  distro macros with project flags: on Leap 16.0 `build_cflags` IS
+  defined (expanded to SUSE optflags + fortify/protector/unwind) but
+  `build_ldflags` is UNDEFINED, and rpmbuild leaves undefined `%{...}`
+  as literal text — the literal reached the link line. Fixed
+  (commit d4a2c4c): `%build` is now a bare `make` using the Makefile's
+  own default flag bar (`-fstack-protector-strong -D_FORTIFY_SOURCE=3
+  -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2
+  -Wformat-security -fPIE -O2 -g`, `LDFLAGS=-Wl,-z,relro,-z,now`; no
+  `-pie` — see the 2026-11-12 `-pie` regression entry below) —
+  distro-independent, stronger than SUSE's `build_cflags`, and
+  identical to what the DEB path builds with. The strict warning set
+  was already proven on Leap's gcc 15 by the workflow's earlier
+  zero-warning build step. Also eliminates any macro-availability risk
+  on EL8/9/10 `rpm-build` (same spec). Verify-step consistency
+  re-checked: `_libdir=/lib64` on SUSE x86_64 matches
+  `ls /lib64/security/...`; RPM name glob unaffected.
+- **Follow-up (SUSE verify step, same day):** the bare-`make` `%build`
+  fix worked — the RPM built AND `%check` (make test) passed; the job
+  then failed at verify: `zypper install` rejected the locally-built
+  RPM with `Signature verification failed [6-File is unsigned]` —
+  zypper enforces GPG checks by default and CI builds unsigned packages
+  (no signing key in the container). Fixed (commit 86dc766): the SUSE
+  verify step now runs
+  `zypper --non-interactive --no-gpg-checks install "$MAIN_RPM"`. The
+  EL rpm-build job (`dnf install -y <local .rpm>`) is unaffected — dnf
+  does not block unsigned local installs. YAML re-validated locally.
+  Remaining proof: next SUSE round — if it passes verify's
+  `ls /lib64/security/... /etc/pam_oidc_device.conf`, the whole
+  distro-build matrix (SUSE + Debian 13 + Ubuntu 26.04) is done.
+
+### 2026-11-11 — SUSE / Debian / Ubuntu packaging support + `distro-build.yml` CI workflow
+- **Task:** Make Makefile/packaging support SUSE (RPM), Debian, and Ubuntu (DEB); add CI jobs
+  building on the latest LTS of each family.
+- **Decisions & Rationale:**
+  - Spec gained an `%if 0%{?suse_version}` branch in
+    `packaging/pam_oidc_device.spec`. **Verified SUSE binary names via rpmfind.net
+    (`system=opensuse`), filtered to 15.6/16.0-era release tags (`150600.*`, `160000.*`):**
+    build-time `pam-devel`, `libcurl-devel`, `libjson-c-devel`, `libopenssl-devel`,
+    `libcmocka-devel` (SUSE uses `libcmocka-devel`, *not* `cmocka-devel`; `json-c-devel` is an
+    old Tumbleweed name — modern SUSE is `libjson-c-devel`; openssl devel is
+    `libopenssl-devel`); runtime `pam`, `libcurl4`, `libjson-c5`, `openssl`.
+  - **No new C code** — packaging/CI/docs only, so the §4 security guardrails and all C gates
+    are unaffected.
+  - `make deb` = `packaging/build-deb.sh`: hand-crafted `.deb` via `dpkg-deb`
+    (`--root-owner-group`, no fakeroot needed) + `dpkg-shlibdeps` for distro-correct
+    `Depends` (handles `libcurl4t64`/`libssl3t64`-style t64 renames without hardcoding);
+    module staged to `/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security` (same path the
+    e2e harness uses — Debian/Ubuntu libpam's module dir); `/etc/pam_oidc_device.conf` is a
+    `0600` conffile; Maintainer matches `MODULE_MAINTAINER` in `include/metadata.h`.
+  - New `.github/workflows/distro-build.yml` (push/PR to `main`, `contents: read`,
+    concurrency-cancel, SHA-pinned checkout): matrix of **opensuse/leap:16.0** (SUSE RPM),
+    **debian:13**, **ubuntu:26.04** (both DEB); each job = install deps →
+    `make EXTRA_CFLAGS=-Werror` → `make test EXTRA_CFLAGS=-Werror` → `make rpm|deb` →
+    install the artifact → `ls` the installed layout.
+  - `scripts/check-licenses.sh` L4 now collects **all** `Requires:` lines (EL + SUSE branches,
+    `awk 'tolower($1)=="requires:"'` + `sort -u`) instead of the first one;
+    `THIRD_PARTY_NOTICES.md` declares the per-distro names so L4 passes for `libcurl4` /
+    `libjson-c5` / `openssl` etc.
+  - Distro "latest LTS" pins (as of 2026-11): openSUSE Leap **16.0** (SUSE family), Debian
+    **13** (trixie), Ubuntu **26.04** LTS ("resolute"). Verified tag existence: Docker Hub
+    registry manifest API (Hub's `tags/` API returns 404 even for valid tags — a known quirk;
+    query `registry-1.docker.io/v2/<repo>/manifests/<tag>` with a bearer token instead).
+    `libcmocka-dev` on Ubuntu 26.04 lives in **universe** (enabled by default in ubuntu images;
+    verified via `archive.ubuntu.com/dists/resolute/universe/.../Packages.xz`).
+- **Gotchas & Lessons:** SUSE naming traps — cmocka devel is `libcmocka-devel` on SUSE too;
+  json-c devel is `libjson-c-devel` (not EL's `json-c-devel`) on 15.6/16.0; openssl devel is
+  `libopenssl-devel`; runtime libs are `libcurl4`/`libjson-c5`/`openssl` (no `-libs` suffix).
+  From this dev host, SUSE/OBS endpoints are unreachable (api.opensuse.org wants auth,
+  build.opensuse.org 403, ftp.opensuse.org times out) — rpmfind.net search (`system=opensuse`)
+  is a working fallback for SUSE package-name verification.
+- **Verification:** local (macOS): `bash -n packaging/build-deb.sh`, YAML parse of
+  `distro-build.yml` + `build-deb.sh` control-file heredoc logic, `make -n deb` recipe
+  expansion, `make check-scrub`, `make check-licenses` (L4 now exercises the SUSE branch
+  names), README/CONTRIBUTING/context/memory docs updated. **NOT yet verified:** actual
+  `make rpm` on openSUSE 16.0, `make deb` on Debian 13 / Ubuntu 26.04, and the CI install
+  steps — these first run in the pushed `distro-build` jobs (docker pull is broken on this
+  host, so no local container verification was possible).
+- **Follow-ups / Open Items:** If the first `distro-build` run shows a zypper "package not
+  found" for a SUSE name (the workflow probes candidates on failure), fix the name in the
+  spec's SUSE branch + the README quickstart. Consider adding `make deb` to a release
+  automation / multi-arch (arm64) matrix later.
+
+### 2026-11-11 — Fixed license-audit `dependency-graph-audit` CI hard-fail (feature-gated GraphQL field)
+- **Task:** The `dependency-graph-audit` job in `license-audit.yml` failed with
+  `gh: Field 'dependencyGraph' doesn't exist on type 'Repository'`.
+- **Root cause:** `Repository.dependencyGraph` is a per-account **feature-gated** GraphQL
+  field. On accounts without the supply-chain dependency-graph feature the field is simply
+  absent from the served schema, so `gh api graphql` fails at *validation time* (schema-level
+  error, before execution). Not fixable by token, permissions, or retries.
+- **Decisions & Rationale:**
+  - Workflow: tolerate **only** that exact schema error (grep on stderr) and try the REST
+    `GET /repos/{owner}/{repo}/dependencies`; a REST **404** (the initial fix assumed a
+    deterministic `[]` — wrong: the first CI run failed with `gh: Not Found (HTTP 404)`).
+    Investigation: the repo is **private** (repo metadata 404 unauthenticated), and *every*
+    dependency-graph REST shape (`/dependencies`, `/dependency-graph/{packages,dependencies,
+    license-summary,package-ecosystem-summary,services}` ± beta media types) also 404s for
+    **public** repos (torvalds/linux) — these endpoints are not publicly served today. So:
+    REST 404 = "no dependency-graph data available" → record `[]` for a clean INFO no-op
+    (safe: `GITHUB_REPOSITORY` is always a real repo in CI, so 404 can't mean
+    misconfiguration); every other query failure still hard-fails the job. `set -e` dropped
+    from that step in favor of the explicit if/elif/else.
+  - `scripts/audit-dependency-graph.py` now classifies payloads: GraphQL
+    `data.repository.dependencyGraph.packagesV2.nodes` → full license-allowlist audit
+    (unchanged semantics); REST top-level array → names cross-checked against
+    `THIRD_PARTY_NOTICES.md`, licenses reported `unknown` with an explicit NOTE (no failure
+    invented from missing data); feature-gated `errors[]` payload → INFO no-op; REST error
+    objects (`{"message": ...}`), malformed JSON, and other GraphQL errors still fail.
+  - Docs synced: `THIRD_PARTY_NOTICES.md` gate table, `.agents/context.md` §3.1 step 11,
+    `CHANGELOG.md` [Unreleased] Fixes.
+- **Verification status:** locally verified on macOS with Python fixtures — 10 payload
+  scenarios pass (feature-gated error, empty graph, allowed package, off-allowlist GPL
+  package, unknown GraphQL error, REST empty, REST populated with undeclared-name WARN,
+  REST error object, malformed JSON, missing file); the workflow's *exact* run block
+  (extracted from the YAML, so it can't drift) was simulated with a fake `gh` across all
+  five branches (ok / gated→REST-ok / gated→REST-404→no-op / gated→REST-500→hard fail /
+  unexpected GraphQL error → hard fail) and the workflow YAML re-parsed. Live API probes:
+  repo metadata 404 unauthenticated (private repo); all dependency-graph REST shapes 404
+  even for public repos. **Still requires CI:** the `license-audit` jobs have not run
+  remotely with the 404-handling fix.
+- **Follow-ups / Open Items:** confirm `dependency-graph-audit` is green on the next push
+  (expect two INFO lines + "no indexed packages"); if GitHub ever serves the dependency-graph
+  data for this account/repo (feature enabled / repo made public / manifest indexed), the
+  audit activates automatically — GraphQL with license data if the schema field appears,
+  otherwise the REST name cross-check.
+
+### 2026-11-11 — Pre-production testing guide + one-command e2e sandbox (tests/e2e)
+- **Task:** Document how users test/audit the module before production (pamtester usage,
+  optional one-command Docker sandbox with mock OIDC, "what else" recommendations), and
+  integrate the sandbox into the automated test framework.
+- **Decisions & Rationale:**
+  - New `tests/e2e/`: `mock_oidc.py` (Python 3 stdlib, HTTPS via self-signed cert trusted via
+    the system CA store; scenario file selects per device-code request; **enforces PKCE S256
+    for real** — stores code_challenge, rejects token polls whose code_verifier does not
+    re-derive to it; issues alg=none JWTs so `verify_jwt_claims` runs), `pam_driver.c`
+    (deterministic PAM driver: classical `pam_conv` multi-message conv, prints
+    PAM_TEXT_INFO/PAM_ERROR_MSG, auto-answers the module's "Press [Enter]" prompt, exits with
+    the PAM retval), `pam_oidc_device.e2e.conf` (use_pkce=true, verify_jwt_claims=true,
+    issuer/audience pinned to https://127.0.0.1:8443), `pam.d-e2e` (`auth requisite
+    pam_oidc_device.so` under throwaway service `e2e`), `run_e2e.sh` (7 asserted scenarios:
+    success / claim-mismatch / provider-denied / slow_down-backoff / root-denied / code-expired
+    / fail-closed 0644 config), `Dockerfile` (ubuntu:24.04, production-style install).
+  - `Makefile`: `make sandbox` (build+run, headless) and `make sandbox-shell`; CI: new
+    `e2e-sandbox` job in `build.yml` (same harness, no docker-in-docker; PAM module dir
+    computed architecture-aware via `dpkg-architecture` — **/lib64/security on EL,
+    /lib/<multiarch>/security on Debian/Ubuntu**).
+  - `docs/testing.md` — full guide: test layers, sandbox, `pamtester` setup + PAM
+    return-code table + 7-case negative matrix + real-ssh gold standard, real-IdP trial
+    checklist, pre-production audit/rollback checklist, roadmap (config-check CLI, sshd e2e,
+    authselect template, provider matrix, more scenarios, fuzzing).
+  - **Why not drive automation with `pamtester` itself:** its source could not be located in
+    the linux-pam trees (it ships as its own tiny distro package, e.g. Debian `pamtester
+    0.1.2`), so its conversation handling of the module's Enter prompt is unverifiable;
+    `pam_driver.c` is the deterministic substitute (pamtester remains the documented manual
+    tool, with a NOTE about the prompt caveat).
+- **Gotchas & Lessons:**
+  - Debian/Ubuntu `libpam0g-dev` provides `security/pam_appl.h` + `pam_ext/pam_modules.h` but
+    **no `pam_ap.h`** — app-side PAM code must include `pam_appl.h` (EL has both).
+  - `pam_start()` takes `const struct pam_conv *` (a struct whose `.conv` is the classical
+    `(int num_messages, const struct pam_message **, struct pam_response **, void *)` fn) —
+    not a bare conv pointer; `pam_response` field is `resp` (not `resp_msg`).
+  - **Linux-PAM status numbers are NOT classic PAM v1 numbering**: on Linux-PAM
+    `PAM_SERVICE_ERR=3, PAM_PERM_DENIED=6, PAM_AUTH_ERR=7, PAM_AUTHINFO_UNAVAIL=9,
+    PAM_ABORT=26, PAM_MODULE_UNKNOWN=28` (classic PAM has AUTH_ERR=1, PERM_DENIED=7,
+    SERVICE_ERR=12, ...). Verify against `/usr/include/security/_pam_types.h` before
+    hardcoding expectations; `pam_strerror` prints the name either way.
+  - Docker images on Apple Silicon are arm64: a module installed to
+    `/lib/x86_64-linux-gnu/security` is **PAM_MODULE_UNKNOWN** to an arm64 PAM — compute the
+    PAM dir, don't hardcode it.
+  - When the e2e run fell back to `/etc/pam.d/other` → `common-auth` (pam_unix hidden
+    "Password:" prompt, every case PAM_AUTH_ERR), the cause was a missing
+    `/etc/pam.d/e2e` install line lost during a split editor write — always grep the script
+    after multi-chunk file creation.
+  - `run_e2e.sh` refuses to overwrite an existing `/etc/pam_oidc_device.conf` that doesn't
+    point at the sandbox mock; `make install` installs the stock sample config if absent — so
+    both the Dockerfile and the CI job pre-stage the e2e fixture *before* `make install`.
+- **Verification:** `make sandbox` green end-to-end on this host (Docker 29.9.3, arm64
+  Ubuntu 24.04 container): all 7 scenarios pass, mock log shows full device→token→userinfo
+  flow with `pkce=yes` on every issue; manual in-container runs confirmed root→6 and
+  0644-config→3 with the expected log lines. `bash -n`, `python3 -m py_compile` clean.
+  **Still requires CI:** the new `e2e-sandbox` job has not run remotely; C code in `src/`
+  unchanged so the existing gcc/clang/lint/sanitize gates are unaffected.
+- **Follow-ups / Open Items:** push and confirm `e2e-sandbox` is green in CI; watch
+  `pamtester` behavior on hosts (doc NOTE covers the Enter-prompt caveat); roadmap items in
+  docs/testing.md §6 (config-check CLI, sshd-in-container e2e, authselect template, provider
+  matrix, PAM_ABORT/group/PKCE-auto scenarios, config-parser fuzzing).
+
+### 2026-11-11 — Third-party notices + license-compliance automation (license-audit)
+- **Task:** Add root `THIRD_PARTY_NOTICES.md` (detailed) + compact README section, and automate
+  license compliance in CI (local mechanical gate + GitHub dependency-graph audit).
+- **Decisions & Rationale:**
+  - Licenses verified against upstream before writing: Nayuki qrcodegen MIT (in-source header);
+    Linux-PAM = 3-clause BSD-style notice, "ALTERNATIVELY ... GNU GPL" per upstream COPYING;
+    cURL = the "curl license" (MIT-style permission notice); json-c = MIT (COPYING: Haszlakiewicz
+    + Metaparadigm); OpenSSL = Apache-2.0 (3.x, repo badge + README; historical: dual); CMocka =
+    Apache-2.0 per cmocka.org (1.x distro releases: 3-clause BSD) — build-only, never shipped.
+  - `scripts/check-licenses.sh` layers: L1 notices present; L2 per-component license text +
+    attribution + provenance; L3 copyleft rejection; L4 spec `Requires:` cross-declaration.
+    L2's license-text patterns *include* copyleft headers, so a GPL component fails at L3
+    (the correct layer), not L2.
+  - `scripts/audit-dependency-graph.py` audits `gh api graphql` `packagesV2` output against a
+    permissive allowlist: empty graph → INFO + exit 0; undeclared package → WARN only;
+    off-allowlist license or GraphQL `errors[]` → exit 1. Auto-activates when a manifest
+    (CMakeLists.txt, package.json, ...) is ever added.
+  - New `license-audit.yml` (push/PR main + monthly 08:00 UTC + dispatch; `contents: read`;
+    SHA-pinned checkout v7.0.1; concurrency group); `make check-licenses` target; RPM source
+    tarball now includes `THIRD_PARTY_NOTICES.md`.
+- **Gotchas & Lessons:** spec `Requires:` values are comma-separated — first L4 attempt parsed
+  `pam,` and failed; normalize with `tr ',' ' '`. macOS `cat -A` doesn't exist (use `cat -v`).
+  Editor `new_text` > ~6000 chars is rejected — write the notices file in 3 inserts.
+- **Verification:** `make check-licenses` green locally; negative tests all reverted cleanly —
+  L1 (file moved away) / L2 (bare component) / L3 (GPL header now fails at L3, not L2) / L4
+  (json-c scrubbed from notices) each fail with exit 1; python audit exercised on mock
+  empty/GPL/GraphQL-error payloads (exits 0/1/1). No C code changed, so build/lint/test gates
+  are unaffected. **Still requires CI:** the new `license-audit.yml` jobs have not run remotely.
+- **Follow-ups / Open Items:** push the branch and confirm both `license-audit` jobs are green
+  in CI (the GraphQL field shape — `dependencyGraph.packagesV2` — was written from the current
+  schema; watch the first remote run).
+
+### 2026-11-11 — Memory-scrub inspection gate + jwt.c ID-token payload PII scrub fix
+- **Task:** User asked to set up Makefile + GitHub Actions to run on every push: (1) static analysis (cppcheck/flawfinder/clang-tidy), (2) ASan/UBSan test builds, (3) memory-management inspection verifying secrets/buffers/state are explicitly zeroed before free/return.
+- **Decisions & Rationale:**
+  - Items (1) and (2) already existed and were left untouched: `make lint` (clang-format/clang-tidy/cppcheck/flawfinder, all CI-mirrored in `lint.yml`) and the `sanitize-test` job (`make test-sanitize CC=clang`, ASan+UBSan+LSan, builds AND runs the CMocka suite). Do not duplicate these gates.
+  - Item (3) was new: `scripts/check-memory-scrubbing.sh` — pure bash/grep (no PAM headers, no toolchain; runs identically on macOS and CI). S1: every `free()` of a sensitive heap buffer (`postfields`, `token_postfields`, `access_token`, `payload_b64`, `payload_json_str`, `resp->body`) requires a same-file `secure_memzero()`/`explicit_bzero()` scrub with first-scrub ordered before first-free. S2: plain `memset()` of a sensitive anchor (incl. `code_verifier`, `code_challenge`, `client_secret`, `device_code`, `cfg`, `dev`) is only tolerated when a secure scrub of the same anchor also exists in the file (top-of-function init-zeroing is kept; memset-as-only-zeroing fails). S3: every `json_object_put(X)` requires same-file `secure_zero_json_tree(X)`; only allowlisted handle is `doc` (http.c discovery metadata, no secrets/PII).
+  - Wiring: `Makefile` `check-scrub` target (+ `.PHONY`); `lint.sh` step 5 (so `make lint` and `.githooks/pre-commit` run it — no hook change needed, only a comment fix); new `memory-scrub` job appended to `lint.yml` (runs on `push: [main]` + `pull_request`, `permissions: contents: read` inherited); context.md §3.1 renumbered (new step 6, loop now 1–10; `make lint` shortcut now "steps 1–5"); §3.2 + §4.1 + §3.3 updated.
+  - **Real §4.1 gap the gate caught:** `src/jwt.c` released the provider-parsed ID-token payload via `json_object_put(payload_json)` at 9 sites without scrubbing json-c's private PII string copies (only app-owned `payload_b64`/`payload_json_str` were scrubbed). Fix: `secure_zero_json_tree()` de-staticed (pam_module.c) and exported via `include/pam_oidc_device.h` (documented); all 9 `jwt.c` sites now scrub before put (bulk perl insertion, verified by grep).
+- **Gotchas & Lessons:** ERE gotcha: in `grep -E` an escaped `\(` matches a literal OPEN paren — a stray trailing `\(` in the scrub pattern demanded `secure_memzero(id(` and silently broke S1/S3 detection (every real scrub "missing"). Negative-testing the script requires copying it INTO the fixture tree (`cd "$(dirname "$0")/.."` resolves to the script's own repo, so running it from the real repo by absolute path against a /tmp fixture silently checks the real tree).
+- **Verification (all on Linux, ubuntu:24.04 container mirroring CI):** `make check-scrub` ✓; `make lint` ✓ (clang-format + clang-tidy + cppcheck + flawfinder 2.0.19 + memory-scrub); `make CC=gcc EXTRA_CFLAGS=-Werror` + `make test CC=gcc` 51/51 ✓; same for clang ✓; standalone `clang-tidy src/*.c` ✓; `make test-sanitize CC=clang EXTRA_CFLAGS=-Werror` 51/51 ✓ (ALL_GATES_PASSED). Locally (macOS): `make check-scrub` ✓ plus S1/S2/S3 negative tests in a /tmp fixture each fail the gate. NOT run: `make rpm` (EL container only — leave to CI `rpm-build`; the change adds no files to the rpm tarball, and no new packaging surface).
+- **Follow-ups / Open Items:** None (S1/S2/S3 are lexical; coarse-path blind spot documented in the script header — sanitizer run + §10.1 audit pass remain the backstop).
+
+### 2026-11-10 — Condensed default text prompt (removed leading blank line + internal blank line)
+- **Task:** User reported residual extra whitespace between the rendered QR block and "Complete authentication in your browser:" and wanted the whole SSH session prompt as concise as possible.
+- **Decisions & Rationale:** Root cause: the built-in default template in `render_prompt_message()` (src/pam_module.c) began with a leading `\n` AND contained `\n\n` before the "Waiting for your approval..." line; stacked on the QR bottom vertical quiet zone (default 4 modules = 2 blank utf8 lines) that gave ~3 blank lines of gap (0.3.0 had removed only the QR block's *trailing* blank line). Removed the leading `\n` and the internal blank line from BOTH default branches (with/without `url_complete`) — the QR bottom quiet zone still separates art from prompt when the QR is shown. Condensed the shipped `init_message` templates identically in `config/pam_oidc_device.conf` + all three `examples/*.conf`. `test_prompt_rendering` now pins the exact default-template output for both branches (previously only the return code was asserted, so this string change broke nothing).
+- **Gotchas & Lessons:** Deployments that SET `init_message` (the shipped config does) do not get the built-in default — the host must adopt the updated template or clear `init_message`; the user's test host was already falling through to the built-in default. `vertical_quiet_zone = 2` remains the config knob to cut the QR blank lines from 2 to 1.
+- **Verification:** Docker CI-mirror gate (ubuntu:24.04): `make CC=gcc EXTRA_CFLAGS=-Werror` + 51-test CMocka suite, `make CC=clang EXTRA_CFLAGS=-Werror` + 51-test suite, `clang-tidy src/*.c -- -Iinclude -D_GNU_SOURCE` (clean), `make test-sanitize CC=clang EXTRA_CFLAGS=-Werror` (51/51) — ALL-PASS (`CI_MIRROR_GATE_ALL_PASS`; zbar roundtrip skipped in-container, runs in CI's `qr-scan-audit`). Local: `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` clean. `make rpm` (EL8/9/10) still requires CI.
+- **Follow-ups / Open Items:** Commit on `wglick/review2` stacked after d946d7d; the two blank QR quiet-zone lines are now the only gap between art and prompt (ISO-minimum default, intentional).
+
+
+### 2026-11-10 — §10.4 follow-up review fixes: -Werror CI enforcement, SHA-pin/permissions/concurrency, `rpm: clean`, dnf install, pam_sm_authenticate phase extraction
+
+- **Task:** Address the follow-up review findings on `wglick/review2`: (1) the zero-warning bar is
+  documented but not mechanically enforced; (2) CI workflows lack SHA pinning, `permissions:`, and
+  `concurrency:`; (3) `make rpm` packages the working tree (stale-`.o` hazard); (4) `dnf localinstall`
+  deprecated, `zbar-tools` unused in compile-matrix/sanitize jobs; (5) `pam_sm_authenticate()` ~600
+  lines (extract device-auth-request and poll-loop phases).
+- **Decisions & Rationale:**
+  - **`EXTRA_CFLAGS` (Makefile):** new appendable variable added to every compile recipe
+    (`src/%.o`, `third_party` rule, `sanitize`, `test`, `test-sanitize`); CI passes
+    `EXTRA_CFLAGS=-Werror` so any warning fails the build (works because `CFLAGS ?=` can't be
+    command-line-extended — command-line assignment replaces it wholesale).
+  - **SHA pinning:** resolved `actions/checkout@v7.0.1` → commit
+    `3d3c42e5aac5ba805825da76410c181273ba90b1` via the GitHub API (`/repos/actions/checkout/commits/v7.0.1`)
+    and pinned all 9 `uses:` (4 build.yml, 4 lint.yml, 1 vendor-audit.yml) with a trailing `# v7.0.1` comment.
+  - **Least privilege / cancel groups:** top-level `permissions: contents: read` +
+    `concurrency: {group: "${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true}`
+    on all three workflows (no job needs anything beyond content reads; no artifacts are published).
+  - **`rpm: clean`:** chosen over `git archive` (which would silently package HEAD instead of the
+    working tree a local dev intends to package, and breaks non-git tarball builds).
+  - **Phase extraction (pam_module.c):** new static helpers `request_device_authorization()`
+    (RFC 8628 §3.1/§3.2 form build → POST → parse/validate → deadline) and `poll_for_access_token()`
+    (§3.4/§3.5 form build → poll loop → access token); new `device_auth_t` result struct
+    (`DEVICE_CODE_MAX_LEN 2048`) whose URI/user-code members are BORROWED from the caller-owned
+    `*dev_json` tree. Pure code motion: identical log messages, return codes, clamping, backoff,
+    and the single caller-owned `cleanup` path (helpers never own resources — they write into
+    caller storage and return the PAM code). `pam_sm_authenticate()` dropped ~690 → 334 lines.
+  - rpm-build `dnf localinstall` → `dnf install`; dropped `zbar-tools` from compile-matrix and
+    sanitize-test (kept in `qr-scan-audit`, the only zbarimg consumer).
+- **Gotchas & Lessons:**
+  - Editor chunking of a large extraction: the helper copy and the original in-function copy are
+    textually identical until the `loglevel` vs `active_loglevel` / `->` vs `.` substitutions —
+    anchors must include those lines or the edit matches twice.
+  - `pam_oauth_log(..., LOGLEVEL_DEBUG, LOG_DEBUG, ...)` has two similar-looking enum args; a
+    typo in one silently fails the old_text match — re-read the region instead of retyping.
+  - Backgrounded `docker run` subshells from `run_commands` get killed when the call times out —
+    relaunch with `nohup ... & disown` and poll the log file.
+  - Local clang-format (19.1.7) reflowed 6 spots in the new helper code (comment-column alignment,
+    line wrapping) — always re-run `clang-format --dry-run --Werror` after C edits.
+- **Verification:** local: `clang-format --dry-run --Werror src/pam_module.c` clean;
+  `make -n rpm` runs `clean` first; all 3 workflow YAMLs parse. Docker CI-mirror gate
+  (ubuntu:24.04): gcc+clang `make EXTRA_CFLAGS=-Werror`, `make test EXTRA_CFLAGS=-Werror`
+  (both compilers), `make test-sanitize CC=clang EXTRA_CFLAGS=-Werror`, `qr_render_check` +
+  zbar decode roundtrip — ALL-PASS.
+- **Follow-ups / Open Items:** commit on `wglick/review2` (stacked with QR-quiet-zone + §10 fixes,
+  awaiting user sign-off); CI EL8/9/10 `rpm-build` matrix + `qr-scan-audit` must stay green on push.
+
+### 2026-11-10 — Configurable QR vertical quiet zone + removed trailing separator blank line
+
+- **Task:** User reported excess vertical whitespace around the terminal QR code (2 blank lines above,
+  2 below, plus 1 trailing separator line). User chose a **configurable** vertical quiet zone over a
+  hard reduction or a docs-only answer.
+- **Decisions & Rationale:**
+  - The blank lines are the ISO/IEC 18004 4-module quiet zone (2 text lines/side in the utf8 half-block
+    style) — required for reliable scanning, so the default stays 4. New `[qr]` key
+    `vertical_quiet_zone` (0–4, `parse_int_range`, default `QR_QUIET_ZONE`) lets operators trade
+    scanner robustness for compactness; the **horizontal** quiet zone stays fixed at 4 (it separates
+    the symbol from adjacent terminal text).
+  - The trailing separator blank line appended by `qr_render_verification_code()` was pure redundancy
+    (the bottom quiet zone already separates art from the following prompt) — removed unconditionally;
+    the undersized-buffer guard tightened from `strlen(header)+3` to `+2` (only the NUL is reserved now).
+  - `qr_render_matrix()` gained a `vquiet` parameter (public-API change; `qr_render_check.c` harness
+    updated to pass `QR_QUIET_ZONE` so the CI `qr-scan-audit` art stays ISO-compliant).
+  - `art2png.py`: optional `VQUIET` arg; ASCII scale detection switched from the top light border to
+    the leading-space run of the first non-blank line (the horizontal quiet zone is always 4×scale at
+    any vertical zone — the top-left finder pattern guarantees a dark module right after it); quiet-zone
+    guard checks outer `vquiet` rows vertically; shape check is now
+    `mod_cols - mod_rows == 2*(QUIET_ZONE - vquiet)` instead of squareness.
+  - Roundtrip unit test now decodes BOTH styles at vquiet 4 **and** 2 through zbarimg; matrix test pins
+    compact-vquiet expectations for both styles; guard test re-pinned to the new bound.
+- **Gotchas & Lessons:**
+  - `art2png.py` `main()` argv off-by-one: `python3 art2png.py ART OUT PX VQ` is **5** argv entries
+    (len 6 would be a phantom 6th). The old code also silently ignored `argv[3]` unless len==5 — a
+    latent bug fixed by `px = int(argv[3]) if len(argv) >= 4 else 3`; len 3 (px defaulted) is now
+    accepted, matching the documented usage. Caught only by a synthetic-art functional check —
+    the in-repo callers always pass all args, so the unit tests alone missed it.
+  - ubuntu:24.04 docker images don't ship `make` — add it to the gate's apt install list.
+- **Verification:** CI-mirror docker gate (ubuntu:24.04): gcc/clang builds + 51-test CMocka suites
+  (now including the zbar roundtrip at both quiet zones, since zbar-tools is installed in the gate),
+  `make test-sanitize CC=clang`, `qr_render_check` harness + zbar decode — see entry follow-up for
+  results. Local: `clang-format --dry-run --Werror` clean; `art2png.py` functional check on synthetic
+  art (vquiet accept/reject/shape-guard) all PASS.
+- **Follow-ups / Open Items:** commit alongside the §10 review fixes on `wglick/review2`; CI
+  `qr-scan-audit` and EL8/9/10 rpm matrix must stay green on push.
+
+### 2026-11-10 — Implemented all four §10 audit fixes (PII log, QR underflow, NUL scrub, json-c 0.17 warnings)
+
+- **Task:** Implemented and validated the four findings from the prior §10 audit (see entry below).
+- **Decisions & Rationale:**
+  - **json-c index compat (fixes the 4 `-Wsign-conversion` warnings):** added a single
+    `JSON_ARRAY_IDX()` macro to `include/pam_oidc_device.h` (with `#include
+    <json-c/json_c_version.h>`) that expands to the bare index on json-c >= 0.17 (`size_t`
+    parameter since 0.17) and to `(int)(i)` on older releases (e.g. EL8's 0.13). Replaced the
+    `(int)i` casts at `src/http.c`, `src/identity.c`, `src/jwt.c`, `src/pam_module.c`
+    (`json_object_array_get_idx` call sites). Version-detection via `JSON_C_MAJOR/MINOR_VERSION`
+    (defined since json-c 0.10; guarded with `defined()` checks for ancient headers).
+  - **PII logging:** `verify_claim()` (`src/identity.c`) raw-claim log demoted
+    LOGLEVEL_DEBUG → LOGLEVEL_VERBOSE, with a comment referencing the redacted DEBUG receipt in
+    `pam_sm_authenticate()`. Chosen over logging lengths/hashes to preserve verbose-level
+    debuggability while matching the documented redaction policy.
+  - **QR underflow:** `qr_render_verification_code()` (`src/qr.c`) guard now rejects
+    `out_len < strlen(QR_HEADER_LINE) + 3` before any `out_len - 2` arithmetic (out_len == 1
+    previously underflowed to SIZE_MAX → unbounded snprintf). Test extended with undersized-buffer
+    cases (0, 1, 2, header+2, header+3) including a no-write check (`out[0] == 'X'` sentinel).
+  - **NUL scrub:** `free_http_response()` (`src/http.c`) now scrubs `resp->size + 1` bytes
+    (write_callback guarantees `body[size] == '\0'`), matching the strlen+1 convention.
+  - CHANGELOG gained an `[Unreleased]` → `### Fixed` section with all four entries.
+- **Gotchas & Lessons:**
+  - Background `docker run` via `nohup ... &` from the tool shell gets killed when the command
+    exits; use **detached mode** (`docker run -d --name ... bash /ci_gate.sh`) and poll
+    `docker logs` instead.
+  - clang-format wraps long `#if` conditions (the version-check line exceeded the column limit
+    and needed `clang-format -i` before the format gate passed).
+  - When grepping gate logs for warnings, exclude make's echoed compile commands — they contain
+    `-Wconversion` and false-positive; grep for `warning:` / `sign-conversion` instead.
+- **Verification:** Full CI-mirror container gate (ubuntu:24.04) passed end-to-end: gcc and clang
+  builds under the full CFLAGS **with zero compiler warnings** (previously 4
+  `-Wsign-conversion`), 51/51 CMocka tests both compilers (extended QR test included),
+  clang-tidy (`WarningsAsErrors: '*'`), cppcheck, flawfinder, clang-format dry-run, and
+  `make test-sanitize CC=clang`. Local clang-format leg passed after reformatting the header.
+  RPM gate not re-run locally (CI covers EL8/9/10; the `(int)` path for EL8's json-c 0.13 is
+  compile-time-selected by the macro but not natively compiled here).
+- **Follow-ups / Open Items:** none for these fixes; changes are uncommitted on `wglick/review2`
+  alongside the audit memory entry — commit (and PR-scope decision: docs-only PR now carries code
+  fixes) is left to the maintainer.
+
+
+### 2026-11-10 — Comprehensive §10 four-pass PR audit (wglick/review2, e6d56c8)
+
+- **Task:** Full §10 audit-pass review (security §10.1 / RFC protocol §10.2 / build-automation §10.3 /
+  quality §10.4) of the PR delta (docs-only `context.md` refactor) plus the full codebase snapshot,
+  and execution of the CI-mirrored verification gates.
+- **Verification:** Full Linux CI-mirror (ubuntu:24.04 container) passed end-to-end: gcc and clang
+  builds, 51/51 CMocka tests under both compilers, clang-tidy, cppcheck, flawfinder, clang-format
+  18.1.x dry-run, and `make test-sanitize CC=clang` (ASan/UBSan/LSan, executed). RPM gate not re-run
+  locally (docs-only delta; `.agents/` is excluded from the rpm tarball) — CI covers it. The TOC
+  anchor check (pending from the prior entry) is now done: GitHub-style slugger → 0 broken links;
+  structure checks re-confirmed (11 `##` / 15 `###`, no sentinels, no double blanks, single trailing
+  newline, symlinks intact).
+- **Findings (all pre-existing on main; none introduced by this PR):**
+  - **MEDIUM — zero-warning bar violated:** gcc and clang builds under the full CFLAGS emit 4
+    `-Wsign-conversion` warnings: `src/http.c:183`, `src/identity.c:359`, `src/jwt.c:333`,
+    `src/pam_module.c:193` — all `json_object_array_get_idx(x, (int)i)`. json-c >= 0.17 takes a
+    `size_t` index, so the `(int)` cast now *causes* the warning (and removing it would warn on
+    EL8's json-c 0.13 `int` parameter) — needs a version-conditional compat cast. CI passes anyway
+    because `make` has no `-Werror`, i.e. §3.1 step 8's zero-warning bar is not mechanically
+    enforced.
+  - **MEDIUM-LOW — PII at debug level:** `verify_claim` (`src/identity.c:114-116`) logs the raw
+    claim value at LOGLEVEL_DEBUG, contradicting `pam_module.c` step-8 comment (line 355: full
+    payload "only at verbose").
+  - **LOW — unsigned underflow:** `qr_render_verification_code` (`src/qr.c:229-231`) computes
+    `out_len - 2` after only rejecting `out_len == 0`; `out_len == 1` underflows to SIZE_MAX →
+    unbounded snprintf. Unreachable via the production caller (32 KiB `qr_buf`), but the function
+    is exported in the public header.
+  - **LOW — CI hardening gap vs §10.3's own bar:** all 8 `actions/checkout` uses are tag-pinned
+    (`@v7.0.1`), not SHA-pinned; no `permissions:` blocks in any workflow.
+  - **Informational:** `base64url_decode` does not pre-reject length ≡ 1 (mod 4) (relies on BIO
+    failure); `make rpm` packages the working tree (known invariant — consider a `clean`
+    prerequisite); `dnf localinstall` is deprecated in favor of `dnf install`; `zbar-tools` is
+    installed but unused in the compile-matrix and sanitize jobs; no `concurrency:` cancel group.
+- **Follow-ups / Open Items:** the two MEDIUM findings are the only candidates worth fixing before
+  the next release; the rest are optional hardening.
+
+
+### 2026-11-10 — Restructured `.agents/context.md` (10 numbered sections, deduplicated, tool-agnostic)
+
+- **Task:** Full rebase/refactor of `.agents/context.md` (the canonical file behind the
+  `AGENTS.md` and `CLAUDE.md` symlinks) for consistency and cross-tool usefulness.
+- **Decisions & Rationale:**
+  - Re-numbered to a clean 1–10 scheme with a Contents table (§/title/"read it when") up top;
+    the previously un-numbered "Code Audit & Specialized Review Workflows" addendum became §10
+    with passes §10.1–§10.4.
+  - Deduplicated overlapping content: old §9 (Core Security Best Practices) folded into §4 as
+    §4.5 (auth-flow hardening); old §8 clang-tidy/compiler-flag duplicates now cross-reference
+    §3.1; old §11 reference links consolidated into §9; output-discipline rules moved from
+    contributor guidelines into §6 (Agent Operational Safety Rules).
+  - Documented the symlink wiring (`.agents/context.md` ← `AGENTS.md` ← `CLAUDE.md`) in the
+    header and added the missing subsystems `src/pkce.c` and `src/qr.c` plus a repository-layout
+    map (verified against the actual tree).
+  - Unified formatting: `-` bullets only, consistent ~95-col wrapping, single-blank-line
+    separation, cleaned stray `>` blanks inside audit blockquotes, exactly one trailing newline.
+  - All CI gate commands preserved **verbatim** (clang-format/clang-tidy/cppcheck/flawfinder,
+    `make test-sanitize CC=clang`, docker CI-mirror command, Python fixture snippet).
+  - Cross-reference audit: this file's historical references to "AGENTS.md §3" (verification
+    gates / non-Linux hosts) remain valid — verification is still §3 (§3.3 = non-Linux hosts).
+- **Gotchas & Lessons:** large file rewrites must be chunked through the editor tool (<6 KB per
+  call) with a `<!-- CONTINUE -->` sentinel; the editor appends extra trailing newlines that
+  need a final normalize pass.
+- **Verification:** docs-only change — no C code touched, so no build/test gates apply. Verified
+  locally on macOS: heading structure (11 `##`, 15 `###`), no leftover sentinels, no double
+  blank lines, all verbatim gate commands present (grep spot-check), symlinks resolve to the new
+  content, exactly one trailing newline. Rendering/rendered-anchor check pending CI/preview.
+- **Follow-ups / Open Items:** none.
 
 ### 2026-11-09 — Full re-review (post-0.2.0): no new code defects; fixed one stale "countdown" comment
 

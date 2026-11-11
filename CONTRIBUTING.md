@@ -13,7 +13,7 @@ clang-format --dry-run --Werror src/*.c include/*.h tests/*.c
 
 ## Static Analysis & Testing
 
-All PRs must pass the local lint gate, compile with zero warnings under **both** compilers, pass the CMocka suite, pass dynamic sanitizer analysis, and (on every push/PR to `main`) the EL8/EL9/EL10 RPM build. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does. The loop below mirrors the gate set in `AGENTS.md` §3:
+All PRs must pass the local lint gate, compile with zero warnings under **both** compilers, pass the CMocka suite, pass dynamic sanitizer analysis, and (on every push/PR to `main`) the EL8/EL9/EL10 RPM build plus the SUSE (openSUSE Leap 16.0) RPM and Debian 13 / Ubuntu 26.04 DEB native builds. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does. The loop below mirrors the gate set in `AGENTS.md` §3:
 
 ```bash
 # 1. Lint / static analysis (clang-format, clang-tidy, cppcheck, flawfinder)
@@ -29,8 +29,10 @@ make clean && make CC=clang && make test CC=clang
 #    NOT a CI gate — run it only as an optional fast pre-check.
 make test-sanitize CC=clang
 
-# 4. Packaging (CI's rpm-build job on EL8/EL9/EL10; requires an EL/dnf host)
-make rpm
+# 4. Packaging (CI's rpm-build job on EL8/EL9/EL10; distro-build.yml adds
+#    SUSE Leap 16.0 RPM + Debian 13 / Ubuntu 26.04 DEB)
+make rpm          # EL/SUSE host with the spec's BuildRequires
+make deb          # Debian/Ubuntu host with dpkg-dev + build deps
 ```
 
 ### Enabling the pre-commit gate (recommended)

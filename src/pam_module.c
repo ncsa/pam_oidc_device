@@ -175,9 +175,12 @@ static int build_form_postfields(CURL *curl, const char **keys, const char **val
  * The recursion is inherently bounded by json-c's maximum parse depth, so a
  * provider JSON document can never drive the stack depth without limit.
  *
+ * Exported via include/pam_oidc_device.h so that src/jwt.c can scrub
+ * provider-parsed ID-token payload trees before json_object_put().
+ *
  * @param[in] obj Root json-c node to scrub (any type, or NULL).
  */
-static void secure_zero_json_tree(struct json_object *obj) { // NOLINT(misc-no-recursion)
+void secure_zero_json_tree(struct json_object *obj) { // NOLINT(misc-no-recursion)
     if (!obj) {
         return;
     }
@@ -190,7 +193,7 @@ static void secure_zero_json_tree(struct json_object *obj) { // NOLINT(misc-no-r
     case json_type_array: {
         size_t count = json_object_array_length(obj);
         for (size_t i = 0; i < count; i++) {
-            secure_zero_json_tree(json_object_array_get_idx(obj, (int)i));
+            secure_zero_json_tree(json_object_array_get_idx(obj, JSON_ARRAY_IDX(i)));
         }
         break;
     }
@@ -270,15 +273,18 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
 
     const char *tpl = cfg->init_message;
     if (tpl[0] == '\0') {
+        /* Compact default: no leading blank line. When the QR code is shown, its bottom vertical
+         * quiet zone already separates the prompt from the rendered art; when it is not, the
+         * prompt follows the preceding terminal output directly, saving a blank line. */
         int w = 0;
         if (url_complete && strcmp(url, url_complete) != 0) {
             w = snprintf(out, out_len,
-                         "\nComplete authentication in your browser:\n  URL:  %s\n  Code: %s\n  (Direct: %s)\n\n"
+                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n  (Direct: %s)\n"
                          "Waiting for your approval; this session completes automatically once you sign in.\n",
                          url, code, url_complete);
         } else {
             w = snprintf(out, out_len,
-                         "\nComplete authentication in your browser:\n  URL:  %s\n  Code: %s\n\n"
+                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n"
                          "Waiting for your approval; this session completes automatically once you sign in.\n",
                          url, code);
         }
@@ -334,13 +340,481 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
     return is_safe_rendered_prompt(out) ? 0 : -1;
 }
 
+/*
+ * Maximum length (bytes, including the terminating NUL) of the provider-issued
+ * RFC 8628 device_code.
+ */
+#define DEVICE_CODE_MAX_LEN 2048
+
+/*
+ * Result of a successful device-authorization request (RFC 8628 s3.1/s3.2).
+ * The verification_uri / verification_uri_complete / user_code members are
+ * BORROWED from the *dev_json tree parsed by request_device_authorization()
+ * and stay valid only until the caller releases that tree; device_code is
+ * owned (copied) by this struct.
+ */
+typedef struct {
+    char device_code[DEVICE_CODE_MAX_LEN];
+    const char *verification_uri;
+    const char *verification_uri_complete; /* NULL when the provider omits it */
+    const char *user_code;
+    int poll_interval;        /* seconds, clamped to [MIN_POLL_INTERVAL, MAX_SUPPORTED_POLL_INTERVAL] */
+    int expires_in;           /* seconds, clamped to (0, cfg->max_poll_seconds] */
+    struct timespec deadline; /* monotonic polling expiration deadline */
+} device_auth_t;
+
+/**
+ * @brief RFC 8628 s3.1/s3.2 device-authorization request phase.
+ *
+ * Builds and POSTs the device-authorization request, then parses and validates
+ * the response (device_code, verification URIs, user_code, poll interval,
+ * expiry) and computes the monotonic polling deadline. The network/JSON
+ * resources (the cURL-escaped request body, the HTTP response, and the parsed
+ * JSON tree) are stored in caller-owned storage so the caller's single
+ * `cleanup` path releases and scrubs them.
+ *
+ * @param[in] pamh           PAM framework handle (may be NULL in unit tests).
+ * @param[in] cfg            Loaded module configuration.
+ * @param[in] loglevel       Active log level.
+ * @param[in] pkce_active    Whether PKCE (RFC 7636) is in effect for this attempt.
+ * @param[in] code_challenge PKCE S256 challenge (ignored when !pkce_active).
+ * @param[in] curl           Initialized cURL handle (used for form encoding).
+ * @param[out] dev           Parsed and validated device-authorization result.
+ * @param[out] resp          HTTP response (caller frees via free_http_response()).
+ * @param[out] dev_json      Parsed response JSON tree (caller owns; dev's string
+ *                           members borrow from it).
+ * @param[out] postfields    cURL-escaped request body (caller scrubs and frees).
+ * @return `PAM_SUCCESS`, or the PAM error code of the failing sub-step.
+ */
+static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, int pkce_active,
+                                        const char *code_challenge, CURL *curl, device_auth_t *dev,
+                                        http_response_t *resp, struct json_object **dev_json, char **postfields) {
+    pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Requesting device code from endpoint: %s",
+                  cfg->device_authorization_endpoint);
+
+    /*
+     * Form-field table for the device-authorization request. Every append goes
+     * through form_field_append(), which enforces DEVICE_FORM_MAX_FIELDS so an
+     * oversized parameter set fails safe instead of overflowing the table.
+     */
+    const char *d_keys[DEVICE_FORM_MAX_FIELDS];
+    const char *d_vals[DEVICE_FORM_MAX_FIELDS];
+    size_t d_count = 0;
+    int d_append_rc = 0;
+
+    d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_id", cfg->client_id);
+
+    /* Client credentials are transmitted as form parameters in the request body
+     * (`client_secret_post`, RFC 6749 s2.3.1); the `client_secret_basic` (HTTP Basic)
+     * client-authentication method is not supported. */
+    if (strlen(cfg->client_secret) > 0) {
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_secret", cfg->client_secret);
+    }
+    if (strlen(cfg->scopes) > 0) {
+        d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "scope", cfg->scopes);
+    }
+    if (pkce_active) {
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge", code_challenge);
+        d_append_rc |=
+            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge_method", "S256");
+    }
+
+    if (d_append_rc != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Device request form-field table overflowed its fixed capacity");
+        return PAM_BUF_ERR;
+    }
+
+    if (build_form_postfields(curl, d_keys, d_vals, d_count, postfields) != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to build device request form postfields");
+        return PAM_BUF_ERR;
+    }
+
+    if (http_request("POST", cfg->device_authorization_endpoint, *postfields, NULL, 10000L, resp, loglevel, pamh) !=
+            0 ||
+        resp->status_code != 200 || !resp->body) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Device authorization request failed (HTTP status code: %ld)", resp->status_code);
+        return PAM_AUTHINFO_UNAVAIL;
+    }
+
+    *dev_json = json_tokener_parse(resp->body);
+    if (!*dev_json || !json_object_is_type(*dev_json, json_type_object)) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Invalid JSON payload from device endpoint");
+        return PAM_SERVICE_ERR;
+    }
+
+    struct json_object *j_code = NULL;
+    struct json_object *j_uri = NULL;
+    struct json_object *j_uri_complete = NULL;
+    struct json_object *j_ucode = NULL;
+    struct json_object *j_int = NULL;
+    struct json_object *j_exp = NULL;
+
+    json_object_object_get_ex(*dev_json, "device_code", &j_code);
+    json_object_object_get_ex(*dev_json, "verification_uri", &j_uri);
+    json_object_object_get_ex(*dev_json, "verification_uri_complete", &j_uri_complete);
+    json_object_object_get_ex(*dev_json, "user_code", &j_ucode);
+    json_object_object_get_ex(*dev_json, "interval", &j_int);
+    json_object_object_get_ex(*dev_json, "expires_in", &j_exp);
+
+    if (!j_code || !j_uri || !json_object_is_type(j_code, json_type_string) ||
+        !json_object_is_type(j_uri, json_type_string)) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Missing device_code or verification_uri in endpoint response");
+        return PAM_SERVICE_ERR;
+    }
+
+    /* user_code is REQUIRED per RFC 8628 Section 3.2; fail fast with a specific
+       message instead of letting the injection check below trip on a placeholder. */
+    if (!j_ucode || !json_object_is_type(j_ucode, json_type_string)) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Missing user_code in endpoint response");
+        return PAM_SERVICE_ERR;
+    }
+
+    if (copy_checked(dev->device_code, sizeof(dev->device_code), json_object_get_string(j_code)) != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Device code buffer capacity exceeded");
+        return PAM_BUF_ERR;
+    }
+
+    dev->verification_uri = json_object_get_string(j_uri);
+    dev->verification_uri_complete = (j_uri_complete && json_object_is_type(j_uri_complete, json_type_string))
+                                         ? json_object_get_string(j_uri_complete)
+                                         : NULL;
+    dev->user_code = json_object_get_string(j_ucode);
+
+    /* Validate provider URLs and user code against injection attacks */
+    if (!is_valid_https_url(dev->verification_uri) || !is_safe_user_code(dev->user_code) ||
+        (dev->verification_uri_complete && !is_valid_https_url(dev->verification_uri_complete))) {
+        if (pamh) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Insecure or malformed URL/code in provider response");
+        }
+        return PAM_SERVICE_ERR;
+    }
+
+    int interval = (j_int && json_object_is_type(j_int, json_type_int)) ? json_object_get_int(j_int) : 5;
+    if (interval < MIN_POLL_INTERVAL) {
+        interval = MIN_POLL_INTERVAL;
+    }
+
+    if (interval > MAX_SUPPORTED_POLL_INTERVAL) {
+        if (pamh) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Provider poll interval %d exceeds supported maximum", interval);
+        }
+        return PAM_SERVICE_ERR;
+    }
+
+    int expires_in = (j_exp && json_object_is_type(j_exp, json_type_int)) ? json_object_get_int(j_exp) : 300;
+    if (expires_in <= 0) {
+        expires_in = 300;
+    }
+    if (expires_in > cfg->max_poll_seconds) {
+        expires_in = cfg->max_poll_seconds;
+    }
+
+    pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                  "Device code response parsed: poll interval=%ds, expires_in=%ds", interval, expires_in);
+
+    /* Calculate polling expiration deadline using POSIX monotonic clock */
+    if (clock_gettime(CLOCK_MONOTONIC, &dev->deadline) != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
+        return PAM_SYSTEM_ERR;
+    }
+    dev->deadline.tv_sec += expires_in;
+
+    dev->poll_interval = interval;
+    dev->expires_in = expires_in;
+    return PAM_SUCCESS;
+}
+
+/**
+ * @brief RFC 8628 s3.4/s3.5 token-polling phase.
+ *
+ * Builds the token request body, then polls the Token Endpoint using
+ * monotonic clock timing (first poll immediate, subsequent polls spaced by the
+ * provider's interval with slow_down / transient-error backoff) until token
+ * issuance, expiration, denial, or an unrecoverable error. As with
+ * request_device_authorization(), the network/JSON resources are stored in
+ * caller-owned storage so the caller's single `cleanup` path releases and
+ * scrubs them.
+ *
+ * @param[in] pamh            PAM framework handle (may be NULL in unit tests).
+ * @param[in] cfg             Loaded module configuration.
+ * @param[in] loglevel        Active log level.
+ * @param[in] pam_user        Target user requesting login.
+ * @param[in] dev             Device-authorization result (code, deadline, interval).
+ * @param[in] code_verifier   PKCE code verifier (ignored when !pkce_active).
+ * @param[in] pkce_active     Whether PKCE (RFC 7636) is in effect for this attempt.
+ * @param[in] curl            Initialized cURL handle (used for form encoding).
+ * @param[out] token_resp     Poll responses (caller frees via free_http_response()).
+ * @param[out] tok_json       Last parsed token JSON tree (caller owns).
+ * @param[out] access_token   Acquired access token, or NULL on failure (caller scrubs/frees).
+ * @param[out] token_postfields cURL-escaped token request body (caller scrubs and frees).
+ * @return `PAM_SUCCESS` when an access token was acquired, or the PAM error
+ *         code of the failing sub-step (PAM_AUTH_ERR on timeout/denial).
+ */
+static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, const char *pam_user,
+                                 const device_auth_t *dev, const char *code_verifier, int pkce_active, CURL *curl,
+                                 http_response_t *token_resp, struct json_object **tok_json, char **access_token,
+                                 char **token_postfields) {
+    /*
+     * Form-field table for the token request. Every append goes through
+     * form_field_append(), which enforces TOKEN_FORM_MAX_FIELDS so an oversized
+     * parameter set fails safe instead of overflowing the table.
+     */
+    const char *t_keys[TOKEN_FORM_MAX_FIELDS];
+    const char *t_vals[TOKEN_FORM_MAX_FIELDS];
+    size_t t_count = 0;
+    int t_append_rc = 0;
+
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_id", cfg->client_id);
+
+    /* Client credentials follow the same form-body `client_secret_post` pattern as the
+     * device-authorization request above; `client_secret_basic` is not supported. */
+    if (strlen(cfg->client_secret) > 0) {
+        t_append_rc |=
+            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_secret", cfg->client_secret);
+    }
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "grant_type",
+                                     "urn:ietf:params:oauth:grant-type:device_code");
+    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "device_code", dev->device_code);
+    if (pkce_active) {
+        t_append_rc |=
+            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "code_verifier", code_verifier);
+    }
+
+    if (t_append_rc != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "Token request form-field table overflowed its fixed capacity");
+        return PAM_BUF_ERR;
+    }
+
+    if (build_form_postfields(curl, t_keys, t_vals, t_count, token_postfields) != 0) {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to build token request form postfields");
+        return PAM_BUF_ERR;
+    }
+
+    pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_INFO, "Polling token endpoint for user '%s'...", pam_user);
+
+    /* Polling loop enforcing RFC 8628 interval delay. The first poll is issued
+     * immediately (no leading sleep) so the user does not wait a full interval before the
+     * initial token request; subsequent polls are spaced by the (possibly adjusted) interval. */
+    int interval = dev->poll_interval;
+    int first_poll = 1;
+    while (1) {
+        if (!first_poll) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
+                return PAM_SYSTEM_ERR;
+            }
+            struct timespec next_poll = now;
+            next_poll.tv_sec += interval;
+
+            if (!timespec_before(&next_poll, &dev->deadline)) {
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "Polling reached device authorization expiration deadline");
+                break;
+            }
+
+            /* Sleep until the next poll deadline: a single uninterrupted sleep of the full
+             * interval, so the token endpoint is never polled more frequently than the
+             * provider's `interval` allows. */
+            int sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_poll, NULL);
+            if (sleep_rc == EINTR) {
+                /* A signal (e.g. user-initiated cancellation / SIGTERM) interrupted the
+                 * poll sleep. Resuming the loop would keep a possibly abandoned session
+                 * blocking the login; abort instead — all resources are reclaimed by
+                 * the caller's `cleanup`. */
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_INFO,
+                              "Polling interrupted by a signal; aborting device-authorization wait");
+                return PAM_ABORT;
+            }
+
+            if (sleep_rc != 0) {
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Clock nanosleep failed with error %d",
+                              sleep_rc);
+                return PAM_SYSTEM_ERR;
+            }
+        }
+        first_poll = 0;
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || !timespec_before(&now, &dev->deadline)) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling authorization deadline reached");
+            break;
+        }
+
+        long remain_ms = (long)((dev->deadline.tv_sec - now.tv_sec) * 1000);
+        if (remain_ms <= 0L) {
+            /*
+             * The monotonic check above guarantees `now` is before the deadline
+             * at nanosecond precision, but the whole-second difference can still
+             * be zero at the deadline boundary. cURL treats a zero (or negative)
+             * CURLOPT_TIMEOUT_MS as "no timeout", so stop polling instead of
+             * firing a request with an unbounded lifetime.
+             */
+            break;
+        }
+        long req_timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
+
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling token endpoint (timeout: %ldms)",
+                      req_timeout_ms);
+
+        free_http_response(token_resp);
+        int req_rc = http_request("POST", cfg->token_endpoint, *token_postfields, NULL, req_timeout_ms, token_resp,
+                                  loglevel, pamh);
+
+        if (req_rc == 0) {
+            if (is_retryable_token_http_status(token_resp->status_code)) {
+                /*
+                 * HTTP 429 (rate limited) and 5xx (server/gateway error) are transient conditions
+                 * and are NOT well-formed RFC 8628 OAuth error responses. The body may be empty, a
+                 * JSON object, or an HTML error page returned by a proxy/load balancer. Back off and
+                 * retry within the device-authorization deadline instead of aborting authentication.
+                 */
+                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "Transient HTTP status %ld from token endpoint; backing off poll interval to %ds",
+                              token_resp->status_code, interval);
+            } else if (token_resp->status_code >= 200 && token_resp->status_code < 300 && token_resp->body) {
+                if (*tok_json) {
+                    json_object_put(*tok_json);
+                }
+                *tok_json = json_tokener_parse(token_resp->body);
+
+                if (*tok_json && json_object_is_type(*tok_json, json_type_object)) {
+                    /*
+                     * RFC 6749 s5.1: token responses carry a `token_type` field (always "Bearer" for
+                     * device-flow grants). Fail closed on a present-but-foreign token type so a
+                     * malformed or unexpected token can never be passed to the UserInfo endpoint as
+                     * a Bearer credential; a missing field is tolerated (DEBUG-logged) since some
+                     * providers omit it.
+                     */
+                    struct json_object *j_ttype = NULL;
+                    if (json_object_object_get_ex(*tok_json, "token_type", &j_ttype) && j_ttype) {
+                        const char *ttype = json_object_get_string(j_ttype);
+                        if (!ttype || strcmp(ttype, "Bearer") != 0) {
+                            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                          "Token response token_type '%s' is not 'Bearer'; refusing to use the token",
+                                          ttype ? ttype : "<absent>");
+                            return PAM_AUTH_ERR;
+                        }
+                    } else {
+                        pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                                      "Token response omits token_type; assuming Bearer");
+                    }
+
+                    struct json_object *j_acc = NULL;
+                    if (json_object_object_get_ex(*tok_json, "access_token", &j_acc) && j_acc &&
+                        json_object_is_type(j_acc, json_type_string)) {
+                        size_t token_len = (size_t)json_object_get_string_len(j_acc);
+                        if (token_len > 0 && token_len <= MAX_ACCESS_TOKEN_LEN) {
+                            *access_token = strdup(json_object_get_string(j_acc));
+                            if (!*access_token) {
+                                pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                              "Memory allocation failed for access_token");
+                                return PAM_BUF_ERR;
+                            }
+                            pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_INFO,
+                                          "Access token successfully acquired");
+                            break; /* Access token acquired successfully */
+                        } else if (token_len > MAX_ACCESS_TOKEN_LEN) {
+                            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                          "Access token length (%zu) exceeds maximum supported length (%d); aborting",
+                                          token_len, MAX_ACCESS_TOKEN_LEN);
+                            break; /* Token too large to process */
+                        }
+                    } else {
+                        pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                                      "2xx token response present but no usable access_token (HTTP %ld); aborting poll",
+                                      token_resp->status_code);
+                    }
+                }
+                break;
+            } else if (token_resp->status_code >= 400 && token_resp->status_code < 500 && token_resp->body) {
+                /*
+                 * RFC 8628 §3.5 OAuth error path (non-429 4xx): a well-formed token response carries
+                 * an `error` string. `authorization_pending` and `slow_down` keep the loop alive; any
+                 * other error is definitive and aborts polling. A 4xx without a parseable error body
+                 * is also treated as definitive.
+                 */
+                if (*tok_json) {
+                    json_object_put(*tok_json);
+                }
+                *tok_json = json_tokener_parse(token_resp->body);
+
+                if (*tok_json && json_object_is_type(*tok_json, json_type_object)) {
+                    struct json_object *j_err = NULL;
+                    if (json_object_object_get_ex(*tok_json, "error", &j_err) && j_err &&
+                        json_object_is_type(j_err, json_type_string)) {
+                        const char *err = json_object_get_string(j_err);
+                        pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Token endpoint returned error: %s",
+                                      err);
+                        if (strcmp(err, "slow_down") == 0) {
+                            interval = (interval > MAX_SUPPORTED_POLL_INTERVAL - 5) ? MAX_SUPPORTED_POLL_INTERVAL
+                                                                                    : interval + 5;
+                            pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                                          "Adjusted poll interval to %ds after slow_down", interval);
+                        } else if (strcmp(err, "authorization_pending") != 0) {
+                            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                          "Non-retryable OAuth authorization error: %s", err);
+                            break; /* Non-retryable OAuth authorization error */
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                /*
+                 * Definitive, non-retryable response: a 2xx without a body, a non-429 4xx without a
+                 * parseable OAuth error body, a 3xx redirect (FOLLOWLOCATION is disabled), or any other
+                 * unexpected status. Abort polling.
+                 */
+                break;
+            }
+        } else {
+            /* Exponential backoff for transient network errors */
+            if (token_resp->curl_code == CURLE_OPERATION_TIMEDOUT || token_resp->curl_code == CURLE_COULDNT_CONNECT ||
+                token_resp->curl_code == CURLE_COULDNT_RESOLVE_HOST ||
+                token_resp->curl_code == CURLE_COULDNT_RESOLVE_PROXY || token_resp->curl_code == CURLE_GOT_NOTHING) {
+                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "Transient cURL error (%d); backing off poll interval to %ds", token_resp->curl_code,
+                              interval);
+            } else {
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Fatal cURL error during polling: %s",
+                              curl_easy_strerror(token_resp->curl_code));
+                break; /* Non-recoverable network error */
+            }
+        }
+    }
+
+    if (!*access_token) {
+        if (pamh) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Authentication failed for user '%s': timed out or denied", pam_user);
+        }
+        return PAM_AUTH_ERR;
+    }
+
+    return PAM_SUCCESS;
+}
+
 /**
  * @brief Primary PAM authentication hook implementation.
  *
  * Executes full RFC 8628 device authorization workflow:
  * 1. Parses PAM module parameters (`config=...`, `loglevel=...`).
  * 2. Loads module configuration settings (`load_config`).
- * 3. Sends POST request to Device Authorization Endpoint to obtain `device_code` and `user_code`.
+ * 3. Sends POST request to Device Authorization Endpoint to obtain `device_code` and `user_code`
+ *    (see request_device_authorization()).
  * 4. Displays the sign-in instructions to the user via a PAM conversation message (`PAM_TEXT_INFO`),
  *    optionally preceded by a scannable terminal QR code of the verification URI (`[qr]` section).
  *    A `PAM_PROMPT_ECHO_ON` "Press [Enter] to begin..." prompt is then issued; polling starts
@@ -349,7 +823,7 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
  *    subsequent prompt triggers a `USERINFO` round-trip) while acting as a synchronization
  *    barrier so the user has had time to note the URL and code.
  * 5. Polls the Token Endpoint using monotonic clock timing until token issuance, expiration, or user
- *    denial.
+ *    denial (see poll_for_access_token()).
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
  * 8. Logs a redacted UserInfo receipt record (size + claim field) at debug level; the full claim payload
@@ -377,8 +851,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     char *token_postfields = NULL;
     char *access_token = NULL;
 
-    char device_code[2048];
-    memset(device_code, 0, sizeof(device_code));
+    /* Owned device-authorization result (RFC 8628 §3.1/§3.2); see
+     * request_device_authorization() for the borrowed-pointer lifetime rules. */
+    device_auth_t dev;
+    memset(&dev, 0, sizeof(dev));
 
     char code_verifier[PKCE_VERIFIER_LEN + 1];
     memset(code_verifier, 0, sizeof(code_verifier));
@@ -490,158 +966,19 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                       "PKCE (RFC 7636) S256 enabled for this device-authorization attempt");
     }
 
-    /* Step 3: Request device code from provider Device Endpoint */
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Requesting device code from endpoint: %s",
-                  cfg.device_authorization_endpoint);
-
-    /*
-     * Form-field table for the device-authorization request. Every append goes
-     * through form_field_append(), which enforces DEVICE_FORM_MAX_FIELDS so an
-     * oversized parameter set fails safe instead of overflowing the table.
-     */
-    const char *d_keys[DEVICE_FORM_MAX_FIELDS];
-    const char *d_vals[DEVICE_FORM_MAX_FIELDS];
-    size_t d_count = 0;
-    int d_append_rc = 0;
-
-    d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_id", cfg.client_id);
-
-    /* Client credentials are transmitted as form parameters in the request body
-     * (`client_secret_post`, RFC 6749 s2.3.1); the `client_secret_basic` (HTTP Basic)
-     * client-authentication method is not supported. */
-    if (strlen(cfg.client_secret) > 0) {
-        d_append_rc |=
-            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "client_secret", cfg.client_secret);
-    }
-    if (strlen(cfg.scopes) > 0) {
-        d_append_rc |= form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "scope", cfg.scopes);
-    }
-    if (pkce_active) {
-        d_append_rc |=
-            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge", code_challenge);
-        d_append_rc |=
-            form_field_append(d_keys, d_vals, &d_count, DEVICE_FORM_MAX_FIELDS, "code_challenge_method", "S256");
-    }
-
-    if (d_append_rc != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Device request form-field table overflowed its fixed capacity");
-        retval = PAM_BUF_ERR;
+    /* Step 3: Request device code from the provider Device Authorization Endpoint and
+     * parse/validate the RFC 8628 §3.2 response (device_code, verification URIs, user_code,
+     * poll interval, expiry, monotonic polling deadline). See request_device_authorization(). */
+    retval = request_device_authorization(pamh, &cfg, active_loglevel, pkce_active, code_challenge, curl, &dev, &resp,
+                                          &dev_json, &postfields);
+    if (retval != PAM_SUCCESS) {
         goto cleanup;
     }
-
-    if (build_form_postfields(curl, d_keys, d_vals, d_count, &postfields) != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to build device request form postfields");
-        retval = PAM_BUF_ERR;
-        goto cleanup;
-    }
-
-    if (http_request("POST", cfg.device_authorization_endpoint, postfields, NULL, 10000L, &resp, active_loglevel,
-                     pamh) != 0 ||
-        resp.status_code != 200 || !resp.body) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Device authorization request failed (HTTP status code: %ld)", resp.status_code);
-        retval = PAM_AUTHINFO_UNAVAIL;
-        goto cleanup;
-    }
-
-    dev_json = json_tokener_parse(resp.body);
-    if (!dev_json || !json_object_is_type(dev_json, json_type_object)) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Invalid JSON payload from device endpoint");
-        retval = PAM_SERVICE_ERR;
-        goto cleanup;
-    }
-
-    struct json_object *j_code = NULL;
-    struct json_object *j_uri = NULL;
-    struct json_object *j_uri_complete = NULL;
-    struct json_object *j_ucode = NULL;
-    struct json_object *j_int = NULL;
-    struct json_object *j_exp = NULL;
-
-    json_object_object_get_ex(dev_json, "device_code", &j_code);
-    json_object_object_get_ex(dev_json, "verification_uri", &j_uri);
-    json_object_object_get_ex(dev_json, "verification_uri_complete", &j_uri_complete);
-    json_object_object_get_ex(dev_json, "user_code", &j_ucode);
-    json_object_object_get_ex(dev_json, "interval", &j_int);
-    json_object_object_get_ex(dev_json, "expires_in", &j_exp);
-
-    if (!j_code || !j_uri || !json_object_is_type(j_code, json_type_string) ||
-        !json_object_is_type(j_uri, json_type_string)) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Missing device_code or verification_uri in endpoint response");
-        retval = PAM_SERVICE_ERR;
-        goto cleanup;
-    }
-
-    /* user_code is REQUIRED per RFC 8628 Section 3.2; fail fast with a specific
-       message instead of letting the injection check below trip on a placeholder. */
-    if (!j_ucode || !json_object_is_type(j_ucode, json_type_string)) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Missing user_code in endpoint response");
-        retval = PAM_SERVICE_ERR;
-        goto cleanup;
-    }
-
-    if (copy_checked(device_code, sizeof(device_code), json_object_get_string(j_code)) != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Device code buffer capacity exceeded");
-        retval = PAM_BUF_ERR;
-        goto cleanup;
-    }
-
-    const char *url_str = json_object_get_string(j_uri);
-    const char *url_comp_str = (j_uri_complete && json_object_is_type(j_uri_complete, json_type_string))
-                                   ? json_object_get_string(j_uri_complete)
-                                   : NULL;
-    const char *user_code_str = json_object_get_string(j_ucode);
-
-    /* Validate provider URLs and user code against injection attacks */
-    if (!is_valid_https_url(url_str) || !is_safe_user_code(user_code_str) ||
-        (url_comp_str && !is_valid_https_url(url_comp_str))) {
-        if (pamh) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Insecure or malformed URL/code in provider response");
-        }
-        retval = PAM_SERVICE_ERR;
-        goto cleanup;
-    }
-
-    int interval = (j_int && json_object_is_type(j_int, json_type_int)) ? json_object_get_int(j_int) : 5;
-    if (interval < MIN_POLL_INTERVAL) {
-        interval = MIN_POLL_INTERVAL;
-    }
-
-    if (interval > MAX_SUPPORTED_POLL_INTERVAL) {
-        if (pamh) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Provider poll interval %d exceeds supported maximum", interval);
-        }
-        retval = PAM_SERVICE_ERR;
-        goto cleanup;
-    }
-
-    int expires_in = (j_exp && json_object_is_type(j_exp, json_type_int)) ? json_object_get_int(j_exp) : 300;
-    if (expires_in <= 0) {
-        expires_in = 300;
-    }
-    if (expires_in > cfg.max_poll_seconds) {
-        expires_in = cfg.max_poll_seconds;
-    }
-
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                  "Device code response parsed: poll interval=%ds, expires_in=%ds", interval, expires_in);
-
-    /* Calculate polling expiration deadline using POSIX monotonic clock */
-    struct timespec device_deadline;
-    if (clock_gettime(CLOCK_MONOTONIC, &device_deadline) != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
-        retval = PAM_SYSTEM_ERR;
-        goto cleanup;
-    }
-    device_deadline.tv_sec += expires_in;
 
     /* Step 4: Display instructions and verification code to client terminal */
     char prompt_buf[MAX_INIT_MSG_LEN];
-    if (render_prompt_message(&cfg, url_str, url_comp_str, user_code_str, prompt_buf, sizeof(prompt_buf)) != 0) {
+    if (render_prompt_message(&cfg, dev.verification_uri, dev.verification_uri_complete, dev.user_code, prompt_buf,
+                              sizeof(prompt_buf)) != 0) {
         if (pamh) {
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to render prompt message");
         }
@@ -655,8 +992,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
      * text prompt below always carries the URL and user code. */
     if (cfg.qr_enabled) {
         char qr_buf[QR_RENDER_BUF_MAX];
-        if (qr_render_verification_code(&cfg, active_loglevel, url_str, url_comp_str, qr_buf, sizeof(qr_buf), pamh) ==
-            0) {
+        if (qr_render_verification_code(&cfg, active_loglevel, dev.verification_uri, dev.verification_uri_complete,
+                                        qr_buf, sizeof(qr_buf), pamh) == 0) {
             int qr_res = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", qr_buf);
             if (qr_res != PAM_SUCCESS) {
                 pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
@@ -700,228 +1037,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         }
     }
 
-    /* Step 5: Build token request body prior to entering polling loop */
-    /*
-     * Form-field table for the token request. Every append goes through
-     * form_field_append(), which enforces TOKEN_FORM_MAX_FIELDS so an oversized
-     * parameter set fails safe instead of overflowing the table.
-     */
-    const char *t_keys[TOKEN_FORM_MAX_FIELDS];
-    const char *t_vals[TOKEN_FORM_MAX_FIELDS];
-    size_t t_count = 0;
-    int t_append_rc = 0;
-
-    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_id", cfg.client_id);
-
-    /* Client credentials follow the same form-body `client_secret_post` pattern as the
-     * device-authorization request above; `client_secret_basic` is not supported. */
-    if (strlen(cfg.client_secret) > 0) {
-        t_append_rc |=
-            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "client_secret", cfg.client_secret);
-    }
-    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "grant_type",
-                                     "urn:ietf:params:oauth:grant-type:device_code");
-    t_append_rc |= form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "device_code", device_code);
-    if (pkce_active) {
-        t_append_rc |=
-            form_field_append(t_keys, t_vals, &t_count, TOKEN_FORM_MAX_FIELDS, "code_verifier", code_verifier);
-    }
-
-    if (t_append_rc != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Token request form-field table overflowed its fixed capacity");
-        retval = PAM_BUF_ERR;
-        goto cleanup;
-    }
-
-    if (build_form_postfields(curl, t_keys, t_vals, t_count, &token_postfields) != 0) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to build token request form postfields");
-        retval = PAM_BUF_ERR;
-        goto cleanup;
-    }
-
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO, "Polling token endpoint for user '%s'...", pam_user);
-
-    /* Step 6: Polling loop enforcing RFC 8628 interval delay. The first poll is issued
-     * immediately (no leading sleep) so the user does not wait a full interval before the
-     * initial token request; subsequent polls are spaced by the (possibly adjusted) interval. */
-    int first_poll = 1;
-    while (1) {
-        if (!first_poll) {
-            struct timespec now;
-            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
-                retval = PAM_SYSTEM_ERR;
-                goto cleanup;
-            }
-            struct timespec next_poll = now;
-            next_poll.tv_sec += interval;
-
-            if (!timespec_before(&next_poll, &device_deadline)) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "Polling reached device authorization expiration deadline");
-                break;
-            }
-
-            /* Sleep until the next poll deadline: a single uninterrupted sleep of the full
-             * interval, so the token endpoint is never polled more frequently than the
-             * provider's `interval` allows. */
-            int sleep_rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_poll, NULL);
-            if (sleep_rc == EINTR) {
-                /* A signal (e.g. user-initiated cancellation / SIGTERM) interrupted the
-                 * poll sleep. Resuming the loop would keep a possibly abandoned session
-                 * blocking the login; abort instead — all resources are reclaimed at
-                 * `cleanup`. */
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
-                              "Polling interrupted by a signal; aborting device-authorization wait");
-                retval = PAM_ABORT;
-                goto cleanup;
-            }
-
-            if (sleep_rc != 0) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Clock nanosleep failed with error %d",
-                              sleep_rc);
-                retval = PAM_SYSTEM_ERR;
-                goto cleanup;
-            }
-        }
-        first_poll = 0;
-
-        struct timespec now;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || !timespec_before(&now, &device_deadline)) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling authorization deadline reached");
-            break;
-        }
-
-        long remain_ms = (long)((device_deadline.tv_sec - now.tv_sec) * 1000);
-        if (remain_ms <= 0L) {
-            /*
-             * The monotonic check above guarantees `now` is before the deadline
-             * at nanosecond precision, but the whole-second difference can still
-             * be zero at the deadline boundary. cURL treats a zero (or negative)
-             * CURLOPT_TIMEOUT_MS as "no timeout", so stop polling instead of
-             * firing a request with an unbounded lifetime.
-             */
-            break;
-        }
-        long req_timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
-
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling token endpoint (timeout: %ldms)",
-                      req_timeout_ms);
-
-        free_http_response(&token_resp);
-        int req_rc = http_request("POST", cfg.token_endpoint, token_postfields, NULL, req_timeout_ms, &token_resp,
-                                  active_loglevel, pamh);
-
-        if (req_rc == 0) {
-            if (is_retryable_token_http_status(token_resp.status_code)) {
-                /*
-                 * HTTP 429 (rate limited) and 5xx (server/gateway error) are transient conditions
-                 * and are NOT well-formed RFC 8628 OAuth error responses. The body may be empty, a
-                 * JSON object, or an HTML error page returned by a proxy/load balancer. Back off and
-                 * retry within the device-authorization deadline instead of aborting authentication.
-                 */
-                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "Transient HTTP status %ld from token endpoint; backing off poll interval to %ds",
-                              token_resp.status_code, interval);
-            } else if (token_resp.status_code >= 200 && token_resp.status_code < 300 && token_resp.body) {
-                if (tok_json) {
-                    json_object_put(tok_json);
-                }
-                tok_json = json_tokener_parse(token_resp.body);
-
-                if (tok_json && json_object_is_type(tok_json, json_type_object)) {
-                    struct json_object *j_acc = NULL;
-                    if (json_object_object_get_ex(tok_json, "access_token", &j_acc) && j_acc &&
-                        json_object_is_type(j_acc, json_type_string)) {
-                        size_t token_len = (size_t)json_object_get_string_len(j_acc);
-                        if (token_len > 0 && token_len <= MAX_ACCESS_TOKEN_LEN) {
-                            access_token = strdup(json_object_get_string(j_acc));
-                            if (!access_token) {
-                                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                              "Memory allocation failed for access_token");
-                                retval = PAM_BUF_ERR;
-                                goto cleanup;
-                            }
-                            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO,
-                                          "Access token successfully acquired");
-                            break; /* Access token acquired successfully */
-                        } else if (token_len > MAX_ACCESS_TOKEN_LEN) {
-                            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                          "Access token length (%zu) exceeds maximum supported length (%d); aborting",
-                                          token_len, MAX_ACCESS_TOKEN_LEN);
-                            break; /* Token too large to process */
-                        }
-                    }
-                }
-                break;
-            } else if (token_resp.status_code >= 400 && token_resp.status_code < 500 && token_resp.body) {
-                /*
-                 * RFC 8628 §3.5 OAuth error path (non-429 4xx): a well-formed token response carries
-                 * an `error` string. `authorization_pending` and `slow_down` keep the loop alive; any
-                 * other error is definitive and aborts polling. A 4xx without a parseable error body
-                 * is also treated as definitive.
-                 */
-                if (tok_json) {
-                    json_object_put(tok_json);
-                }
-                tok_json = json_tokener_parse(token_resp.body);
-
-                if (tok_json && json_object_is_type(tok_json, json_type_object)) {
-                    struct json_object *j_err = NULL;
-                    if (json_object_object_get_ex(tok_json, "error", &j_err) && j_err &&
-                        json_object_is_type(j_err, json_type_string)) {
-                        const char *err = json_object_get_string(j_err);
-                        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                                      "Token endpoint returned error: %s", err);
-                        if (strcmp(err, "slow_down") == 0) {
-                            interval = (interval > MAX_SUPPORTED_POLL_INTERVAL - 5) ? MAX_SUPPORTED_POLL_INTERVAL
-                                                                                    : interval + 5;
-                            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                                          "Adjusted poll interval to %ds after slow_down", interval);
-                        } else if (strcmp(err, "authorization_pending") != 0) {
-                            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                          "Non-retryable OAuth authorization error: %s", err);
-                            break; /* Non-retryable OAuth authorization error */
-                        }
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                /*
-                 * Definitive, non-retryable response: a 2xx without a body, a non-429 4xx without a
-                 * parseable OAuth error body, a 3xx redirect (FOLLOWLOCATION is disabled), or any other
-                 * unexpected status. Abort polling.
-                 */
-                break;
-            }
-        } else {
-            /* Exponential backoff for transient network errors */
-            if (token_resp.curl_code == CURLE_OPERATION_TIMEDOUT || token_resp.curl_code == CURLE_COULDNT_CONNECT ||
-                token_resp.curl_code == CURLE_COULDNT_RESOLVE_HOST ||
-                token_resp.curl_code == CURLE_COULDNT_RESOLVE_PROXY || token_resp.curl_code == CURLE_GOT_NOTHING) {
-                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "Transient cURL error (%d); backing off poll interval to %ds", token_resp.curl_code,
-                              interval);
-            } else {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Fatal cURL error during polling: %s",
-                              curl_easy_strerror(token_resp.curl_code));
-                break; /* Non-recoverable network error */
-            }
-        }
-    }
-
-    if (!access_token) {
-        if (pamh) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Authentication failed for user '%s': timed out or denied", pam_user);
-        }
-        retval = PAM_AUTH_ERR;
+    /* Step 5/6: Build the token request and poll the Token Endpoint (first poll immediate,
+     * then RFC 8628 interval spacing with slow_down / transient-error backoff) until token
+     * issuance, expiration, denial, or an unrecoverable error. See poll_for_access_token(). */
+    retval = poll_for_access_token(pamh, &cfg, active_loglevel, pam_user, &dev, code_verifier, pkce_active, curl,
+                                   &token_resp, &tok_json, &access_token, &token_postfields);
+    if (retval != PAM_SUCCESS) {
         goto cleanup;
     }
 
@@ -1040,7 +1161,7 @@ cleanup:
      * `pam_user` is owned by the PAM library (a read-only `const char *` obtained from
      * `pam_get_user()`), so it is intentionally NOT freed during cleanup.
      */
-    secure_memzero(device_code, sizeof(device_code));
+    secure_memzero(&dev, sizeof(dev));
     secure_memzero(code_verifier, sizeof(code_verifier));
     secure_memzero(code_challenge, sizeof(code_challenge));
     secure_memzero(&cfg, sizeof(cfg));

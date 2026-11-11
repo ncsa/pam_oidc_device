@@ -20,8 +20,8 @@ def parse_metadata(metadata_path):
     return metadata
 
 def generate_rpm_changelog(changelog_path, metadata):
-    maintainer = metadata.get('MODULE_MAINTAINER', 'NCSA Cybersecurity & HPC Administration <admin@ncsa.illinois.edu>')
-    default_ver = metadata.get('MODULE_VERSION', '0.2.0')
+    maintainer = metadata.get('MODULE_MAINTAINER', 'NCSA Cyberinfrastructure <help@ncsa.illinois.edu>')
+    default_ver = metadata.get('MODULE_VERSION', '0.3.0')
 
     entries = []
     current_ver = None

@@ -31,8 +31,6 @@ The repository is structured into single-responsibility C source files:
 
 * **`test_suite.c`**: CMocka unit test suite featuring mock cURL transport overrides and end-to-end QR code scanner validation.
 
-
-
 ---
 
 ## 2. Execution Flow Summary
@@ -47,8 +45,6 @@ The primary entry point is `pam_sm_authenticate()` in `pam_module.c`. When an au
 6. **Token Verification**: Performs pre-flight metadata validation on access tokens (`jwt.c`) and queries the `userinfo_endpoint`.
 7. **Identity & Group Matching**: Validates identity claims via regex (`verify_claim()`) and enforces group membership policies (`verify_group_membership()`).
 8. **Memory Hygiene**: Zeroes all sensitive buffers (`secure_memzero`, `secure_zero_json_tree`) before exiting.
-
-
 
 ---
 
@@ -66,19 +62,13 @@ Reviewers are encouraged to scrutinize the following security and reliability do
 
 * **Heap Reallocations**: Review dynamic buffer expansion in `write_callback()` (`http.c`) and `build_form_postfields()` (`pam_module.c`) for integer overflow protections on `size_t` calculations.
 
-
-
 ### B. POSIX Filesystem & Hardening
 
 * **Config Security**: Review `load_config()` in `config.c` for symlink race conditions (`O_NOFOLLOW`), file descriptor leaks (`O_CLOEXEC`), root ownership (`uid == 0`), and permission restrictions (`0600` / `0640`).
 
-
-
 ### C. Terminal Security & Injection Prevention
 
 * **Sanitization Functions**: Scrutinize `is_safe_terminal_string()`, `is_safe_user_code()`, and `is_safe_rendered_prompt()` to ensure control characters, ANSI escape sequences, or header injections cannot reach the user terminal.
-
-
 
 ### D. Cryptography & Protocol Compliance
 
@@ -87,25 +77,30 @@ Reviewers are encouraged to scrutinize the following security and reliability do
 
 * **JWT Claim Inspection**: Confirm `verify_token_metadata()` in `jwt.c` safely handles fractional `exp`/`nbf` NumericDate claims, audience array matching, and missing claim policies without performing invalid cryptographic assumptions.
 
-
-
 ---
 
 ## 4. Build, Testing & Verification
 
 ### Build Commands
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+The project builds with the in-repo `Makefile` (no CMake):
 
+```bash
+make          # build the module + the CMocka test runner
 ```
 
 ### Running the CMocka Test Suite
 
 ```bash
-ctest --test-dir build --output-on-failure
-
+make test     # build (if needed) and run tests/runner
 ```
 
-The test suite in `test_suite.c` uses weak symbol overrides to mock `libcurl` network transfers without external dependencies. If `zbarimg` and `python3` are installed on the system, `test_qr_scan_roundtrip` automatically verifies terminal QR code rendering accuracy against an independent decoder.
+The test suite in `tests/test_suite.c` uses weak symbol overrides to mock `libcurl` network transfers without external dependencies. If `zbarimg` and `python3` are installed on the system, `test_qr_scan_roundtrip` automatically verifies terminal QR code rendering accuracy against an independent decoder.
+
+---
+
+## Related
+
+* [Security Policy](../../SECURITY.md) — vulnerability disclosure procedure.
+* [Testing & Pre-Production Audit Guide](../testing.md) — operator-facing verification ladder.
+* `AGENTS.md` §3 — the CI-mirrored verification gates a PR must pass.
