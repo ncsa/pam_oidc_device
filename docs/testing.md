@@ -131,7 +131,7 @@ configuration on a disposable host.
 
 ```bash
 # 1. Install the module and a copy of its config (docs/getting-started.md §2–3)
-sudo make install PAM_DIR=<your PAM module dir>   # e.g. /lib64/security or /lib/x86_64-linux-gnu/security
+sudo make install PAM_DIR=<your PAM module dir>   # e.g., /lib64/security or /lib/x86_64-linux-gnu/security
 
 # 2. Point a config copy at your test IdP (or the sandbox mock on 127.0.0.1:8443)
 sudo cp config/pam_oidc_device.conf /etc/pam_oidc_device.conf
@@ -157,8 +157,9 @@ sudo pamtester oidc-test testuser authenticate
 ```
 
 The module then runs the full device flow in your terminal: the verification
-URL, user code (and QR code if `[qr] enabled = true`), then it polls until
-you sign in on a second device. Watch the module log in parallel:
+URL, user code (and QR code if `[qr] enabled = true`), then a short
+"Press [Enter] to begin..." pause — after which it polls until you sign in
+on a second device. Watch the module log in parallel:
 
 ```bash
 sudo journalctl -f | grep pam_oidc_device        # module syslog (LOG_AUTHPRIV)
@@ -243,7 +244,7 @@ Checklist:
       that will run the module.
 - [ ] Set `issuer` to the provider's exact `iss` and `audience` to the
       audience your tokens carry; enable `verify_jwt_claims = true`.
-- [ ] Map the claim: pick `claim_field` (e.g. `preferred_username` or `sub`)
+- [ ] Map the claim: pick `claim_field` (e.g., `preferred_username` or `sub`)
       and write `claim_regex` so only *your* domain/tenant can map to local
       accounts (the sample's `@example.edu` pinning pattern).
 - [ ] If the provider exposes group claims, configure `allow_groups` /
@@ -253,7 +254,7 @@ Checklist:
       if anything is off (verbose includes full HTTP transport metrics —
       keep PII out of shared logs).
 - [ ] Confirm the provider's `expires_in` interplay: your local
-      `max_poll_seconds` (range 10–3600, default 300) caps the wait
+      `max_poll_seconds` (range 10–3600, default 120) caps the wait
       regardless of the provider's code lifetime.
 
 ---

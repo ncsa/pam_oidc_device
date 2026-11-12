@@ -1,11 +1,14 @@
-# AGENTS.md — pam_oidc_device: AI Agent Context & Rules
+# pam_oidc_device — Deep Agent Context & Rules
 
-> **Purpose.** This file is the single, *tool-agnostic* source of truth for all AI/GenAI coding
-> agents (Copilot, Cline, Cursor, Roo, Claude Code, …) working on `pam_oidc_device`.
+> **Purpose.** This is the *deep* reference document for AI/GenAI coding agents (Copilot, Cline,
+> Cursor, Roo, Claude Code, …) working on `pam_oidc_device`. It holds the architecture map,
+> module boundaries, security & protocol guardrails, the CI-mirrored verification gates, RFC
+> compliance notes, the reference library, and the audit-pass prompts.
 >
-> **Wiring.** The canonical file is `.agents/context.md`. The repo-root `AGENTS.md` is a symlink
-> to it, and `CLAUDE.md` is a symlink to `AGENTS.md`, so one edit serves every tool. Only ever
-> edit `.agents/context.md` — never edit through the symlinks.
+> **Wiring.** The root `AGENTS.md` is the thin, canonical entry point (build/test commands +
+> hard boundaries). `CLAUDE.md`, `.github/copilot-instructions.md`, and the `.*rules` files are
+> all symlinks to that root `AGENTS.md`; this file is the detailed companion they point readers
+> to. Edit the deep content here — never edit through the tool shims.
 >
 > **Companion.** Machine-oriented memory of prior AI work (decisions, gotchas, verification
 > status) is kept separately in [`.agents/memory.md`](.agents/memory.md) and must be read before
@@ -32,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.0, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.1, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).
@@ -133,9 +136,24 @@ predicting CI.
 
 4. **Run cppcheck (mirror CI):**
    ```bash
-   cppcheck --enable=all --suppress=missingIncludeSystem --suppress=unusedFunction \
-            --suppress=constParameterCallback --error-exitcode=1 --std=c99 -I include/ src/
+   cppcheck --enable=warning \
+            --enable=style \
+            --enable=performance \
+            --enable=portability \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --suppress=staticFunction \
+            --suppress=constParameterCallback \
+            --error-exitcode=1 \
+            --std=c99 \
+            -I include/ \
+            src/
    ```
+   The `--enable` set is deliberately the four defect severities, not `--enable=all`:
+   `error` severity is always checked regardless, and leaving `information`/`debug`
+   off stops newer cppcheck releases from surfacing purely diagnostic messages
+   (`checkersReport`, `normalCheckLevelMaxBranches`) that `--error-exitcode=1` would
+   otherwise treat as hard failures.
 
 5. **Run flawfinder (mirror CI):**
    ```bash
@@ -188,14 +206,14 @@ predicting CI.
    ```
 
 10. **Native-distro package builds (CI-enforced, on every push/PR to `main`):**
-    - `make rpm` — the `rpm-build` job in `.github/workflows/build.yml` runs it inside
-      Rocky Linux 8/9/10 containers (then installs the produced RPM and verifies
-      `/lib64/security/pam_oidc_device.so` and `/etc/pam_oidc_device.conf`); the `distro-build`
-      job in `.github/workflows/distro-build.yml` runs it inside **openSUSE Leap 16.0**
-      (SUSE), where the spec's `%if 0%{?suse_version}` branch selects SUSE binary package
-      names (`pam-devel`/`libcurl-devel`/`libjson-c-devel`/`libopenssl-devel`/
-      `libcmocka-devel` build-time; `pam`/`libcurl4`/`libjson-c5`/`openssl` runtime).
-      `make rpm` needs the `rpmbuild` toolchain (EL/dnf or SUSE/zypper hosts).
+    - `make rpm` — the `distro-build` job in `.github/workflows/distro-build.yml` runs it
+      inside **Rocky Linux 8/9/10** (EL) and **openSUSE Leap 16.0** (SUSE) containers (then
+      installs the produced RPM and verifies `/lib64/security/pam_oidc_device.so` and
+      `/etc/pam_oidc_device.conf`); on SUSE the spec's `%if 0%{?suse_version}` branch selects
+      SUSE binary package names (`pam-devel`/`libcurl-devel`/`libjson-c-devel`/
+      `libopenssl-devel`/`libcmocka-devel` build-time; `pam`/`libcurl4`/`libjson-c5`/
+      `openssl` runtime). `make rpm` needs the `rpmbuild` toolchain (EL/dnf or SUSE/zypper
+      hosts).
     - `make deb` — the same `distro-build` job builds and installs the binary `.deb`
       (hand-crafted by `packaging/build-deb.sh` with `dpkg-deb` + `dpkg-shlibdeps`, no
       debhelper; module lands in `/lib/<multiarch>/security`, config as a `0600` conffile)
@@ -235,9 +253,8 @@ Do not mark a task as completed unless every gate CI enforces exits cleanly with
 - `make test-sanitize CC=clang` (the `sanitize-test` job),
 - the `e2e-sandbox` job (`tests/e2e/run_e2e.sh`: installed module driven through a real PAM
   stack against the in-repo HTTPS mock OIDC provider; locally: `make sandbox`),
-- `make rpm` on EL8/EL9/EL10 (the `rpm-build` job) **and** on openSUSE Leap 16.0, plus
-  `make deb` on Debian 13 + Ubuntu 26.04 LTS (the `distro-build` jobs in
-  `.github/workflows/distro-build.yml`),
+- `make rpm` on EL8/EL9/EL10 **and** openSUSE Leap 16.0, plus `make deb` on Debian 13 +
+  Ubuntu 26.04 LTS (all the `distro-build` jobs in `.github/workflows/distro-build.yml`),
 - the `license-audit` workflow (`make check-licenses` + the GitHub dependency-graph audit).
 
 `make sanitize` is *not* a CI gate and must not be reported as one.
@@ -278,9 +295,9 @@ docker run -it --rm \
   '
 ```
 
-The `rpm-build` gate cannot be mirrored in that Ubuntu container — it requires an EL image
-(e.g. `rockylinux:9` with `rpm-build`, `pam-devel`, …, as in `build.yml`) — or simply run it in
-CI.
+The `make rpm` gate (the EL/SUSE entries of the `distro-build` job) cannot be mirrored in that
+Ubuntu container — it requires an EL image (e.g. `rockylinux:9` with `rpm-build`, `pam-devel`,
+…, as in `distro-build.yml`) — or simply run it in CI.
 
 **Lightweight checks that DO work on macOS (no PAM needed):**
 
@@ -520,6 +537,138 @@ validation, threat model, packaging), `docs/developer/review.md` (developer
 review guide), `docs/developer/roadmap.md`, `examples/README.md` (provider
 integration examples & discovery).
 
+### 9.1 OAuth 2.0 Device Authorization Grant (RFC 8628) — Vendor & Implementation Reference
+
+This reference defines the IETF standards, commercial OIDC providers, academic/research identity
+federations, reference PAM implementations, and cross-vendor behavioral variances that
+`pam_oidc_device` must support.
+
+#### 1. Core IETF Specifications
+
+* **RFC 8628 — OAuth 2.0 Device Authorization Grant:** https://www.rfc-editor.org/info/rfc8628/
+  * Defines the `/device_authorization` endpoint, `urn:ietf:params:oauth:grant-type:device_code`
+    token grant, OIDC discovery metadata (`device_authorization_endpoint`), polling error codes
+    (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`), and Section 5/6
+    security and usability rules (base-20 user code charset, TLS enforcement, and remote phishing
+    mitigations).
+* **RFC 9700 — Best Current Practice for OAuth 2.0 Security:** https://www.rfc-editor.org/info/rfc9700/
+  * Security baseline deprecating Resource Owner Password Credentials (ROPC) in favor of the
+    Device Authorization Grant on input-constrained or headless systems.
+
+#### 2. Commercial & Enterprise OIDC Providers
+
+* **Microsoft Entra ID (Azure AD) — Microsoft Identity Platform:** https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code
+  * **Endpoints & Setup:** Uses `/{tenant}/oauth2/v2.0/devicecode` and
+    `/{tenant}/oauth2/v2.0/token`. Requires **Allow public client flows** enabled in the App
+    Registration.
+  * **Behavior:** Defaults `expires_in` to `900` seconds (15 minutes). Returns an extra localized
+    `message` field in the device authorization response (customizable via `?mkt=xx-XX`). Uses
+    `authorization_declined` in addition to `access_denied` when a user rejects the prompt. Issues
+    `id_token` and `refresh_token` when `openid` and `offline_access` scopes are requested.
+* **Okta — Configure Device Authorization Grant Flow:** https://developer.okta.com/docs/guides/device-authorization-grant/main/
+  * **Shared Device Guide:** https://www.okta.com/blog/identity-security/device-flow-and-okta-shared-device-authentication-for-consumers/
+  * **Endpoints & Setup:** Requires configuring a **Native Application** with the
+    `Device Authorization` grant enabled on both the client and the Custom Authorization Server's
+    **Access Policy Rule**.
+  * **Behavior:** User codes default to a 10-minute lifetime (`600` seconds). Supports
+    `verification_uri_complete` for terminal QR code rendering and documents shared/public device
+    session-clearing practices.
+* **Auth0 — Device Authorization Flow & Implementation Guide:** https://auth0.com/docs/get-started/authentication-and-authorization-flow/device-authorization-flow
+  * **Native Device Quickstart:** https://auth0.com/docs/quickstart/native/device
+  * **Endpoints & Setup:** Requires **Native** application type, **OIDC Conformant** toggle
+    enabled, and **Device Code** grant type enabled (plus **Allow Offline Access** on the API for
+    refresh tokens).
+  * **Behavior:** Allows tenant-level customization of `user_code` character set, format, and
+    length (enforcing minimums of 8 characters for BASE20 letters or 9 for numbers). Recommends
+    immediately discarding `device_code` in memory once exchanged for tokens.
+* **Keycloak — Securing Applications and Services with OIDC:** https://www.keycloak.org/securing-apps/oidc-layers
+  * **Architectural Design Spec:** https://github.com/keycloak/keycloak-community/blob/main/design/oauth2-device-authorization-grant.md
+  * **Endpoints & Setup:** Exposes `/realms/{realm}/protocol/openid-connect/auth/device` and
+    `/realms/{realm}/device`. Requires enabling **OAuth 2.0 Device Authorization Grant** on the
+    client and supports per-realm or per-client overrides for `Device Code Lifespan` (default
+    `600s`) and `Device Polling Interval` (default `5s`).
+  * **Behavior:** Implements "User Code Verification First" so per-client authentication flow
+    overrides apply, and enforces consent display so users verify device identity against
+    phishing.
+* **Google Identity — OAuth 2.0 for TV and Limited-Input Device Applications:** https://developers.google.com/identity/protocols/oauth2/limited-input-device
+  * **Endpoints & Setup:** Uses `https://oauth2.googleapis.com/device/code` (advertised in
+    `.well-known/openid-configuration` as `device_authorization_endpoint`) and requires the **TVs
+    and Limited Input devices** OAuth client type.
+  * **Behavior:** Deviates from RFC 8628 by returning `verification_url` instead of
+    `verification_uri` in the JSON response. Supports only a restricted subset of Google scopes.
+* **Ping Identity (PingAM) — Device Authorization Grant Endpoint:** https://docs.pingidentity.com/pingam/8.1/am-oauth2/rest-api-oauth2-device-code.html
+  * **Behavior:** Documents `/oauth2/device/code` and `/oauth2/device/user` along with optional
+    PKCE extensions (`Device authorization grant with PKCE`) for public clients.
+* **AWS IAM Identity Center — OIDC API Reference:** https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/Welcome.html
+  * **StartDeviceAuthorization API:** https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/API_StartDeviceAuthorization.html
+  * **Behavior:** Uses dynamic client registration (`RegisterClient`) followed by JSON-encoded
+    requests to `/device_authorization` and `/token` rather than `application/x-www-form-urlencoded`,
+    and omits standard OIDC `id_token` issuance in some portal configurations.
+
+#### 3. Academic & Research Federation OIDC Providers
+
+* **CILogon — OAuth 2.0 Device Flow & OIDC Documentation:** https://www.cilogon.org/device
+  * **General OIDC Docs:** https://www.cilogon.org/oidc
+  * **Reference CLI Shell Script:** https://cilogon.org/deviceflow.sh
+  * **Endpoints & Setup:** Advertises `https://cilogon.org/oauth2/device_authorization` and
+    `https://cilogon.org/oauth2/token` via `https://cilogon.org/.well-known/openid-configuration`
+    (staging environment at `https://test.cilogon.org`).
+  * **Behavior:** Supports both **Confidential Clients** (`client_id` + `client_secret` via form
+    POST) and **Public Clients** (`client_id` only). Defaults to `expires_in: 900` (15 minutes) and
+    `interval: 5`, issuing formatted `user_code` values (e.g., `PLK-NGF-V77`) alongside
+    `verification_uri_complete` (`https://cilogon.org/device/?user_code=...`). Supports the
+    `org.cilogon.userinfo` scope for federated SAML/eduPerson claims (`eppn` /
+    `eduPersonPrincipalName`, `eptid`, `eduPersonScopedAffiliation`, `ou`, `idp_name`).
+* **Globus Auth — API & Headless CLI Reference (Unsupported Caveat):** https://docs.globus.org/api/auth/reference/
+  * **Headless Login Docs:** https://docs.globus.org/cli/reference/login/
+  * **Behavior:** Globus Auth (`https://auth.globus.org`) does **not** implement RFC 8628 and omits
+    `device_authorization_endpoint` from `https://auth.globus.org/.well-known/openid-configuration`.
+    Headless logins (`globus login --no-local-server`) rely on a copy-paste OAuth 2.0 Authorization
+    Code flow (`https://auth.globus.org/v2/web/auth-code`). Research sites requiring RFC 8628
+    alongside Globus authenticate against **CILogon** directly.
+* **INDIGO IAM (WLCG, INFN, ESCAPE, EOSC) — Obtaining a Token from a CLI:** https://indigo-iam.github.io/v/current/docs/tasks/user/getting-a-token/
+  * **Behavior:** Exposes `/devicecode` via `.well-known/openid-configuration` and explicitly
+    deprecates ROPC in favor of the device flow. Supports self-service and RFC 7591 dynamic client
+    registration with `urn:ietf:params:oauth:grant-type:device_code` enabled by default, plus
+    optional `audience` parameters on token requests per **WLCG Common JWT Profiles**.
+* **CERN SSO (Keycloak) — OAuth 2.0 Device Code Authorization Grant:** https://auth.docs.cern.ch/user-documentation/oidc/device-code/
+  * **Behavior:** Enables `urn:ietf:params:oauth:grant-type:device_code` by default for new OIDC
+    client registrations, supports both public and confidential clients, and returns `cern_roles`
+    claims for authorization mapping.
+* **EGI Check-in / LS Login / eduTEAMS (GÉANT AARC) — Service Provider OIDC Guide:** https://docs.egi.eu/providers/check-in/sp/
+  * **Behavior:** Implements the **AARC Blueprint Architecture (BPA)** and **REFEDS Assurance
+    Framework**, encoding Virtual Organization (VO) memberships in `eduperson_entitlement` URNs
+    (e.g., `urn:mace:egi.eu:group:...`) and persistent user identifiers in `eduperson_unique_id`.
+
+#### 4. Reference PAM & Research CLI Implementations
+
+* **`ICS-MU/pam_oauth2_device` (C++ PAM Module for Research Infrastructures):** https://github.com/ICS-MU/pam_oauth2_device
+  * Security-reviewed by the University of Basel and the Swiss Institute of Bioinformatics (evolved
+    from `ondrejvelisek/pam_oauth2_device` and SLAC's `pam_oauth2_device`). Renders terminal QR
+    codes from `verification_uri_complete`, maps configurable OIDC claims (`username_attribute`
+    such as `sub`, `eppn`, or `preferred_username`) to local POSIX/LDAP accounts, and injects MFA
+    enforcement (`require_mfa`) into authorization requests.
+* **`Nithe14/pam_oauth2_device` (Rust PAM Implementation):** https://github.com/Nithe14/pam_oauth2_device
+  * Integrates alongside SSSD/NSS for local account resolution, validates token claims (`active`,
+    `username`, `scope`, `exp`), and explicitly blocks `root` logins via the OIDC device flow.
+* **`indigo-dc/oidc-agent` & `EOSC-synergy/ssh-oidc` (`motley_cue`):** https://github.com/indigo-dc/oidc-agent and https://github.com/EOSC-synergy/ssh-oidc
+  * Standard research CLI/HPC tooling demonstrating `--flow=device` across CILogon, EGI Check-in,
+    INDIGO IAM, and WLCG, plus mapping REFEDS assurance levels and `eduperson_entitlement` VOs to
+    local Linux accounts.
+
+#### 5. Cross-Vendor Compatibility & Implementation Matrix for `pam_oidc_device`
+
+| Requirement / Behavior | Standard & Vendor Variance | Implementation Rule for `pam_oidc_device` |
+| :--- | :--- | :--- |
+| **OIDC Discovery validation** | **Entra**, **Okta**, **Auth0**, **Keycloak**, **Google**, **CILogon**, **INDIGO IAM**, **CERN SSO**, and **EGI Check-in** publish `device_authorization_endpoint`; **Globus Auth** does not. | Resolve `device_authorization_endpoint`, `token_endpoint`, `jwks_uri`, and `issuer` via `.well-known/openid-configuration`. Allow manual endpoint overrides in config, and return a clear `PAM_AUTHINFO_UNAVAIL` / config error if `device_authorization_endpoint` is absent. |
+| **Verification URI JSON key** | RFC 8628 requires `verification_uri`; **Google Identity** returns `verification_url`. | Parse `verification_uri` first and fall back to `verification_url` if `verification_uri` is missing. |
+| **User denial error codes** | RFC 8628 defines `access_denied`; **Microsoft Entra ID** can return `authorization_declined`. | Treat both `access_denied` and `authorization_declined` as immediate terminal authentication failures (`PAM_AUTH_ERR`). |
+| **Polling interval & backoff** | RFC 8628 defaults to `5s` if `interval` is omitted and mandates adding `+5s` on `slow_down`. | Honor server-returned `interval` (default `5s`), permanently increment the session interval by `+5s` upon receiving `slow_down`, and apply exponential backoff on transient network/5xx errors. |
+| **Client authentication mode** | **Entra ID**, **Okta**, **Auth0**, and **Google** expect public native clients without a secret (some reject secrets on device flow); **Keycloak**, **PingAM**, **CILogon**, **CERN SSO**, and **INDIGO IAM** support both public and confidential clients. | Default to public client mode (`client_id` in form body), with optional `client_secret` support (`client_secret_basic` or `client_secret_post`) for centrally provisioned confidential clients. |
+| **POSIX username claim mapping** | Commercial IdPs often use `email` or `preferred_username`, whereas academic IdPs frequently issue opaque `sub` URIs (`http://cilogon.org/serverA/users/...`) alongside `eppn` or `eduperson_unique_id`. | Support configurable `username_attribute` lookup (`eppn`, `eduperson_unique_id`, `preferred_username`, `email`, `sub`) with optional `@domain` stripping or local mapfile/regex translation, and block `root` logins by default. |
+| **VO / Group & MFA gating** | Research clusters authorize by Virtual Organization (`eduperson_entitlement`, `wlcg.groups`, `cern_roles`) and REFEDS MFA (`acr` = `https://refeds.org/profile/mfa`). | Support optional claim-matching rules (required group/entitlement values and `acr` MFA assertions) and optional `acr_values` / `audience` request parameters before returning `PAM_SUCCESS`. |
+| **PAM & OpenSSH UX** | `sshd` requires `KbdInteractiveAuthentication yes` (`ChallengeResponseAuthentication yes`) and `UsePAM yes` to display prompts. | Emit `verification_uri` and `user_code` (plus an optional ASCII QR code from `verification_uri_complete` when enabled) via `PAM_TEXT_INFO` in the PAM conversation function before entering the token polling loop. |
+
 ---
 
 ## 10. Specialized Review Workflows (Audit Passes)
@@ -540,10 +689,14 @@ configuration parsing for vulnerability vectors and defensive coding flaws.
 >
 > 1. **Memory hygiene & buffer safety:** Verify that sensitive tokens, client secrets, and JSON
 >    trees are zeroed via volatile memory writes (`secure_memzero`, `secure_zero_json_tree`)
->    across **all** exit paths (including `return`, `goto cleanup`, and error branches). Audit
->    stack and heap bounds checking: inspect `snprintf`, `memcpy`, `realloc`, and fixed-capacity
->    form field arrays (`DEVICE_FORM_MAX_FIELDS`, `TOKEN_FORM_MAX_FIELDS`) for integer
->    wrap-around or truncation risks.
+>    across **all** exit paths (including `return`, `goto cleanup`, and error branches). Enumerate
+>    every `free()` / `json_object_put()` release of a sensitive or provider-parsed value and
+>    manually confirm the paired scrub: the lexical gate (`make check-scrub`) only recognizes
+>    bare-identifier, `*handle`, and `&handle` argument forms — releases through array indexing
+>    or temporaries, and allowlisted non-sensitive trees (`JSON_PII_ALLOWLIST`), are out of its
+>    scope. Audit stack and heap bounds checking: inspect `snprintf`, `memcpy`, `realloc`, and
+>    fixed-capacity form field arrays (`DEVICE_FORM_MAX_FIELDS`, `TOKEN_FORM_MAX_FIELDS`) for
+>    integer wrap-around or truncation risks.
 > 2. **POSIX & system hardening:** Validate file-descriptor and race-condition defenses during
 >    file loading (`load_config`). Confirm strict usage of `O_NOFOLLOW` and `O_CLOEXEC`, root
 >    ownership assertions (`uid == 0`), and restrictive file-permission enforcement

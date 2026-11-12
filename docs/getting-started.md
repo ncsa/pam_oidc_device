@@ -83,6 +83,7 @@ A minimal working configuration:
 ```ini
 [oauth]
 client_id = your-oauth-client-id
+# client_secret = your-oauth-client-secret   # only for confidential clients (leave unset for public clients)
 device_authorization_endpoint = https://auth.example.com/oauth2/v2.0/devicecode
 token_endpoint = https://auth.example.com/oauth2/v2.0/token
 userinfo_endpoint = https://auth.example.com/oauth2/v2.0/userinfo
@@ -97,11 +98,13 @@ case_sensitive = false
 
 [runtime]
 loglevel = info
-max_poll_seconds = 300
+max_poll_seconds = 120
 
 [prompt]
 # Optional custom prompt template (printable ASCII; use \n for newlines).
-# init_message = Sign in at {verification_uri} with code {user_code}
+# Placeholders: {url} (verification URL), {url_complete} (direct-link URL with
+# the code embedded, if the IdP provides one), {code} (user code).
+# init_message = Sign in at {url} with code {code}
 
 [qr]
 # Optional: render the sign-in URL as a scannable QR code on TTY logins (phone-camera friendly).
@@ -166,10 +169,17 @@ sudo sshd -t && sudo systemctl reload sshd
 > [!NOTE]
 > **The device code clock starts before you press Enter.** The provider's `expires_in`
 > countdown begins the moment the module requests the device code — *before* you press
-> ENTER at the continuation prompt. The module's polling window is additionally capped at
-> `max_poll_seconds` (`[runtime]`, default 300 s, floor 10 s). Time spent sitting idle at
-> the "Press ENTER to continue" prompt consumes the code's remaining lifetime; approve the
-> code on your second device promptly after it is displayed.
+> Enter at the "Press [Enter] to begin..." confirmation prompt. Token-endpoint polling
+> does **not** start until you press Enter; the first poll then fires immediately (no
+> leading delay), so approving on your second device is picked up the moment polling
+> begins. The confirmation prompt exists to flush the sign-in prompt to your terminal —
+> OpenSSH keyboard-interactive clients buffer `PAM_TEXT_INFO` messages, which are only
+> delivered to the screen once the module prompts you for some input — the Enter
+> round-trip is that trigger (and also gives you a moment to note the URL and code).
+> The module's polling window is additionally capped at `max_poll_seconds` (`[runtime]`,
+> default 120 s, floor 10 s). Time spent sitting idle at the confirmation prompt
+> consumes the code's remaining lifetime; approve the code on your second device
+> promptly after it is displayed.
 
 ---
 
@@ -209,7 +219,7 @@ completing the device flow in all of these cases).
 > - With `required` / `requisite`, *any* module failure — including an invalid or missing
 >   config file — **blocks login** (fail-closed).
 > - With `sufficient`, a module failure does **not** block login: PAM simply continues to the
->   next module. If a later module (e.g. `pam_unix.so`) then succeeds, the user is
+>   next module. If a later module (e.g., `pam_unix.so`) then succeeds, the user is
 >   authenticated **without ever completing the OIDC device flow**. That silently downgrades
 >   step-up/MFA authentication to your fallback method the moment the module errors — which is
 >   almost never what you want on a security gate.
@@ -229,21 +239,39 @@ Placing `auth required pam_succeed_if.so uid >= 1000 quiet` immediately **before
 On modern Enterprise Linux distributions (RHEL 8/9/10, Rocky Linux, AlmaLinux, Fedora), system PAM stack configuration is managed dynamically by `authselect`.
 
 > [!WARNING]
-> Direct manual edits to `/etc/pam.d/system-auth` or `/etc/pam.d/sshd` may be overwritten during system updates or when `authselect apply-changes` is executed.
+> Direct manual edits to the shared stack files (e.g., `/etc/pam.d/system-auth`) are
+> regenerated when `authselect apply-changes` is executed; `/etc/pam.d/sshd` is not
+> managed by `authselect`, but distribution updates can reconfigure it.
 
 ### Preserving Configuration with `authselect`
 
 To permanently integrate `pam_oidc_device.so`:
 
-1. **Option A (Recommended):** Append the module directive directly to `/etc/pam.d/sshd`. `authselect` manages core profile files (`system-auth`, `password-auth`) but leaves custom `/etc/pam.d/sshd` additions intact unless a full profile re-application explicitly overwrites service files.
-2. **Option B (Custom Profile):** Create a vendor custom authselect profile:
+1. **Option A (Recommended):** Append the module directive directly to `/etc/pam.d/sshd`. `authselect` manages only the shared stack files (`system-auth`, `password-auth`, …) plus `nsswitch.conf`/`dconf` — it never rewrites `/etc/pam.d/sshd`, so the appended directive survives `authselect apply-changes` and profile switches. The only way it can be lost is a manual or distribution-driven replacement of the `sshd` file itself.
+2. **Option B (Custom Profile):** `authselect` manages only the **shared stack
+   files** (`system-auth`, `password-auth`, `fingerprint-auth`,
+   `smartcard-auth`, `postlogin`) plus `nsswitch.conf`/`dconf` — it does
+   **not** manage `/etc/pam.d/sshd`, and `authselect apply-changes` will never
+   overwrite it. So Option A already persists unless `/etc/pam.d/sshd` is
+   manually replaced. A profile-based integration must instead target the
+   shared stack that `sshd` pulls in (the RHEL-family `sshd` stack ends with
+   `auth include password-auth`):
    ```bash
-   sudo authselect create-profile oidc-sshd sssd --copy-settings-for=sshd
+   # Find the currently active profile, then derive a custom profile from it:
+   authselect select --print-id
+   sudo authselect create-profile oidc-auth --base-on=<current-profile>
    ```
-   Modify `/etc/authselect/custom/oidc-sshd/sshd` to include `pam_oidc_device.so`, then apply:
+   Add the module to the auth section of
+   `/etc/authselect/custom/oidc-auth/password-auth` (after `pam_unix.so` /
+   `pam_faillock.so`, before any `sufficient` entries), then apply:
    ```bash
-   sudo authselect select custom/oidc-sshd
+   sudo authselect select custom/oidc-auth
    ```
+   > [!WARNING]
+   > A module placed in a shared stack applies to **every** service that
+   > includes that stack (`system-auth`, `password-auth`) — typically `sshd`,
+   > `su`, and the display manager. If you want the device flow scoped to SSH
+   > logins only, use Option A.
 
 ---
 
@@ -262,6 +290,16 @@ Log levels can be configured in `/etc/pam_oidc_device.conf` under `[runtime]` or
 | `info` | `2` | **Default.** Logs high-level auth success/failure lifecycle events. |
 | `debug` | `3` | Logs internal workflow steps, regex claim matches, and deadline clocks. |
 | `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status. |
+
+### Polling Timeout (`max_poll_seconds`)
+
+`max_poll_seconds` (in `[runtime]`) caps the module's token-polling window:
+default `120` seconds, accepted range `10`–`3600`. The provider's own
+`expires_in` may clamp the window shorter. When the cap (or the provider
+timeout) is reached without a token, authentication fails with
+`PAM_AUTH_ERR`. Because the device code clock starts **before** the Enter
+confirmation prompt (see the Note in §4), approve the code on your second
+device promptly after it is displayed.
 
 ### PAM Directive Override Example
 

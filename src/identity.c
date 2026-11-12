@@ -49,17 +49,20 @@ static int ascii_strcasecmp(const char *s1, const char *s2) {
  * against `target` using either exact or case-insensitive ASCII matching. Empty tokens
  * are ignored, so trailing/leading commas do not produce spurious matches.
  *
- * Length handling: `list` is copied into a fixed 256-byte stack buffer so `strtok_r()`
- * can split it in place without mutating the caller's (const, reused) config string. A
- * list whose length reaches that bound is REJECTED, not truncated: `copy_checked()`
- * reports the overflow and this function returns 0 (no match), so a partial token can
- * never spuriously match. That is fail-safe for allow lists (an over-long allow list
- * matches nothing, so the account is refused). For a deny list the same bound is, in
- * principle, a fail-open (an over-long deny list is simply not applied) — but every
- * current caller passes one of the 256-byte `config_t` list fields, which the config
- * loader already bounds to 255 characters, so the cap is a defense-in-depth backstop
- * that is unreachable through the normal config path; it keeps the function safe even
- * if it were ever called with an arbitrary-length list, and keeps stack usage bounded.
+ * Length handling: `list` is copied into a stack buffer sized to `ACCESS_LIST_LEN`
+ * so `strtok_r()` can split it in place without mutating the caller's (const, reused)
+ * config string. This buffer is deliberately the same bound as the `config_t` list
+ * fields it always feeds (the user/group allow/deny lists), so a validly parsed list
+ * always fits here and matching works end to end. A list whose length reaches that
+ * bound is REJECTED, not truncated: `copy_checked()` reports the overflow and this
+ * function returns 0 (no match), so a partial token can never spuriously match. That
+ * is fail-safe for allow lists (an over-long allow list matches nothing, so the
+ * account is refused). For a deny list the same bound is, in principle, a fail-open
+ * (an over-long deny list is simply not applied) — but every current caller passes one
+ * of the `ACCESS_LIST_LEN`-byte `config_t` list fields, which the config loader already
+ * bounds to the same length, so the cap is a defense-in-depth backstop that is
+ * unreachable through the normal config path; it keeps the function safe even if it
+ * were ever called with an arbitrary-length list, and keeps stack usage bounded.
  *
  * @param[in] list           Comma-separated candidate list.
  * @param[in] target         Value to search for.
@@ -70,7 +73,7 @@ static int list_contains(const char *list, const char *target, int case_sensitiv
     if (!list || !target || target[0] == '\0') {
         return 0;
     }
-    char buf[256];
+    char buf[ACCESS_LIST_LEN];
     if (copy_checked(buf, sizeof(buf), list) != 0) {
         return 0;
     }

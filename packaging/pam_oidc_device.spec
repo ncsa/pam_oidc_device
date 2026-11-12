@@ -1,6 +1,6 @@
 # Fallback defaults if built directly via rpmbuild without Makefile defines
 %{!?mod_name:    %global mod_name pam_oidc_device}
-%{!?mod_version: %global mod_version 0.3.0}
+%{!?mod_version: %global mod_version 0.3.1}
 %{!?mod_summary: %global mod_summary PAM authentication module for OAuth 2.0 Device Authorization Grant}
 
 Name:           %{mod_name}
@@ -45,7 +45,7 @@ authentication modules for step-up or multi-factor authentication.
 %build
 # Build with the Makefile's own default flags instead of distro macros:
 # the Makefile encodes the project's documented flag bar (-fstack-protector-strong,
-# -D_FORTIFY_SOURCE=3, the full -Wall/-Wextra warning set, -O2 -g) and links
+# -D_FORTIFY_SOURCE=2, the full -Wall/-Wextra warning set, -O2 -g) and links
 # with -Wl,-z,relro,-z,now. The %{build_cflags}/%{build_ldflags} macros are
 # distribution-specific and cannot be relied on: %build_ldflags is undefined
 # on openSUSE Leap 16.0, where rpmbuild leaves the literal "%{build_ldflags}"

@@ -2,7 +2,7 @@
 #
 # scripts/check-memory-scrubbing.sh — Memory-management inspection gate.
 #
-# Enforces the project's secret-hygiene invariant (AGENTS.md §4.1): sensitive
+# Enforces the project's secret-hygiene invariant (`.agents/context.md` §4.1): sensitive
 # buffers — OAuth tokens, PKCE verifier/challenge, client secret, form POST
 # fields, HTTP response bodies, and provider-parsed JSON trees — must be
 # zeroed with a dead-code-elimination-proof primitive (`secure_memzero()`
@@ -28,8 +28,9 @@
 #       file. Plain memset remains acceptable for *initialization*
 #       (top-of-function zero-init, where the optimizer keeps the
 #       writes); it is never acceptable as the *only* zeroing.
-#   S3  Every json_object_put() of a provider-parsed JSON tree handle
-#       must be paired with a same-file secure_zero_json_tree() scrub of
+#   S3  Every json_object_put() of a provider-parsed JSON tree handle —
+#       including pointer/dereference forms such as json_object_put(*tok_json)
+#       — must be paired with a same-file secure_zero_json_tree() scrub of
 #       that handle (json-c retains private heap copies of each parsed
 #       string that json_object_put() releases with a plain free()).
 #       Documented non-sensitive trees may be listed in JSON_PII_ALLOWLIST.
@@ -39,7 +40,10 @@
 #   * A sensitive buffer that is freed WITHOUT scrubbing on one path can
 #     still pass S1/S2 if another path in the same file scrubs before
 #     release. The CMocka sanitizer run (`make test-sanitize`) and the
-#     security audit passes (AGENTS.md §10.1) remain the backstop.
+#     security audit passes (`.agents/context.md` §10.1) remain the backstop.
+#   * S3 matches `json_object_put(handle)`, `json_object_put(*handle)` and
+#     `json_object_put(&handle)`; releases through other expressions (array
+#     indexing, temporaries) remain out of scope.
 #
 set -uo pipefail
 
@@ -53,7 +57,7 @@ err() {
   fail=1
 }
 
-# Accepted anti-DCE zeroing primitives (AGENTS.md §4.1).
+# Accepted anti-DCE zeroing primitives (`.agents/context.md` §4.1).
 SCRUB_RE='(secure_memzero|explicit_bzero)\('
 
 # --- S1: scrub-before-release for sensitive heap buffers ----------------------
@@ -94,7 +98,7 @@ done
 # If a file memsets a sensitive anchor, it must also secure-scrub that same
 # anchor somewhere in the same file. `.{0,1}` after the open paren permits
 # the address-of form (memset(&dev, ...)).
-S2_ANCHORS='postfields token_postfields access_token client_secret code_verifier code_challenge device_code payload_b64 payload_json_str auth_hdr resp->body dev cfg'
+S2_ANCHORS='postfields token_postfields access_token client_secret code_verifier code_challenge device_code payload_b64 payload_json_str auth_hdr resp->body dev cfg prompt_buf jwt_sub'
 
 note "S2: plain memset() only tolerated alongside a secure scrub"
 for f in src/*.c; do
@@ -114,13 +118,13 @@ JSON_PII_ALLOWLIST='doc' # http.c: OIDC discovery metadata (endpoints / methods 
 
 note "S3: json_object_put() paired with secure_zero_json_tree()"
 for f in src/*.c; do
-  handles=$(grep -oE 'json_object_put\([A-Za-z_][A-Za-z0-9_]*\)' "$f" | sed -E 's/json_object_put\(|\)//g' | sort -u)
+  handles=$(grep -oE 'json_object_put\([*&]?[A-Za-z_][A-Za-z0-9_]*\)' "$f" | sed -E 's/json_object_put\(|\)//g; s/[*&]//g' | sort -u)
   [ -z "$handles" ] && continue
   for h in $handles; do
     case " $JSON_PII_ALLOWLIST " in
       *" $h "*) continue ;;
     esac
-    if ! grep -qE "secure_zero_json_tree\(${h}" "$f"; then
+    if ! grep -qE "secure_zero_json_tree\(\*?${h}" "$f"; then
       err "$f: json_object_put(${h}) without a same-file secure_zero_json_tree(${h}) scrub"
     fi
   done

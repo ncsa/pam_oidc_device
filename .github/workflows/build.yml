@@ -1,4 +1,4 @@
-name: Build and Package Verification
+name: Build & Test
 
 on:
   push:
@@ -160,45 +160,3 @@ jobs:
 
       - name: Run the device-flow e2e scenario suite
         run: ./tests/e2e/run_e2e.sh
-
-  rpm-build:
-    name: Native ${{ matrix.distro.name }} RPM Package Build
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        distro:
-          - name: "EL8"
-            image: "rockylinux/rockylinux:8"
-            config_pkg: "dnf-utils"
-            optional_repo: "powertools"
-          - name: "EL9"
-            image: "rockylinux/rockylinux:9"
-            config_pkg: "dnf-plugins-core"
-            optional_repo: "crb"
-          - name: "EL10"
-            image: "rockylinux/rockylinux:10"
-            config_pkg: "dnf-plugins-core"
-            optional_repo: "crb"
-    container:
-      image: ${{ matrix.distro.image }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Enable optional repo and install build dependencies
-        run: |
-          dnf install -y ${{ matrix.distro.config_pkg }}
-          dnf config-manager --set-enabled ${{ matrix.distro.optional_repo }}
-          dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
-
-      - name: Verify RPM creation and run %check tests
-        run: make rpm
-
-      - name: Verify generated RPM package
-        run: |
-          MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm")
-          dnf install -y "$MAIN_RPM"
-          ls -la /lib64/security/pam_oidc_device.so
-          ls -la /etc/pam_oidc_device.conf

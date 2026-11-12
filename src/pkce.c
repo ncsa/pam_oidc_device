@@ -92,6 +92,11 @@ static int base64url_encode_nopad(const unsigned char *data, size_t len, char *o
  * Base64URL, yielding a 64-character verifier within the RFC 7636 §4.2
  * 43-128 character bound. The raw CSPRNG buffer is scrubbed before return.
  *
+ * The 48-byte draw is deliberate: 48 is a multiple of 3, so all 384 CSPRNG
+ * bits map directly onto exact 6-bit Base64URL groups with no leftover bits —
+ * the encoding is modulo-bias-free by construction (no rejection sampling
+ * needed) and preserves the full 48 bytes of entropy.
+ *
  * The caller owns `out` and is expected to scrub it with `secure_memzero()` on
  * every termination path; this function never logs or returns the verifier.
  *

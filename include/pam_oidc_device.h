@@ -40,20 +40,14 @@
  * ============================================================================ */
 
 /*
- * json-c 0.17 changed json_object_array_get_idx()'s index parameter from
- * `int` to `size_t`. Casting a `size_t` loop index to the parameter type the
- * linked json-c release expects keeps -Wconversion / -Wsign-conversion quiet
- * on both old (e.g. EL8's json-c 0.13) and new (>= 0.17) platforms. Callers
- * iterate with indices bounded by json_object_array_length(), which is always
- * far below INT_MAX, so the narrowing cast on pre-0.17 releases cannot lose
- * data.
+ * json_object_array_get_idx() takes a `size_t` index on every json-c release in the
+ * supported matrix (EL8's json-c 0.13.1 through 0.18 on EL10/Ubuntu/Debian/SUSE). All
+ * callers iterate with a `size_t` index bounded by json_object_array_length(); the
+ * explicit size_t cast matches the parameter type and keeps -Wconversion /
+ * -Wsign-conversion quiet on every platform. (An earlier shim that narrowed the index
+ * to `int` on pre-0.17 releases was wrong: json-c already used `size_t` there.)
  */
-#if defined(JSON_C_MAJOR_VERSION) && defined(JSON_C_MINOR_VERSION) &&                                                  \
-    (JSON_C_MAJOR_VERSION > 0 || JSON_C_MINOR_VERSION >= 17)
-#define JSON_ARRAY_IDX(i) (i)
-#else
-#define JSON_ARRAY_IDX(i) ((int)(i))
-#endif
+#define JSON_ARRAY_IDX(i) ((size_t)(i))
 
 /* ============================================================================
  * Configuration & Runtime Constants
@@ -68,11 +62,24 @@
 /** @brief Maximum standard polling interval in seconds. */
 #define MAX_POLL_INTERVAL 60
 
-/** @brief Maximum supported polling interval upper bound in seconds. */
+/** @brief Maximum supported polling interval upper bound in seconds; provider-advertised
+ *         intervals above this are clamped down to it (never a fatal error). */
 #define MAX_SUPPORTED_POLL_INTERVAL 120
 
 /** @brief Maximum buffer capacity for custom initial user prompt templates. */
 #define MAX_INIT_MSG_LEN 1024
+
+/**
+ * @brief Byte capacity of the [access] user/group allow/deny list fields
+ * (`allow_users`, `deny_users`, `allow_groups`, `deny_groups`).
+ *
+ * 2048 bytes comfortably holds a full production deny list of local service
+ * accounts (e.g. every account from /etc/passwd, ~500-1000 bytes). Must stay in
+ * lockstep with the scratch buffer in identity.c's list_contains() — the two
+ * bounds are the same logical cap, so raising one without the other would let
+ * a longer list parse but then fail to match at runtime.
+ */
+#define ACCESS_LIST_LEN 2048
 
 /** @brief Maximum allowable HTTP response payload size (256 KiB). */
 #define MAX_HTTP_RESPONSE_SIZE ((size_t)256 * 1024)
@@ -186,16 +193,20 @@ typedef struct {
                             verification. */
     char introspection_endpoint[512]; /**< Reserved: RFC 7662 Token Introspection endpoint URL; parsed and validated,
                                          but not yet used. */
-    int verify_jwt_claims;  /**< Flag: 1 to enforce local JWT claim inspection (exp, nbf, iss, aud). Claims-only; NOT a
-                               signature check. */
-    int clock_skew_leeway;  /**< Allowed clock skew leeway in seconds for exp/nbf validation. */
-    int require_exp_claim;  /**< Flag: 1 to require a well-formed 'exp' claim when verify_jwt_claims is enabled. */
-    char allow_users[256];  /**< Comma-separated local usernames permitted to authenticate (empty = all allowed). */
-    char deny_users[256];   /**< Comma-separated local usernames denied authentication (takes precedence over allow). */
-    int allow_root;         /**< Flag: 1 to permit the `root` account to authenticate; 0 (default) denies root. */
-    char allow_groups[256]; /**< Comma-separated provider groups/roles granting access (any single match suffices). */
-    char deny_groups[256];  /**< Comma-separated provider groups/roles denying access (takes precedence over allow). */
-    int enforce_groups;     /**< Flag: 1 to require group/role authorization when no group lists are configured. */
+    int verify_jwt_claims; /**< Flag: 1 to enforce local JWT claim inspection (exp, nbf, iss, aud). Claims-only; NOT a
+                              signature check. */
+    int clock_skew_leeway; /**< Allowed clock skew leeway in seconds for exp/nbf validation. */
+    int require_exp_claim; /**< Flag: 1 to require a well-formed 'exp' claim when verify_jwt_claims is enabled. */
+    char allow_users[ACCESS_LIST_LEN]; /**< Comma-separated local usernames permitted to authenticate (empty = all
+                                          allowed). */
+    char deny_users[ACCESS_LIST_LEN];  /**< Comma-separated local usernames denied authentication (takes precedence over
+                                          allow). */
+    int allow_root; /**< Flag: 1 to permit the `root` account to authenticate; 0 (default) denies root. */
+    char allow_groups[ACCESS_LIST_LEN]; /**< Comma-separated provider groups/roles granting access (any single match
+                                           suffices). */
+    char deny_groups[ACCESS_LIST_LEN];  /**< Comma-separated provider groups/roles denying access (takes precedence over
+                                           allow). */
+    int enforce_groups;         /**< Flag: 1 to require group/role authorization when no group lists are configured. */
     char group_claim_field[64]; /**< JSON field name in UserInfo containing group/role claims (e.g., "groups", "roles").
                                  */
     int use_pkce;               /**< Three-state PKCE gate: 0 (default) off; 1 always extend the RFC 8628 device
@@ -629,5 +640,25 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
  *       both integer and double JSON types are accepted, all others are rejected.
  */
 int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t *pamh);
+
+/**
+ * @brief Extracts a single string claim (e.g. `sub`) from a JWT's payload segment.
+ *
+ * Applies the same strict structural validation as verify_token_metadata()
+ * (three dot-delimited segments, non-empty payload, strict RFC 4648 §5
+ * Base64URL alphabet, JSON object payload) and copies the named claim's string
+ * value into the caller's buffer. Claims-only inspection: the JWT signature is
+ * NOT verified; never use this as the sole basis for authorization.
+ *
+ * @param[in]  token      Raw JWT string (header.payload.signature).
+ * @param[in]  claim_name Name of the payload claim to extract.
+ * @param[out] out        Buffer receiving the NUL-terminated claim value.
+ * @param[in]  out_len    Capacity of @p out in bytes.
+ * @return 0 when the claim was found and copied; 1 when the claim is absent
+ *         from the payload; -1 on NULL/empty arguments, malformed JWT
+ *         structure, non-object payload, a non-string claim, or an output
+ *         buffer too small for the value.
+ */
+int jwt_extract_claim_string(const char *token, const char *claim_name, char *out, size_t out_len);
 
 #endif /* PAM_OIDC_DEVICE_H */

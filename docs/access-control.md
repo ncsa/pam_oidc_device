@@ -30,11 +30,11 @@ enforce_groups = false
 | --- | --- | --- | --- |
 | `allow_users` | string | `""` | Comma-separated list of local usernames permitted to authenticate. Empty allows all non-denied users. |
 | `deny_users` | string | `""` | Comma-separated list of local usernames denied authentication. **Takes precedence over `allow_users`.** |
-| `allow_root` | boolean | `false` | When `true`, permits the `root` account to authenticate. **Default denies `root` even if it is listed in `allow_users`.** |
+| `allow_root` | boolean | `false` | When `true`, permits the `root` account to authenticate. **Default denies `root` even if it is listed in `allow_users`.** A `root` entry in `deny_users` still wins — denial lists are evaluated before the `root` opt-in. |
 | `allow_groups` | string | `""` | Comma-separated list of provider groups/roles granting access. A user matching any listed group is allowed. |
 | `deny_groups` | string | `""` | Comma-separated list of provider groups/roles denying access. **Takes precedence over `allow_groups`.** |
 | `enforce_groups` | boolean | `false` | When `true`, requires group/role evaluation even if group lists are empty (denying access if no groups match). |
-| `group_claim_field` | string | `"groups"` | JSON key in the UserInfo response containing group or role claims (e.g. `groups`, `roles`, `wids`). |
+| `group_claim_field` | string | `"groups"` | JSON key in the UserInfo response containing group or role claims (e.g., `groups`, `roles`, `wids`). |
 
 ---
 
@@ -43,7 +43,7 @@ enforce_groups = false
 Local account access checks are evaluated **before making any network requests** to the identity provider.
 
 * **Denial Precedence:** If a local user is listed in `deny_users`, authentication is refused immediately with `PAM_PERM_DENIED` without making any HTTP requests.
-* **Root Default-Deny:** The `root` account is refused with `PAM_PERM_DENIED` unless `allow_root = true` is explicitly set; this applies regardless of `allow_users`/`deny_users`.
+* **Root Default-Deny:** The `root` account is refused with `PAM_PERM_DENIED` unless `allow_root = true` is explicitly set; the check runs independently of `allow_users`, but `deny_users` is still evaluated first — so `allow_root = true` plus `deny_users = root` refuses `root`.
 * **Allow Enforcement:** If `allow_users` is set, any local account not explicitly listed is rejected before network contact.
 * **Case Sensitivity:** Matching honors the `case_sensitive` setting configured under the `[claim]` section.
 
@@ -58,9 +58,9 @@ allow_users = alice, bob
 deny_users = root
 ```
 
-* User `alice` -> Allowed to proceed to OIDC polling.
-* User `root` -> Immediately denied (`PAM_PERM_DENIED`), no HTTP network traffic generated.
-* User `eve` -> Denied (not listed in `allow_users`).
+* User `alice` → Allowed to proceed to OIDC polling.
+* User `root` → Immediately denied (`PAM_PERM_DENIED`), no HTTP network traffic generated.
+* User `eve` → Denied (not listed in `allow_users`).
 
 ---
 
@@ -98,7 +98,7 @@ The module automatically handles various JSON claim structures under `group_clai
 
 ---
 
-## Evaluation Precedence & Rules
+### Evaluation Precedence & Rules
 
 1. **Bypass:** If no group lists are configured and `enforce_groups = false`, group authorization is bypassed.
 2. **Deny List Precedence:** If any user group matches an entry in `deny_groups`, authentication fails immediately with `PAM_PERM_DENIED`.
