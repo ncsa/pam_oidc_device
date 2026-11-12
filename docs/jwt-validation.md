@@ -44,11 +44,20 @@ require_exp_claim = false
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `verify_jwt_claims` | boolean | `false` | Enables local pre-flight claims parsing (`exp`, `nbf`, `iss`, `aud`). |
+| `verify_jwt_claims` | boolean | `false` | Enables local pre-flight claims parsing (`exp`, `nbf`, `iss`, `aud`). **Requires both `issuer` and `audience` to be configured** (rejected at load time otherwise). |
 | `issuer` | string | `""` | Expected issuer string (`iss`). If set, incoming tokens must match exactly. |
 | `audience` | string | `""` | Expected audience string or comma-separated list (`aud`). |
 | `clock_skew_leeway` | integer | `60` | Time window leeway (in seconds) permitted during `exp` and `nbf` timestamp validation. |
 | `require_exp_claim` | boolean | `false` | When `true`, tokens missing an `exp` claim are rejected immediately. |
+
+> [!IMPORTANT]
+> **`issuer` and `audience` are required together with `verify_jwt_claims = true`.**
+> With claims-only inspection (no local signature verification), the `iss`/`aud`
+> binding is the core defense against tokens minted for a different tenant or
+> client. A missing expectation would silently skip the check, so the module
+> rejects the configuration at load time and fails closed if the combination
+> ever reaches the token check. A token whose `iss` or `aud` claim does not
+> match the configured expectation fails the authentication attempt.
 
 ---
 
@@ -56,7 +65,8 @@ require_exp_claim = false
 
 1. **Tenant Pinning (`iss` check):** Ensures logins are restricted strictly to your organization's specific OIDC tenant ID, preventing users from presenting valid tokens issued by foreign or personal tenants.
 2. **Audience Restriction (`aud` check):** Confirms the presented token was explicitly minted for your target resource or application audience.
-3. **Fail-Fast Efficiency:** Immediately rejects expired (`exp`) or premature (`nbf`) tokens locally, eliminating unnecessary TLS socket connections and UserInfo network round-trips.
+3. **Subject Consistency (`sub` cross-check):** When local inspection is enabled and the access token carries a `sub` claim, it must match the `sub` returned by the provider's UserInfo endpoint — a token-substitution defense on multi-audience IdPs. A missing `sub` on either side is skipped (logged); a present-but-mismatched or malformed `sub` fails the authentication attempt.
+4. **Fail-Fast Efficiency:** Immediately rejects expired (`exp`) or premature (`nbf`) tokens locally, eliminating unnecessary TLS socket connections and UserInfo network round-trips.
 
 ---
 
@@ -109,6 +119,9 @@ If local JWT validation fails:
    sudo journalctl -f -u sshd | grep pam_oidc_device
    ```
 3. Common mismatch log messages and fixes:
+   * **`verify_jwt_claims = true requires both issuer and audience to be configured`** — Add both `issuer` and `audience` to the `[oauth]` section, or disable `verify_jwt_claims`.
+   * **`JWT issuer (iss) check required but no issuer is configured`** / **`JWT audience (aud) check required but no audience is configured`** — Same fix as above (normally caught at load time).
    * **`Token issuer mismatch (expected: '...', received: '...')`** — Copy the `received:` value into your `issuer` setting.
    * **`Token audience mismatch (expected: '...', received: '...')`** — Copy the `received:` value into your `audience` setting.
+   * **`JWT subject does not match UserInfo subject ... (token substitution suspected)`** — The access token's `sub` claim differs from the `sub` the provider's UserInfo endpoint returned for the same Bearer token. If this is unexpected, contact your identity provider administrator; do not disable the check to work around it.
    * **`Invalid token structure: missing header/payload delimiter`** — The IdP returned an opaque access token instead of a 3-part JWT. Set `verify_jwt_claims = false`.

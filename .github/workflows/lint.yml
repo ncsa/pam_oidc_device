@@ -55,9 +55,16 @@ jobs:
 
       - name: Run cppcheck
         run: |
-          cppcheck --enable=all \
+          # Not --enable=all: newer cppcheck emits information-level diagnostics
+          # (checkersReport, normalCheckLevelMaxBranches) that --error-exitcode=1
+          # would treat as hard failures. error-severity checks are always enabled.
+          cppcheck --enable=warning \
+                   --enable=style \
+                   --enable=performance \
+                   --enable=portability \
                    --suppress=missingIncludeSystem \
                    --suppress=unusedFunction \
+                   --suppress=staticFunction \
                    --suppress=constParameterCallback \
                    --error-exitcode=1 \
                    --std=c99 \
@@ -77,7 +84,7 @@ jobs:
       - name: Run Flawfinder security audit
         run: flawfinder --minlevel=3 --error-level=3 src/ include/
 
-  # Memory-management inspection (AGENTS.md §4.1): scripts/
+  # Memory-management inspection (`.agents/context.md` §4.1): scripts/
   # check-memory-scrubbing.sh verifies that sensitive buffers (OAuth tokens,
   # PKCE verifier/challenge, client secret, form POST fields, HTTP response
   # bodies, provider-parsed JSON trees) are zeroed with an anti-dead-code-

@@ -294,7 +294,13 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         }
     }
 
-    /* Step 5: Verify Issuer Claim (iss) */
+    /* Step 5: Verify Issuer Claim (iss).
+     *
+     * With claims-only inspection (no local signature verification), the issuer
+     * binding is the core defense against tokens minted for a different tenant or
+     * client, so when verify_jwt_claims is enabled an unconfigured issuer fails
+     * closed. load_config() rejects that combination up front; this branch also
+     * covers direct callers of this public API. */
     if (strlen(cfg->issuer) > 0) {
         struct json_object *j_iss = NULL;
         if (!json_object_object_get_ex(payload_json, "iss", &j_iss) || !json_object_is_type(j_iss, json_type_string) ||
@@ -306,6 +312,12 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
             json_object_put(payload_json);
             return -1;
         }
+    } else if (cfg->verify_jwt_claims) {
+        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "JWT issuer (iss) check required but no issuer is configured");
+        secure_zero_json_tree(payload_json);
+        json_object_put(payload_json);
+        return -1;
     }
 
     /* Step 6: Verify Audience Claim (aud) */
@@ -359,10 +371,114 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
             json_object_put(payload_json);
             return -1;
         }
+    } else if (cfg->verify_jwt_claims) {
+        /* Fail closed on an unconfigured audience when verify_jwt_claims is
+         * enabled, for the same reason as the issuer check above (see the
+         * Step 5 note): load_config() rejects the combination up front, and
+         * this branch also covers direct callers of this public API. */
+        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                      "JWT audience (aud) check required but no audience is configured");
+        secure_zero_json_tree(payload_json);
+        json_object_put(payload_json);
+        return -1;
     }
 
     secure_zero_json_tree(payload_json);
     json_object_put(payload_json);
     pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "JWT metadata and claim checks passed successfully");
     return 0;
+}
+
+/**
+ * @brief Extracts a single string claim (e.g. `sub`) from a JWT's payload segment.
+ *
+ * Applies the same strict structural validation as verify_token_metadata()
+ * (three dot-delimited segments, non-empty payload, strict RFC 4648 §5
+ * Base64URL alphabet, JSON object payload) and copies the named claim's string
+ * value into the caller's buffer.
+ *
+ * NOTE: like verify_token_metadata(), this is claims-only inspection; the JWT
+ * signature is NOT verified. It exists for the JWT-`sub` vs UserInfo-`sub`
+ * consistency check and must never be the sole basis for authorization.
+ *
+ * @param[in]  token      Raw JWT string (header.payload.signature).
+ * @param[in]  claim_name Name of the payload claim to extract.
+ * @param[out] out        Buffer receiving the NUL-terminated claim value.
+ * @param[in]  out_len    Capacity of @p out in bytes.
+ * @return 0 when the claim was found and copied; 1 when the claim is absent
+ *         from the payload; -1 on NULL/empty arguments, malformed JWT
+ *         structure, non-object payload, a non-string claim, or an output
+ *         buffer too small for the value.
+ */
+int jwt_extract_claim_string(const char *token, const char *claim_name, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    if (!token || !claim_name || *claim_name == '\0') {
+        return -1;
+    }
+
+    /* Step 1: Confirm standard 3-part JWT structure (header.payload.signature). */
+    const char *dot1 = strchr(token, '.');
+    if (!dot1) {
+        return -1;
+    }
+    const char *dot2 = strchr(dot1 + 1, '.');
+    if (!dot2 || strchr(dot2 + 1, '.') != NULL) {
+        return -1;
+    }
+
+    /* Step 2: Extract and Base64URL decode the payload segment. */
+    size_t payload_b64_len = (size_t)(dot2 - (dot1 + 1));
+    if (payload_b64_len == 0) {
+        return -1;
+    }
+
+    char *payload_b64 = calloc(1, payload_b64_len + 1);
+    if (!payload_b64) {
+        return -1;
+    }
+    memcpy(payload_b64, dot1 + 1, payload_b64_len);
+
+    size_t decoded_len = 0;
+    char *payload_json_str = base64url_decode(payload_b64, &decoded_len);
+    secure_memzero(payload_b64, payload_b64_len);
+    free(payload_b64);
+    if (!payload_json_str) {
+        return -1;
+    }
+
+    struct json_object *payload_json = json_tokener_parse(payload_json_str);
+    secure_memzero(payload_json_str, decoded_len);
+    free(payload_json_str);
+    if (!payload_json || !json_object_is_type(payload_json, json_type_object)) {
+        if (payload_json) {
+            secure_zero_json_tree(payload_json);
+            json_object_put(payload_json);
+        }
+        return -1;
+    }
+
+    /* Step 3: Copy the named claim when present as a JSON string. */
+    int rc = 1;
+    struct json_object *j_claim = NULL;
+    if (json_object_object_get_ex(payload_json, claim_name, &j_claim)) {
+        if (!j_claim || !json_object_is_type(j_claim, json_type_string)) {
+            rc = -1;
+        } else {
+            const char *val = json_object_get_string(j_claim);
+            size_t val_len = strlen(val);
+            if (val_len + 1 > out_len) {
+                rc = -1;
+            } else {
+                memcpy(out, val, val_len + 1);
+                rc = 0;
+            }
+        }
+    }
+
+    secure_zero_json_tree(payload_json);
+    json_object_put(payload_json);
+    return rc;
 }

@@ -25,12 +25,14 @@
 
 ## Standing Invariants (curated, always-true)
 
-- **Release version sources & the `AGENTS.md` symlink.** The canonical module version lives in
+- **Release version sources & the agent-docs layout.** The canonical module version lives in
   `include/metadata.h` (`PAM_OIDC_VERSION`, which also feeds the User-Agent string). A release bump
   must keep it consistent with `Makefile` (`VERSION ?=`), `packaging/pam_oidc_device.spec`
   (`%global mod_version`), `packaging/gen-changelog.py` (`default_ver`), and `.agents/context.md`.
-  `AGENTS.md` is a *symlink* to `.agents/context.md`, so editing `context.md` updates both — never
-  double-edit. `CHANGELOG.md` historical entries keep their original version strings (do not
+  The root `AGENTS.md` is a thin *real* file (build/test commands + hard boundaries); `CLAUDE.md`,
+  `.github/copilot-instructions.md`, and the `.*rules` files are all *symlinks* to it — edit only
+  the root `AGENTS.md`, never a shim. Deep content lives in `.agents/context.md`.
+  `CHANGELOG.md` historical entries keep their original version strings (do not
   rewrite past releases).
 - **Linux PAM only.** This is a Linux PAM module; `libpam` has no Homebrew/MacPorts/Windows package
   and `include/pam_oidc_device.h` pulls in `<security/pam_*.h>`. A failing *native* macOS build is an
@@ -45,9 +47,9 @@
   `make CC=clang && make test CC=clang` — the `compile-matrix` job) →
   `make test-sanitize CC=clang` (the `sanitize-test` job). `make sanitize` (compile-only) is
   **NOT** a CI gate — no CI job runs it; never report it as a passed gate. CI additionally
-  enforces `make rpm` on EL8/EL9/EL10 (`rpm-build` job in `build.yml`) and the native-distro
-  `distro-build` jobs (`distro-build.yml`: openSUSE Leap 16.0 RPM; Debian 13 + Ubuntu 26.04
-  LTS DEB via `make deb`) on every push/PR to `main`.
+  enforces the native-distro `distro-build` jobs (`distro-build.yml`: `make rpm` on
+  EL8/EL9/EL10 + openSUSE Leap 16.0; `make deb` on Debian 13 + Ubuntu 26.04 LTS) on
+  every push/PR to `main`.
   `build.yml` also enforces the `e2e-sandbox` job: `tests/e2e/run_e2e.sh` drives the
   **installed** module through a real PAM stack (`/etc/pam.d/e2e`) against the in-repo HTTPS
   mock OIDC provider (`tests/e2e/mock_oidc.py`, PKCE S256 enforced) — run it locally with
@@ -188,6 +190,188 @@
   `Depends:` line, and captures stderr to a mktemp file that is printed on failure.
 
 ## Interaction Log (newest first)
+
+### 2026-11-15 — Docs audit: polling-timing contradiction fixed repo-wide (README + getting-started)
+
+- **Task:** User-driven review of `README.md` (polling-timing contradiction, dangling `If`
+  clause, typos, line-wrap style) followed by a repo-wide sweep for the same
+  polling-timing misrepresentation in other docs.
+- **Decisions & Rationale:** Verified against `src/pam_module.c` Steps 4/4c/5: the module
+  displays the sign-in prompt (Steps 4/4b), blocks on the mandatory `PAM_PROMPT_ECHO_ON`
+  "Press [Enter] to begin..." (Step 4c), and only then polls — first poll immediate, no
+  leading sleep. Docs corrected to that behavior:
+  - `README.md`: "Standard RFC 8628 Flow" bullet no longer claims polling starts *before*
+    Enter; the Enter step + OpenSSH `PAM_TEXT_INFO` flush rationale moved into "How It
+    Works" step 2; two mini-paragraph bullets tightened; hard-wrapped sections unwrapped
+    to the file's unwrapped majority style; Step-4 `required`-vs-`sufficient` warning
+    rewritten with a main clause; sample config gained a commented `client_secret`.
+  - `docs/getting-started.md` §4 NOTE: "pressing Enter does not start polling (that has
+    already begun)" was the same wrong-side claim — rewritten: polling begins *after*
+    Enter (first poll immediate); the true statement that the provider `expires_in`
+    clock runs from device-code issuance (before Enter) is kept. Also fixed the
+    misquoted prompt text ("Press ENTER to continue" → "Press [Enter] to begin...").
+  - `docs/testing.md` §3.2: added the Enter pause to the flow summary.
+- **Gotchas & Lessons:** The earlier note in this file ("polls immediately by default,
+  best-effort Enter flush only when `require_keypress = true`") is **SUPERSEDED** — since
+  v0.2.0 the confirmation is mandatory (CHANGELOG [0.2.0]) and polling begins only after
+  Enter. `CHANGELOG.md` [0.1.0] "first poll immediate after prompt shown" is historical
+  and was intentionally left as-is (standing invariant: never rewrite past releases); the
+  [0.2.0] entry already supersedes it. `docs/threat-model.md`, `examples/README.md`,
+  `SECURITY.md`, `CONTRIBUTING.md`, `.agents/context.md` checked clean — no
+  when-polling-starts claims.
+- **Verification:** Markdown-only changes (no build impact). Grep-verified: no residual
+  "even before you press Enter" / "that has already begun" / "Press ENTER to continue"
+  claims; README wrapping uniform; QR-fallback note appears exactly once. No code
+  touched, so the Linux gates/CI status of the tree is unchanged.
+- **Follow-ups / Open Items:** None.
+
+
+### 2026-11-15 — Lower-level review findings (I-1…Q-2/T-2/B-1): dispositions recorded, no code change
+- **Task:** Address the Info/Nit findings from the follow-up review: I-1 (claims-only local JWT),
+  I-2 (unscrubbed `doc` release in `discovery_probe_pkce`), I-3 (`expires_in` fallback), Q-2
+  (`discovery_probe_pkce` in the public header), T-2 (L-1-class gaps invisible to lint + sanitizers),
+  B-1 (in-tree `.o` files).
+- **Decisions & Rationale:** I-1/I-2/I-3 confirmed as documented-by-design / allowlisted
+  (`JSON_PII_ALLOWLIST='doc'`, `check-memory-scrubbing.sh:117`) / defensive-with-clamp — accepted
+  as-is, no change. B-1: objects are git-ignored; keep `make clean` habitual before packaging/audit.
+  T-2's regex mitigation was already landed in the P2 S3 extension (verified: negative/positive
+  self-tests + full ubuntu:24.04 gate green); the remaining mitigation — a standing code-review
+  checklist item — was added to `.agents/context.md` §10.1 item 1 (enumerate every
+  `free()`/`json_object_put()` release site and manually confirm the paired scrub; note the gate's
+  bare-identifier/`*`/`&`-only scope). Q-2 is the only item with a real decision: `discovery_probe_pkce`
+  is a genuine cross-TU internal helper (defined `src/http.c:208`, called from production
+  `src/pam_module.c:1003` and by the test suite via the public header), not merely a testability export;
+  moving it out of `include/pam_oidc_device.h` is an "ask first" boundary — deferred to user decision.
+- **Gotchas & Lessons:** A "testability export" finding may understate the coupling — always grep
+  for production call sites before treating a non-static symbol as test-only.
+- **Verification:** docs-only delta; no build/test impact.
+- **Follow-ups / Open Items:** None — Q-2 resolved by user decision: keep the declaration in the
+  public header (consistent with the single-public-header pattern for all shared internal helpers;
+  finding rated "awareness only").
+
+### 2026-11-15 — Review remediation: L-1/L-2 scrub + S3 gate extension, T-1 backoff unit tests, Q-1 no-local-teardown markers
+- **Task:** Implement the comprehensive-review recommendations (P2 L-1/L-2, P3 D-1/T-1/Q-1).
+- **Decisions & Rationale:**
+  - Both `poll_for_access_token()` re-parse sites now run `secure_zero_json_tree(*tok_json)`
+    before `json_object_put(*tok_json)` (the prior tree is provably a 4xx
+    `authorization_pending`/`slow_down` error tree — a 2xx always exits the loop — but
+    scrub-before-release now holds on every release path), with a comment at each site making
+    the (non-sensitive) nature of the prior tree auditable (D-1).
+  - `scripts/check-memory-scrubbing.sh` S3 handle regex extended to
+    `json_object_put\([*&]?handle\)` so pointer/dereference forms are gated; documented in the
+    script header + known-limitations (out of scope: array indexing / temporaries).
+  - Poll-interval backoff math extracted into exported helpers `poll_interval_after_slow_down()`
+    / `poll_interval_after_transient()` (both call sites in the poll loop — HTTP 429/5xx AND
+    transient cURL errors use the doubling helper). Prototypes live **only in
+    `tests/test_suite.c`** (test-only externs, deliberately NOT added to
+    `include/pam_oidc_device.h` to leave the public header untouched — the "ask first"
+    boundary). New CMocka cases: `is_retryable_token_http_status()` matrix + backoff
+    +5/double/clamp-at-120 math.
+  - Q-1: doc blocks of `request_device_authorization()` / `poll_for_access_token()` now carry an
+    explicit "NO local teardown — do not introduce function-local allocations" marker.
+- **Gotchas & Lessons:** the poll loop has TWO doubling sites (HTTP 429/5xx branch and the
+  transient-cURL-error branch), not one — grep before assuming; multi-line editor anchors in
+  this file must match 16-space loop indentation exactly.
+- **Verification:** `make check-scrub` clean locally (plus a negative/positive
+  self-test of the new S3 dereference handling); ubuntu:24.04 container
+  (§3.3 recipe): gcc + clang builds zero-warning, CMocka suite green
+  (57 cases incl. the 2 new ones, run under gcc, clang, and ASan/UBSan/LSan),
+  clang-tidy gate clean — all `GATES_ALL_GREEN`.
+- **Follow-ups / Open Items:** none.
+
+### 2026-11-15 — Restructured AI-agent docs: thin root `AGENTS.md` + canonical `.agents/` layout
+- **Task:** Reorganize the AI-coding-agent instruction files to match the emerging cross-tool
+  `AGENTS.md` standard: a thin, canonical root `AGENTS.md` (commands + hard boundaries up top)
+  with thin symlinks for every tool, and deeper content under `.agents/`.
+- **Decisions & Rationale:**
+  - Root `AGENTS.md` was a *symlink* to the 651-line `.agents/context.md`; it is now a **real,
+    thin (~150-line) file** leading with copy-paste build/verify commands and three-tier
+    boundaries (Always / Ask first / Never). Deep architecture, protocol gotchas, reference, and
+    audit-pass prompts stay in `.agents/context.md` (its § numbering is preserved so the `§X`
+    references scattered across the repo remain valid).
+  - Every tool entry point is now a **symlink** to the thin root `AGENTS.md` (more reliable than
+    `@import` shims — the content is literally present at each path): `CLAUDE.md`, `.clinerules`,
+    `.cursorrules`, `.roorules`, `.windsurfrules`, and `.github/copilot-instructions.md` (the
+    latter was previously a 34 KB full *duplicate* of the doc — now a symlink, removing a
+    maintenance trap).
+  - Added `.agents/plans/` (feature plans / cross-tool handoffs) and `.agents/skills/`
+    (agentskills.io-standard reusable workflows), each with a README.
+  - Repointed the stale `AGENTS.md §X` external references (in `Makefile`, `CONTRIBUTING.md`,
+    `docs/developer/review.md`, `scripts/check-memory-scrubbing.sh`, `.github/workflows/lint.yml`)
+    to `.agents/context.md §X`.
+  - Added `.agents/memory.local.md` to `.gitignore` (personal LLM scratchpad companion to
+    `memory.md`).
+- **Gotchas & Lessons:**
+  - `AGENTS.md`'s `.gitattributes` already marks it `linguist-vendored` + `export-ignore`, so the
+    new real file inherits the correct packaging/exclusion behavior — no `.gitattributes` change
+    needed.
+  - The `context.md` header previously claimed *it* was `AGENTS.md` and the symlink target;
+    reworded so it self-describes as the deep companion the shims point readers to.
+- **Verification:** All edits verified by re-grep — no stray `AGENTS.md §X` references remain in
+  code/scripts/CI; `readlink` confirms every tool shim resolves to the root `AGENTS.md` (and
+  `ai-instructions/*` to the `.agents/` docs). Docs- and config-only change: no C code touched, so
+  the build/test/lint/sanitizer gates are unaffected. Still need to push + confirm in CI
+  (docs-only; expect no job changes).
+- **Follow-ups / Open Items:**
+  - `.agents/skills/` now populated with 8 skills: `security-audit`, `protocol-compliance-audit`,
+    `build-packaging-audit`, `code-quality-audit` (ported from `context.md` §10.1–10.4),
+    `release-bump`, `sanitizer-audit`, `add-c-module`, and `run-e2e`.
+  - If the repo grows, add nested `AGENTS.md` files under `src/`/`tests/` that *add* constraints
+    (never contradict root).
+
+### 2026-11-14 — Landed review fixes M1 + L1–L3 + I1–I3 (v0.3.1 tree, uncommitted)
+- **Task:** Implement all seven findings from the 2026-11-14 comprehensive review — M1 (iss/aud silently skipped), L1 (provider-interval hard-fail), L2 (no JWT-`sub` vs UserInfo-`sub` check), L3 (unscrubbed `prompt_buf`), I1–I3 (informational) — code + tests + docs, then run the complete §3 gate matrix including the six-distro `distro-build` legs.
+- **Decisions & Rationale:** **M1** — `parse_config_file()` (config.c) now *rejects* `verify_jwt_claims=true` with empty `issuer`/`audience` at load time (error log + `secure_memzero(cfg)` + `-1`), stronger than the review's "load-time warning": silently skipping iss/aud leaves claims-only inspection bound solely to "userinfo accepts this token". **L1** — provider `interval > MAX_SUPPORTED_POLL_INTERVAL` (120 s) now *clamps* with a warning instead of hard-failing (RFC 8628 §3.5 only forbids polling *faster*). **L2** — new `jwt_extract_claim_string()` (jwt.c, declared in the public header): same strict 3-segment / RFC 4648 §5 / object-payload validation as `verify_token_metadata()`, claims-only; `pam_sm_authenticate` extracts the access token's `sub` into stack `jwt_sub[JWT_SUB_CLAIM_MAX=256]` (local #define in pam_module.c) and compares with the UserInfo `sub`: missing `sub` on either side is skipped with a log (providers differ), present-but-mismatched or malformed fails closed (`PAM_AUTH_ERR`, "token substitution suspected"). **L3** — `prompt_buf` and `jwt_sub` scrubbed via `secure_memzero` on all exit paths; `scripts/check-memory-scrubbing.sh` `S2_ANCHORS` extended with `prompt_buf jwt_sub`. **I1** — pkce.c comment documents the 48-byte verifier draw as modulo-bias-free by construction (multiple of 3 → exact 6-bit Base64URL groups, full 384-bit entropy, no rejection sampling). **I2** — default `max_poll_seconds` 300 → 120 (PAM-safe ceiling) in `load_config()` + sample config with rationale. **I3** — VERBOSE full-UserInfo payload logging documented as by-design (docs/jwt-validation.md).
+- **Gotchas & Lessons:** (1) cppcheck cannot model the `json_object_object_foreachC` macro loop — a `counter < N` comparison seeded to 0 is flagged "always false" (it folds the incremented counter to 0); fix by *decrementing* an opaque budget (`names_left`, seeded from `json_object_object_length()` with a range check, cap 32) instead of incrementing a counter. (2) `json_object_object_length()` returns `int` on EL8/EL9 json-c (0.13/0.14) but `size_t` on newer — seed via `const long claims_raw = (long)json_object_object_length(uinfo_json);` + explicit range check: exempt from `-Wconversion` *and* keeps the value opaque to cppcheck. (3) The EL8/EL9 distro gates are the only gates that catch (2) — the ubuntu:24.04 suite does not; any change touching json-c API usage needs the six-distro run. (4) clang-tidy required renaming the new `jwt_extract_claim_string` param `jwt_str` → `token` (header + source in lockstep); the pre-existing `jwt_str` in `verify_token_metadata` was never flagged. (5) First distro run failed EL8/EL9 on `-Wconversion` from (2) — fix → re-run the ubuntu:24.04 gate suite *and* sandbox before relaunching the distro matrix.
+- **Verification:** ALL LOCAL, in Linux containers (macOS host), all green: ubuntu:24.04 suite — `make lint` (clang-format/clang-tidy/cppcheck/flawfinder/check-scrub), `make CC=gcc && make test CC=gcc`, `make CC=clang && make test CC=clang`, `make test-sanitize CC=clang`, `make check-licenses` → ALL_GATES_PASSED (re-run green after the final cast fix; `.gates.log` removed on success); `make -s sandbox` → SANDBOX_PASSED; six-distro matrix via a `distro-build.yml`-mirroring harness (`EXTRA_CFLAGS=-Werror` build + CMocka + rpm/deb build + package install + on-disk verification of `/lib64/security/pam_oidc_device.so` + `/etc/pam_oidc_device.conf`): **EL8 PASS, EL9 PASS, EL10 PASS, SUSE16 PASS, DEB13 PASS, UBU2604 PASS**. Nothing left for CI to prove beyond re-confirmation on push.
+- **Follow-ups / Open Items:** Commit the 14-file working tree (src/{config,jwt,pam_module,pkce}.c, include/pam_oidc_device.h, tests/test_suite.c, scripts/check-memory-scrubbing.sh, config/pam_oidc_device.conf, CHANGELOG.md, README.md, docs/getting-started.md, docs/jwt-validation.md, docs/testing.md, .agents/memory.md); CI re-validates on push.
+
+### 2026-11-14 — Comprehensive full-repo code review pass (read-only, v0.3.1 @ 597f618)
+- **Task:** Deliver the comprehensive code-review report covering all of `src/`, `include/`, and the `Makefile` with file:line findings. Read-only — no code changes requested or made.
+- **Decisions & Rationale (findings of record):** 1 **Medium** — `iss`/`aud` checks silently skipped when `issuer`/`audience` are unset (jwt.c:298, 312): with claims-only JWT inspection the default config binds identity solely to "IdP userinfo accepts this Bearer token", a real risk on multi-audience IdPs (token minted for another client); recommend a load-time warning when `verify_jwt_claims=true` and either is empty. 3 **Low** — provider `interval > MAX_SUPPORTED_POLL_INTERVAL` (120 s) hard-fails instead of clamping (RFC 8628 §3.5 only forbids polling *faster*; pam_module.c:503-509); no JWT-`sub` vs UserInfo-claim consistency check (pam_module.c:1090-1097); stack `prompt_buf` (holds user_code + URIs) not scrubbed at exit while every comparable buffer is (pam_module.c:979, cleanup 1122-1174). 3 **Info** — PKCE verifier `%66` mapping has modulo bias (immaterial at 64 chars, ≥387 bits); default `max_poll_seconds=300` exceeds AGENTS §5.3.4's own 60–120 s guidance; VERBOSE logs the full UserInfo payload by design (pam_module.c:1087-1088).
+- **Gotchas & Lessons:** Verified NOT findings: `aud_cfg_copy[256]` cannot truncate (`cfg->audience` is `char[256]`, header line 190 — the jwt.c:318 failure branch is unreachable defensive code); CI *does* mechanically enforce `-Werror` (`EXTRA_CFLAGS=-Werror` in compile-matrix + sanitizer jobs, CHANGELOG "Mechanically enforced zero-warning bar"); redirects are disabled (`CURLOPT_FOLLOWLOCATION 0L`, http.c:401). `case_sensitive` defaults to 1 (exact match) and `allow_root` to 0 (deny) — both correct; do not "fix". The prompt is a *stack* buffer, so the scrub gate's free()-based lexical check cannot cover it.
+- **Verification:** LOCAL (macOS): `make check-scrub`, `make check-licenses`, and `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` (exact CI scope) all green; working tree clean at 597f618 (v0.3.1). No code changed → Linux gates/CI unaffected.
+- **Follow-ups / Open Items:** if any of M1/L1–L3 are adopted, they require the full §3.1 Linux gate loop (make lint, gcc+clang matrix, test-sanitize, sandbox, distro builds).
+
+### 2026-11-12 — EL8/EL9 `make EXTRA_CFLAGS=-Werror` build fixes: `JSON_ARRAY_IDX` → `size_t`, qrcodegen per-TU flags, cppcheck `--enable` scope
+- **Task:** Three CI jobs red: `Distro / EL8`, `Distro / EL9` (both failed in `make EXTRA_CFLAGS=-Werror` AND `make rpm`), and `Lint / cppcheck`. Root-caused each; applied minimal correct fixes. (Distinct from the earlier same-day 739d094 commit, which fixed `.clang-tidy`/`src/qr.c`/spec + the cppcheck `staticFunction` suppress.)
+- **Decisions & Rationale:**
+  - **`JSON_ARRAY_IDX` sign-conversion (EL8/EL9 `make -Werror`):** failed first at `src/http.c:184`. The header's version-conditional shim (`#if ... JSON_C_MINOR_VERSION >= 17 ... (i) #else ((int)(i)) #endif`) was wrong: it narrowed the index to `int` on pre-0.17, but json-c's `json_object_array_get_idx()` takes a `size_t` index on **every** supported release. Probed the real installed headers via Docker: EL8 json-c **0.13.1** → `size_t idx`, EL9 0.14 → `size_t`, Ubuntu 24.04/26.04 0.17/0.18 → `size_t`, EL10 0.18 → `size_t`. (The old `JSON_C_MAJOR_VERSION > 0 || MINOR >= 17` gate is also effectively dead on `0.x`.) Replaced the shim with a single `#define JSON_ARRAY_IDX(i) ((size_t)(i))` in `include/pam_oidc_device.h` — a no-op at all 4 call sites (each already `for (size_t i = ...)`) and correct on all platforms.
+  - **qrcodegen `-Wconversion` under `-Werror` on EL8 GCC 8 (the *next* failure after the header fix):** `third_party/qrcodegen/qrcodegen.c:784` (`int ret` → `uint8_t` write in `setModuleBounded`) trips `-Wconversion`. Vendored code is SHA256-pinned by `scripts/check_qrcodegen_upstream.sh` (drift audit), so it must stay pristine. Fixed in `Makefile`: the `third_party/qrcodegen/%.o` rule now uses a dedicated `QR_CFLAGS = -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -fPIE -O2 -g` (hardening + basic warnings, but NOT `-Wconversion`/`-Wpedantic`/`-Wshadow`/`-Wformat=2`/`-Werror`/`$(EXTRA_CFLAGS)`). Project `src/*.c`/`include/*.h` unchanged and still held to the full strict bar.
+  - **cppcheck `--enable=all` → 4 defect severities:** newer cppcheck (2.13) emits **information-level** report lines (`checkersReport`, `normalCheckLevelMaxBranches`) that `--error-exitcode=1` treats as hard failures (exit 1 despite "0 errors"). Changed all 5 `--enable=all` sites (`.github/workflows/lint.yml`; `scripts/lint.sh` note + invocation; `.agents/context.md` §3.1) to `--enable=warning --enable=style --enable=performance --enable=portability`. `error` severity is always checked regardless; only `information`/`debug` drop out.
+- **Gotchas & Lessons:**
+  - `-Werror` distro builds surface **sequential** failures — fix one, rebuild, find the next (EL8: `JSON_ARRAY_IDX` → then qrcodegen.c:784). Don't stop at the first.
+  - "cppcheck reports 0 errors but exits 1" = information/debug report lines tripping `--error-exitcode=1`; scope `--enable`, don't disable the check.
+  - When a json-c API's param type is version-sensitive, **probe the installed header** (`grep` the `json_object.h` after `dnf/rpm` install) rather than trusting a remembered version boundary — the old "int before 0.17" assumption was simply wrong.
+  - Vendored code is drift-pinned: work *around* it (per-TU flags), never edit the file.
+- **Verification (all in CI-mirror Docker containers; native macOS build is an environment limitation, §3.3):**
+  - `make check-scrub` → OK (also ran natively on macOS).
+  - **EL8** (`rockylinux:8`, GCC 8, json-c 0.13.1): `make EXTRA_CFLAGS=-Werror` BUILD_EXIT=0; `make test EXTRA_CFLAGS=-Werror` 52/52 PASSED TEST_EXIT=0; `make rpm` → `pam_oidc_device-0.3.0-1.el8.aarch64.rpm` RPM_EXIT=0; docker-exit=0.
+  - **EL9** (`rockylinux:9`, GCC 11, json-c 0.14): same three steps exit 0, 52/52 PASSED, `.el9` RPM built.
+  - **Full `make lint`** in `ubuntu:24.04` (clang 18.1.3, cppcheck 2.13): clang-format `--dry-run --Werror` clean; clang-tidy `Suppressed 53327 (53326 non-user, 1 NOLINT)` = 0 user-code diagnostics; cppcheck (new flags) 7/7 clean exit 0; flawfinder level-3+ = 0; scrub OK; `LINT_GATE_EXIT=0`.
+  - Not yet run locally: `compile-matrix` clang leg + `test-sanitize CC=clang` on ubuntu (header/Makefile changes are C-standard, clang-tidy-verified, and gcc-proven on EL8/EL9). CI confirms.
+- **Follow-ups / Open Items:** Commit (`include/pam_oidc_device.h`, `Makefile`, `.github/workflows/lint.yml`, `scripts/lint.sh`, `.agents/context.md` + this memory entry) and push to `wglick/more_improvements`; confirm `Distro / EL8`, `Distro / EL9`, and `Lint / cppcheck` turn green, and that `compile-matrix` (clang) + `sanitize-test` stay green.
+
+### 2026-11-12 — Unblocked CI after EL consolidation: `_FORTIFY_SOURCE` 3→2, cppcheck `staticFunction`, clang-tidy pins
+- **Task:** After the `distro-build` consolidation commit (64f7c08), several CI jobs went red: `Static Analysis (clang-tidy)`, `Static Analysis (cppcheck)`, and `EL8/EL9: Rocky Linux (RPM)`. Needed to separate failures caused by that commit from latent toolchain drift, and restore green.
+- **Decisions & Rationale:** Root-caused and applied the minimal correct fix for each. (1) **EL8/9/10 build — genuinely caused by the consolidation:** the new distro-build step builds with `make EXTRA_CFLAGS=-Werror`, but the old `rpm-build` job only ran `make rpm` (bare, no `-Werror`). glibc on EL8/EL9 (2.28/2.34) does not support `_FORTIFY_SOURCE=3` and emits `#warning _FORTIFY_SOURCE > 2 is treated like 2`, which `-Werror` makes fatal. Fixed at the source: `Makefile` `-D_FORTIFY_SOURCE=3` → `=2` (maximum universally-supported level and the flag §10.3 already documents; warning-free on every distro), plus the matching comment in `packaging/pam_oidc_device.spec`. (2) **cppcheck `staticFunction` — toolchain-version drift:** newer cppcheck on `ubuntu-latest` now reports 5 functions (`parse_config_file`, `discovery_json_advertises_s256`, `render_prompt_message`, `qr_encode_uri`, `qr_render_matrix`) as "should be static". All are declared in `include/pam_oidc_device.h` and called by `tests/test_suite.c`, so they CANNOT be `static` (would break the header decl + test link). Added `--suppress=staticFunction` to all 3 cppcheck mirrors (`.github/workflows/lint.yml`, `scripts/lint.sh`, `.agents/context.md` §3.1 step 4) — same heuristic family as the already-suppressed `unusedFunction`. (3) **clang-tidy — all 4 errors on code untouched by recent commits, so also a runner clang-tidy version bump:** `readability-math-missing-parentheses` on `QR_MAX_SIZE` (fixed the code — parenthesized `((QR_MAX_VERSION * 4) + 17)` in both `QR_MAX_SIZE`/`QR_LINE_BUF_MAX`, semantics unchanged: 97/874); `readability-function-size` on the large `http_request` orchestrator and `clang-analyzer-security.ArrayBound` ×2 (false positives on the canonical `isspace((unsigned char)x)` in `trim_whitespace` and on `calloc(n+1)` NUL-termination in `base64url_decode` — both provably in bounds) are disabled in `.clang-tidy` with an explanatory comment, consistent with the existing `-readability-*` / `-clang-analyzer-security.insecureAPI.*` disable list.
+- **Gotchas & Lessons:** The clang-tidy + cppcheck reds were NOT caused by the recent C/CI changes — the flagged lines (config.c:193, http.c:285, jwt.c:127, qr.c:166) predate them. Treat "CI suddenly red on unchanged code" as runner toolchain drift, not a regression in your diff. `clang-analyzer-security.ArrayBound` is a genuine false-positive source on glibc `ctype` (128-entry `__ctype_b` model) and on `calloc`; `readability-function-size` is a subjective style metric. Disabling a specific FP-prone/subjective check (or adding a `--suppress=` for a heuristic that cannot see header-declared/test-used functions) is the honest fix — do NOT rewrite correct, safe code to appease a buggy analyzer.
+- **Verification status:** LOCAL + LINUX-CONTAINER (ubuntu:24.04 via Docker) — (a) all 4 touched YAML files re-parse (PyYAML); (b) `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` clean; (c) `make check-scrub` and `make check-licenses` green; (d) qr.c macro values verified unchanged (97/874); (e) **full CI-mirror gate run in `ubuntu:24.04` Docker: `clang-tidy src/*.c -- -Iinclude -D_GNU_SOURCE` (clang-tidy 18.1.3) → 0 user-code errors; `cppcheck` (2.13.0) → exit 0 (`Unmatched suppression: staticFunction` info-level only — the 5 CI findings did not reproduce because 2.13.0 is older than the CI runner's cppcheck); `make EXTRA_CFLAGS=-Werror` + `make test` under gcc AND clang → 52/52 tests pass both; `make test-sanitize CC=clang` (ASan+UBSan+LSan) → clean. So the 4 clang-tidy errors are DEFINITIVELY fixed.** STILL REQUIRED (CI only): `make EXTRA_CFLAGS=-Werror` on **EL8/EL9/EL10** (the Ubuntu 24.04 gate uses glibc 2.39 which silently honors `_FORTIFY_SOURCE=3`, so it does not exercise the EL8/9 glibc-2.28/2.34 path that triggered the regression — `=2` sidesteps it but only CI can confirm); the cppcheck `staticFunction` suppression against the CI runner's newer cppcheck; `distro-build` EL8/EL9/EL10 legs; `e2e-sandbox`; `make rpm` / `make deb`; `license-audit`.
+- **Follow-ups / Open Items:** Confirm the `clang-tidy` + `cppcheck` jobs and the six `distro-build` legs all turn green on the next push/PR. If a future clang-tidy/cppcheck bump surfaces NEW checks on unchanged code, apply the same pattern (code fix for style; targeted disable/suppress for false positives) rather than widening the gates.
+
+### 2026-11-12 — Consolidated all native-distro package builds into `distro-build.yml`
+- **Task:** EL8/EL9/EL10 RPM builds lived in the `rpm-build` job of `.github/workflows/build.yml` while the SUSE/Debian/Ubuntu builds lived in `.github/workflows/distro-build.yml`. Operator wanted every distro package build co-located in one workflow (the distro-build one).
+- **Decisions & Rationale:** Folded EL8/EL9/EL10 (Rocky Linux, `make rpm`) into the single `distro-build` matrix in `distro-build.yml`, alongside the existing SUSE (RPM) + Debian 13 / Ubuntu 26.04 (DEB) entries. Each entry carries `label`/`image`/`pkg`/`install`/`verify`; the EL `verify` mirrors the SUSE verify shape (`set -euo pipefail`, `find ... | head -1`, `[ -n ]` guard) but installs via `dnf install -y` (not `zypper --no-gpg-checks`). `dnf config-manager` needs `dnf-utils` (EL8) / `dnf-plugins-core` (EL9+) plus the extra-products repo enabled first: `powertools` on EL8, `crb` on EL9/EL10. Deleted the `rpm-build` job from `build.yml`, which now holds only the non-distro gates (compile-matrix, sanitize-test, qr-scan-audit, e2e-sandbox). Updated every doc that asserted the EL gate lives in `build.yml`: `.agents/context.md` (§3.1 step 10, §3.2, §3.3), this file's Standing Invariants, `docs/packaging.md`, and `CONTRIBUTING.md`. No C or packaging-content change — pure CI reorganization.
+- **Gotchas & Lessons:** (1) Never run a `perl -i -pe` substitution through a shell whose script text contains backticks — bash treats them as command substitution and will actually execute the `make rpm`/`make deb`/`make clean` targets referenced in the docs (that ran in-repo `make clean`/`make rpm`/`make deb`, all gitignored/failed-harmless on macOS, but it is not safe against `/etc`). Use the editor tool, or a quoted `<<'PY'`/`<<'EOF'` heredoc, for anything containing backticks. (2) The `memory.md` bullets use a 2-space continuation indent, not 3 — the editor match failed twice on the wrong indent.
+- **Verification status:** LOCAL (macOS) — both workflow files re-parsed cleanly with PyYAML (`build.yml` jobs = compile-matrix/sanitize-test/qr-scan-audit/e2e-sandbox; `distro-build.yml` jobs = distro-build); all doc cross-references updated. NOT RUN / STILL REQUIRED: the actual EL `make rpm` + install + on-disk checks on EL8/9/10 and the SUSE/Debian/Ubuntu legs via the CI `distro-build` jobs (no rpmbuild/dpkg toolchain locally). No source-code or packaging-content change, so this edit does not by itself require re-running the lint/compile/test/sanitize gates, but CI re-validates everything on push/PR.
+- **Follow-ups / Open Items:** Confirm the six `distro-build` matrix legs (EL8/EL9/EL10, SUSE Leap 16.0, Debian 13, Ubuntu 26.04) turn green on the next push/PR to `main`.
+
+### 2026-11-12 — Expanded `[access]` list fields 256→2048 (fixes "Failed to parse key 'deny_users'")
+- **Task:** Operator hit `pam_oidc_device(sshd:auth): Failed to parse key 'deny_users' at line 28` followed by `error: PAM: Error in service module`. Their `deny_users` value was 574 chars but the fields are `char deny_users[256]`.
+- **Decisions & Rationale:** Root cause: `copy_checked()` in `parse_config_kv` caps a value at `sizeof(cfg->deny_users)` = 255, so any list >255 chars fails load → `load_config()` returns `PAM_AUTH_ERR`. Expanded all four `[access]` list fields (`allow_users`/`deny_users`/`allow_groups`/`deny_groups`) to a new `ACCESS_LIST_LEN 2048` macro (`include/pam_oidc_device.h`). CRITICAL lockstep change: `identity.c list_contains()` scratch buffer went `char buf[256]` → `char buf[ACCESS_LIST_LEN]` — otherwise a longer list would parse but fail to match at runtime (fail-open on a *deny* list is worse than the parse error). Also `config.c parse_config_file()` line buffer `MAX_INIT_MSG_LEN+128` (1152) → `ACCESS_LIST_LEN+128` (2176) so a valid ~2 KB list line is not misreported as "Overlong line". Added CMocka regression test `test_parse_config_file_long_access_list` (589-char `deny_users` round-trips into the field) and registered it in the config suite.
+- **Gotchas & Lessons:** The three bounds (struct field, `list_contains` scratch buffer, `fgets` line buffer) are the SAME logical cap and MUST be raised together — the struct field is the one the error message points at, but the scratch buffer is where a silent fail-open lurks. A ~574-char operator deny list ≈ most of `/etc/passwd` service accounts; 255 was too small for production. The 600-char `test_parse_config_file_overlong_line` still passes for a DIFFERENT reason (no `[section]`/`=` → key-before-section reject), not the buffer cap.
+- **Verification status:** LOCAL (macOS) only — `clang-format --dry-run --Werror` clean at the exact CI scope; `make check-scrub` green; an isolated harness (verbatim `list_contains` + the new test's value-generation) compiled AND ran CLEAN under the full strict flags under BOTH clang and gcc, all behavior asserts pass (589-char parse + member match, non-member reject, over-long reject). NOT RUN: `make`/`make test`/clang-tidy/cppcheck/flawfinder/`test-sanitize` (no PAM headers / no docker on this host). STILL REQUIRED: Linux gates / CI (compile-matrix gcc+clang, sanitize, e2e-sandbox, rpm/deb, license-audit).
+- **Follow-ups / Open Items:** Run the Linux container gate (AGENTS.md §3.3) or push for CI before merge. CHANGELOG note added under `[Unreleased]` / `### Fixed`.
 
 ### 2026-11-12 — Regression fix: remove `-pie` from `LDFLAGS` (shared-library link broke on modern binutils)
 - **Task:** The `-pie` addition from the previous entry broke every link:

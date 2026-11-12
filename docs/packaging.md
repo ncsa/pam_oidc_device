@@ -54,14 +54,14 @@ make deb
 sudo dpkg -i build/pam-oidc-device_0.3.0_$(dpkg --print-architecture).deb
 ```
 
-The output `.deb` is generated under `build/` (e.g.
+The output `.deb` is generated under `build/` (e.g.,
 `build/pam-oidc-device_0.3.0_amd64.deb`). The package is named
 `pam-oidc-device` (dash form) because Debian package names may not contain
 underscores; the installed files keep the module name
 (`pam_oidc_device.so`, `/etc/pam_oidc_device.conf`).
 
 > [!NOTE]
-> **CI coverage:** EL8/EL9/EL10 RPM builds run in the `rpm-build` job of
-> `.github/workflows/build.yml`; SUSE (openSUSE Leap 16.0), Debian 13, and
-> Ubuntu 26.04 LTS native builds + package installs run in the `distro-build`
-> jobs of `.github/workflows/distro-build.yml` on every push/PR to `main`.
+> **CI coverage:** EL8/EL9/EL10 (Rocky Linux) + SUSE (openSUSE Leap 16.0) RPM builds
+> and Debian 13 + Ubuntu 26.04 LTS DEB builds all run in the `distro-build` jobs of
+> `.github/workflows/distro-build.yml` (zero-warning build, unit tests, native
+> package build, install, and on-disk layout check) on every push/PR to `main`.

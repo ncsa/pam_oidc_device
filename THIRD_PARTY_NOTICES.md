@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 `pam_oidc_device`'s own code is licensed under the [MIT License](LICENSE), but the module is
-**not self-contained**: it vendors one small permissively-licensed component and links against
+**not self-contained**: it vendors one small permissively licensed component and links against
 a small set of well-known system libraries. This file is the **authoritative record** of every
 third-party component, its license, its provenance, and how license compliance is verified.
 
@@ -36,7 +36,7 @@ detail lives here. Compliance is enforced mechanically — see
   license's redistribution terms are therefore the distribution's responsibility,
   not the module's.
 * **No copyleft code (GPL / LGPL / AGPL) is vendored or linked into the module.** If a future
-  component would change that, the license gate (`scripts/check-licenses.sh`, check L3) fails
+  component changes that, the license gate (`scripts/check-licenses.sh`, check L3) fails
   and the addition requires explicit review.
 
 ---
@@ -70,6 +70,7 @@ detail lives here. Compliance is enforced mechanically — see
 * **Distribution package names:** the runtime/dev package is `pam` / `pam-devel`
   on both Red Hat EL and SUSE (openSUSE Leap / SLES).
 * **Upstream:** https://github.com/linux-pam/linux-pam
+
 ## 3. cURL (`libcurl`) — *runtime*
 
 * **Copyright:** © 1996–present Daniel Stenberg and many contributors.
@@ -129,7 +130,21 @@ pip versions and are not part of the distributed product.
 | Gate | What it verifies | Where |
 | --- | --- | --- |
 | `scripts/check-licenses.sh` (`make check-licenses`) | L1: this file exists at the repo root. L2: every `third_party/*/` component carries license text, an `AUTHORS`/`NOTICE` attribution file, and a `vendor-provenance.txt` pin. L3: no copyleft (GPL/LGPL/AGPL) license text anywhere in `third_party/`. L4: every runtime dependency from **all** `Requires:` lines of the RPM spec (Red Hat EL and SUSE per-distro branches) is declared in this file. | local target; CI job `license-compliance` in `license-audit.yml` |
-| GitHub dependency-graph audit (`scripts/audit-dependency-graph.py`) | Queries GitHub's dependency graph for every manifest/package GitHub has indexed for this repository and fails when any indexed package carries a license outside the permissive allowlist (MIT, ISC, BSD, Apache-2.0, zlib, …); packages not declared in this file are flagged. The job queries the GraphQL dependency graph first; because the `Repository.dependencyGraph` field is feature-gated per account (on accounts without the supply-chain dependency-graph feature the query fails with the schema-level error `Field 'dependencyGraph' doesn't exist on type 'Repository'`), it falls back to the REST `GET /repos/{owner}/{repo}/dependencies` endpoint on that one error; if that endpoint also returns 404 — as it does today (the REST dependency-graph endpoints are feature-gated and the repo is private, so no dependency-graph data exists to serve) — the job records an empty payload and the audit passes with an INFO no-op. When real data does arrive (REST array of packages), the auditor cross-checks package names against this file (REST responses carry no license data). Today this pure-C/Make project has no manifest GitHub recognizes, so the gate passes with an INFO note and **activates automatically** the moment a manifest (e.g. `CMakeLists.txt`, `package.json`, `requirements.txt`) is added. | CI job `dependency-graph-audit` in `license-audit.yml` |
+| GitHub dependency-graph audit (`scripts/audit-dependency-graph.py`) | Queries GitHub's dependency graph for every manifest/package GitHub has indexed for this repository and fails when any indexed package carries a license outside the permissive allowlist (MIT, ISC, BSD, Apache-2.0, zlib, …) or is not declared in this file. Today this pure-C/Make project has no manifest GitHub recognizes, so the gate passes with an INFO note and **activates automatically** the moment a manifest (e.g., `CMakeLists.txt`, `package.json`, `requirements.txt`) is added. | CI job `dependency-graph-audit` in `license-audit.yml` |
+
+> [!NOTE]
+> **Dependency-graph fallback mechanics.** The auditor queries the GraphQL
+> `Repository.dependencyGraph` field first; that field is feature-gated per
+> account, so on accounts without the supply-chain dependency-graph feature the
+> query fails with the schema-level error `Field 'dependencyGraph' doesn't
+> exist on type 'Repository'` and the auditor falls back to the REST
+> `GET /repos/{owner}/{repo}/dependencies` endpoint. If that endpoint also
+> returns 404 — as it does today, because the REST dependency-graph endpoints
+> are feature-gated and this repository is private (no dependency-graph data
+> exists to serve) — the job records an empty payload and the audit passes with
+> an INFO no-op. When real data does arrive (a REST array of packages), the
+> auditor cross-checks package names against this file (REST responses carry no
+> license data).
 | Vendor drift audit | The vendored QR encoder matches its pinned upstream revision (SHA-256 + token-level equivalence), and upstream has not advanced past the pin. | CI job in `vendor-audit.yml` |
 
 This notices file is shipped in the RPM **source** tarball alongside `LICENSE` so that anyone

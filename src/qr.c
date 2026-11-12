@@ -34,10 +34,10 @@
 #include <string.h>
 
 /** Maximum symbol width in modules for QR_MAX_VERSION (21 + 4 * version). */
-#define QR_MAX_SIZE (QR_MAX_VERSION * 4 + 17)
+#define QR_MAX_SIZE ((QR_MAX_VERSION * 4) + 17)
 
 /** Worst-case bytes per rendered line: QR_MAX_SIZE modules * 3 (UTF-8 glyph width) * 3 (max scale). */
-#define QR_LINE_BUF_MAX ((3 * 3 * (QR_MAX_VERSION * 4 + 17)) + 1)
+#define QR_LINE_BUF_MAX ((3 * 3 * ((QR_MAX_VERSION * 4) + 17)) + 1)
 
 /** Instruction line prefixed to the rendered QR block. */
 #define QR_HEADER_LINE "Scan this QR code with your phone's camera to open the verification page:"

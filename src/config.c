@@ -740,7 +740,11 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
     memset(&seen, 0, sizeof(seen));
     config_section_t current_sec = SEC_NONE;
 
-    char line[MAX_INIT_MSG_LEN + 128];
+    /* The read buffer must comfortably hold the longest legal config line. The largest
+     * value is an [access] list field (up to ACCESS_LIST_LEN-1 chars) plus its key and
+     * the '=' separator; size it accordingly so a valid long list is not misreported as
+     * an overlong line. */
+    char line[ACCESS_LIST_LEN + 128];
     int line_num = 0;
     int parse_failed = 0;
 
@@ -867,6 +871,21 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
         return -1;
     }
 
+    /* JWT claim inspection is only meaningful when the expected issuer and audience
+     * are both configured: with claims-only inspection (no local signature
+     * verification), the iss/aud binding is the defense against tokens minted for
+     * a different client or tenant, and verify_token_metadata() fails closed on an
+     * unconfigured check. Reject the combination up front instead of failing every
+     * authentication attempt at token-verification time. */
+    if (cfg->verify_jwt_claims && (strlen(cfg->issuer) == 0 || strlen(cfg->audience) == 0)) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "verify_jwt_claims = true requires both issuer and audience to be configured");
+        }
+        secure_memzero(cfg, sizeof(config_t));
+        return -1;
+    }
+
     /* Load-time PKCE advisories (emitted once per load, not per authentication attempt). */
     if (cfg->use_pkce == 1) {
         if (pamh) {
@@ -914,7 +933,10 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     (void)copy_checked(cfg->claim_field, sizeof(cfg->claim_field), "sub");
     (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
     cfg->claim_capture_group = 1;
-    cfg->max_poll_seconds = 300;
+    /* Default bounded to the PAM-safe 120 s ceiling (SSH LoginGraceTime and
+     * systemd PAM timeouts are typically shorter than RFC 8628 device-code
+     * lifetimes; the operator may still raise it explicitly up to 3600). */
+    cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
     cfg->loglevel = LOGLEVEL_INFO;
     cfg->verify_jwt_claims = 0;

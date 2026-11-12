@@ -44,6 +44,15 @@
 /* clang-format on */
 
 /*
+ * Test-only prototypes: poll_interval_after_slow_down() / poll_interval_after_transient()
+ * are exported from src/pam_module.c solely so this suite can pin the poll-loop backoff
+ * arithmetic; they are intentionally NOT part of the public API in
+ * include/pam_oidc_device.h.
+ */
+int poll_interval_after_slow_down(int interval);
+int poll_interval_after_transient(int interval);
+
+/*
  * Weak overrides of libcurl's transport entry points, used exclusively by the
  * http_request()/discovery_probe_pkce tests. Defining these global symbols in
  * the test executable redirects the calls made by the module code here
@@ -432,6 +441,53 @@ static void test_jwt_mismatch_claims(void **state) {
 }
 
 /**
+ * @brief Unit test verifying the fail-closed iss/aud policy when verify_jwt_claims
+ *        is enabled without a configured issuer or audience.
+ *
+ * With claims-only inspection (no local signature verification), an iss/aud
+ * expectation that is not configured must not be silently skipped while the
+ * feature is enabled — the token binding simply cannot be checked, so it fails
+ * closed. load_config() rejects the combination up front; this covers direct
+ * callers of the public API.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_unconfigured_binding_fail_closed(void **state) {
+    (void)state;
+    config_t cfg;
+
+    /* Payload:
+     * {"iss":"https://sts.windows.net/tenant/","aud":"00000003-0000-0000-c000-000000000000","exp":2524608000}
+     */
+    const char *jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjoyNTI0NjA4MDAwfQ.sig";
+
+    /* verify_jwt_claims enabled without an issuer: fail closed. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.verify_jwt_claims = 1;
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), -1);
+
+    /* Issuer configured but no audience: still fail closed. */
+    strncpy(cfg.issuer, "https://sts.windows.net/tenant/", sizeof(cfg.issuer) - 1);
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), -1);
+
+    /* Both configured: accepted. */
+    strncpy(cfg.audience, "00000003-0000-0000-c000-000000000000", sizeof(cfg.audience) - 1);
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), 0);
+
+    /* Legacy direct-call behavior preserved: with verify_jwt_claims disabled,
+     * unconfigured iss/aud checks are skipped rather than failing. */
+    cfg.verify_jwt_claims = 0;
+    cfg.issuer[0] = '\0';
+    cfg.audience[0] = '\0';
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), 0);
+}
+
+/**
  * @brief Unit test verifying JWT audience array processing.
  *
  * @param[in,out] state CMocka test state context (unused).
@@ -571,6 +627,83 @@ static void test_jwt_base64url_strict_alphabet(void **state) {
 
     /* Legal trailing padding is still accepted (payload decodes to {"sub":"test_user"}). */
     assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0X3VzZXIifQ==.sig", &cfg, NULL), 0);
+}
+
+/**
+ * @brief Unit test verifying jwt_extract_claim_string() claim extraction semantics.
+ *
+ * Covers the found / absent / non-string claim trichotomy, malformed JWT
+ * structure rejection (mirroring verify_token_metadata), argument validation,
+ * and the undersized-output-buffer failure. Fixture payloads (base64url of
+ * JSON, verified with Python):
+ *  - SUB_JWT payload: {"iss":"https://sts.windows.net/tenant/",
+ *    "aud":"00000003-0000-0000-c000-000000000000","sub":"test-subject-123",
+ *    "exp":2524608000}
+ *  - NO_SUB_JWT payload: same without the "sub" member.
+ *  - NON_STR_SUB_JWT payload: {"iss":"https://sts.windows.net/tenant/",
+ *    "sub":12345,"exp":2524608000} (sub is a JSON number).
+ *  - LONG_SUB_JWT payload: {"sub":"<300 x's>","exp":2524608000} (exceeds the
+ *    256-byte output buffer).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_extract_claim_string(void **state) {
+    (void)state;
+    char out[256];
+
+    const char *sub_jwt =
+        "eyJhbGciOiJIUzI1NiJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwic3ViIjoidGVzdC1zdWJqZWN0LTEyMyIsImV4cCI6MjUyNDYwODAwMH0.sig";
+    const char *no_sub_jwt =
+        "eyJhbGciOiJIUzI1NiJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjoyNTI0NjA4MDAwfQ.sig";
+    const char *non_str_sub_jwt =
+        "eyJhbGciOiJIUzI1NiJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwic3ViIjoxMjM0NSwiZXhwIjoyNTI0NjA4MDAwfQ.sig";
+    const char *long_sub_jwt = "eyJhbGciOiJIUzI1NiJ9."
+                               "eyJzdWIiOiJ4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh"
+                               "4eHh4eHh4eHh4eHh4eHh4eHh4"
+                               "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh"
+                               "4eHh4eHh4eHh4eHh4eHh4eHh4"
+                               "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh"
+                               "4eHh4eHh4eHh4eHh4eHh4eHh4"
+                               "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh"
+                               "4eHh4eHh4eHh4eHh4eHh4eHh4"
+                               "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh"
+                               "4eHh4eHh4eHh4eHh4eHh4eHh4"
+                               "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgiLCJleHAiOjI1MjQ2MDgwMDB9.sig";
+
+    /* Found: string claim copied verbatim, including an unrelated claim. */
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, "sub", out, sizeof(out)), 0);
+    assert_string_equal(out, "test-subject-123");
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, "iss", out, sizeof(out)), 0);
+    assert_string_equal(out, "https://sts.windows.net/tenant/");
+
+    /* Absent claim: distinguished from failure; output reset to empty. */
+    assert_int_equal(jwt_extract_claim_string(no_sub_jwt, "sub", out, sizeof(out)), 1);
+    assert_string_equal(out, "");
+
+    /* Non-string claim type: malformed for this helper, fails closed. */
+    assert_int_equal(jwt_extract_claim_string(non_str_sub_jwt, "sub", out, sizeof(out)), -1);
+
+    /* Claim value longer than the output buffer: fails closed. */
+    assert_int_equal(jwt_extract_claim_string(long_sub_jwt, "sub", out, sizeof(out)), -1);
+
+    /* Malformed JWT structure (mirrors verify_token_metadata rejection). */
+    assert_int_equal(jwt_extract_claim_string("invalid_jwt_no_dots", "sub", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string("invalid_jwt.one_dot", "sub", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string("a.b.c.d", "sub", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string("eyJhbGciOiJIUzI1NiJ9..sig", "sub", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string("eyJhbGciOiJIUzI1NiJ9.bm90X2pzb24.sig", "sub", out, sizeof(out)), -1);
+
+    /* NULL / empty arguments. */
+    assert_int_equal(jwt_extract_claim_string(NULL, "sub", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, NULL, out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, "", out, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, "sub", NULL, sizeof(out)), -1);
+    assert_int_equal(jwt_extract_claim_string(sub_jwt, "sub", out, 0), -1);
 }
 
 /**
@@ -753,6 +886,66 @@ static void test_discovery_probe_pkce_null_args(void **state) {
     assert_int_equal(discovery_probe_pkce(NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(
         discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", NULL, LOGLEVEL_NONE, NULL), -1);
+}
+
+/**
+ * @brief Pins the transient/retryable classification of token-endpoint HTTP
+ *        status codes (`is_retryable_token_http_status()`).
+ *
+ * HTTP 429 and every 5xx status are transient (retry with backoff within the
+ * device-authorization deadline); success, definitive 4xx OAuth errors,
+ * redirects, and "no response" are all handled separately.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_is_retryable_token_http_status_matrix(void **state) {
+    (void)state;
+
+    /* 429 (rate limited) and 5xx (server/gateway) are transient. */
+    assert_int_equal(is_retryable_token_http_status(429), 1);
+    assert_int_equal(is_retryable_token_http_status(500), 1);
+    assert_int_equal(is_retryable_token_http_status(502), 1);
+    assert_int_equal(is_retryable_token_http_status(503), 1);
+    assert_int_equal(is_retryable_token_http_status(504), 1);
+    assert_int_equal(is_retryable_token_http_status(599), 1);
+
+    /* Everything else is success, definitive, a redirect, or no response. */
+    assert_int_equal(is_retryable_token_http_status(0), 0);
+    assert_int_equal(is_retryable_token_http_status(200), 0);
+    assert_int_equal(is_retryable_token_http_status(204), 0);
+    assert_int_equal(is_retryable_token_http_status(301), 0);
+    assert_int_equal(is_retryable_token_http_status(400), 0);
+    assert_int_equal(is_retryable_token_http_status(401), 0);
+    assert_int_equal(is_retryable_token_http_status(404), 0);
+    assert_int_equal(is_retryable_token_http_status(428), 0);
+    assert_int_equal(is_retryable_token_http_status(430), 0);
+    assert_int_equal(is_retryable_token_http_status(499), 0);
+    assert_int_equal(is_retryable_token_http_status(600), 0);
+}
+
+/**
+ * @brief Pins the RFC 8628 s3.5 poll-interval backoff arithmetic extracted
+ *        from the polling loop: `slow_down` (+5 s) and transient 429/5xx /
+ *        cURL-transport-error (doubling), each clamped at
+ *        MAX_SUPPORTED_POLL_INTERVAL.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_interval_backoff_math(void **state) {
+    (void)state;
+
+    /* `slow_down`: +5 s, clamped at the supported maximum. */
+    assert_int_equal(poll_interval_after_slow_down(MIN_POLL_INTERVAL), MIN_POLL_INTERVAL + 5);
+    assert_int_equal(poll_interval_after_slow_down(60), 65);
+    assert_int_equal(poll_interval_after_slow_down(MAX_SUPPORTED_POLL_INTERVAL - 5), MAX_SUPPORTED_POLL_INTERVAL);
+    assert_int_equal(poll_interval_after_slow_down(MAX_SUPPORTED_POLL_INTERVAL - 4), MAX_SUPPORTED_POLL_INTERVAL);
+    assert_int_equal(poll_interval_after_slow_down(MAX_SUPPORTED_POLL_INTERVAL), MAX_SUPPORTED_POLL_INTERVAL);
+
+    /* Transient 429/5xx / cURL transport error: doubling, clamped at the supported maximum. */
+    assert_int_equal(poll_interval_after_transient(MIN_POLL_INTERVAL), MIN_POLL_INTERVAL * 2);
+    assert_int_equal(poll_interval_after_transient(60), 120);
+    assert_int_equal(poll_interval_after_transient(MAX_SUPPORTED_POLL_INTERVAL / 2 + 1), MAX_SUPPORTED_POLL_INTERVAL);
+    assert_int_equal(poll_interval_after_transient(MAX_SUPPORTED_POLL_INTERVAL), MAX_SUPPORTED_POLL_INTERVAL);
 }
 
 /**
@@ -979,7 +1172,7 @@ static void init_config_defaults(config_t *cfg) {
     (void)copy_checked(cfg->claim_field, sizeof(cfg->claim_field), "sub");
     (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
     cfg->claim_capture_group = 1;
-    cfg->max_poll_seconds = 300;
+    cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
     cfg->loglevel = LOGLEVEL_INFO;
     cfg->verify_jwt_claims = 0;
@@ -1032,7 +1225,7 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_string_equal(cfg.claim_field, "sub");
     assert_string_equal(cfg.claim_regex, "^(.*)$");
     assert_int_equal(cfg.claim_capture_group, 1);
-    assert_int_equal(cfg.max_poll_seconds, 300);
+    assert_int_equal(cfg.max_poll_seconds, 120);
     assert_int_equal(cfg.case_sensitive, 1);
     assert_int_equal(cfg.loglevel, LOGLEVEL_INFO);
     assert_string_equal(cfg.group_claim_field, "groups");
@@ -1227,6 +1420,47 @@ static void test_parse_config_file_overlong_line(void **state) {
     assert_non_null(f);
     assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
     fclose(f);
+}
+
+/**
+ * @brief Unit test verifying a long [access] list parses and round-trips.
+ *
+ * Regression guard for the 256-byte list-field cap: operators deny a large
+ * production /etc/passwd service-account list (>500 bytes), which used to fail
+ * with "Failed to parse key 'deny_users'". Build a ~590-byte deny_users value
+ * (100 accounts), longer than the old 255-char limit, and confirm it now loads
+ * and is preserved intact.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_long_access_list(void **state) {
+    (void)state;
+    char deny[ACCESS_LIST_LEN];
+    size_t off = 0;
+    for (int i = 0; i < 100; i++) {
+        off += (size_t)snprintf(deny + off, sizeof(deny) - off, "%ssvc%d", i ? "," : "", i);
+    }
+    assert_true(off > 255); /* the very length that used to overflow the old 256-byte field */
+
+    char text[ACCESS_LIST_LEN + 256];
+    int tlen = snprintf(text, sizeof(text),
+                        "[oauth]\n"
+                        "client_id = ci\n"
+                        "device_authorization_endpoint = https://idp.example.com/device\n"
+                        "token_endpoint = https://idp.example.com/token\n"
+                        "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                        "[access]\n"
+                        "deny_users = %s\n",
+                        deny);
+    assert_true(tlen > 0 && (size_t)tlen < sizeof(text));
+
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_string_equal(cfg.deny_users, deny);
 }
 
 /**
@@ -1466,6 +1700,82 @@ static void test_parse_config_file_pkce_auto_requires_discovery(void **state) {
     fclose(f);
     /* All parsed content is securely zeroed on failure. */
     assert_string_equal(cfg.client_id, "");
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects verify_jwt_claims = true
+ *        unless both issuer and audience are configured.
+ *
+ * The iss/aud checks fail closed without a configured expectation, so the
+ * combination is rejected at load time instead of failing every
+ * authentication attempt at token-verification time.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
+    (void)state;
+    config_t cfg;
+
+    /* Neither issuer nor audience configured. */
+    static const char *const neither = "[oauth]\n"
+                                       "client_id = ci\n"
+                                       "device_authorization_endpoint = https://idp.example.com/device\n"
+                                       "token_endpoint = https://idp.example.com/token\n"
+                                       "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                       "verify_jwt_claims = true\n";
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(neither);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+    /* All parsed content is securely zeroed on failure. */
+    assert_string_equal(cfg.client_id, "");
+
+    /* Issuer only. */
+    static const char *const issuer_only = "[oauth]\n"
+                                           "client_id = ci\n"
+                                           "device_authorization_endpoint = https://idp.example.com/device\n"
+                                           "token_endpoint = https://idp.example.com/token\n"
+                                           "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                           "verify_jwt_claims = true\n"
+                                           "issuer = https://idp.example.com\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(issuer_only);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+
+    /* Audience only. */
+    static const char *const audience_only = "[oauth]\n"
+                                             "client_id = ci\n"
+                                             "device_authorization_endpoint = https://idp.example.com/device\n"
+                                             "token_endpoint = https://idp.example.com/token\n"
+                                             "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                             "verify_jwt_claims = true\n"
+                                             "audience = aud-1\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(audience_only);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+
+    /* Both configured: accepted. */
+    static const char *const both = "[oauth]\n"
+                                    "client_id = ci\n"
+                                    "device_authorization_endpoint = https://idp.example.com/device\n"
+                                    "token_endpoint = https://idp.example.com/token\n"
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "verify_jwt_claims = true\n"
+                                    "issuer = https://idp.example.com\n"
+                                    "audience = aud-1\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(both);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_int_equal(cfg.verify_jwt_claims, 1);
+    assert_string_equal(cfg.issuer, "https://idp.example.com");
+    assert_string_equal(cfg.audience, "aud-1");
 }
 
 /**
@@ -2087,10 +2397,12 @@ int main(void) {
         cmocka_unit_test(test_jwt_valid_metadata),
         cmocka_unit_test(test_jwt_expired_token),
         cmocka_unit_test(test_jwt_mismatch_claims),
+        cmocka_unit_test(test_jwt_unconfigured_binding_fail_closed),
         cmocka_unit_test(test_jwt_audience_array),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),
         cmocka_unit_test(test_jwt_malformed_structure),
         cmocka_unit_test(test_jwt_base64url_strict_alphabet),
+        cmocka_unit_test(test_jwt_extract_claim_string),
         cmocka_unit_test(test_retryable_token_http_status),
         cmocka_unit_test(test_http_request_enforces_tls_options),
         cmocka_unit_test(test_pkce_code_verifier),
@@ -2104,6 +2416,7 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_key_before_section),
         cmocka_unit_test(test_parse_config_file_unknown_section),
         cmocka_unit_test(test_parse_config_file_overlong_line),
+        cmocka_unit_test(test_parse_config_file_long_access_list),
         cmocka_unit_test(test_parse_config_file_invalid_url),
         cmocka_unit_test(test_parse_config_file_invalid_int),
         cmocka_unit_test(test_parse_config_file_invalid_loglevel),
@@ -2114,6 +2427,7 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_null_args),
         cmocka_unit_test(test_parse_config_file_pkce_auto),
         cmocka_unit_test(test_parse_config_file_pkce_auto_requires_discovery),
+        cmocka_unit_test(test_parse_config_file_jwt_claims_requires_binding),
         cmocka_unit_test(test_parse_config_file_invalid_discovery_endpoint),
         cmocka_unit_test(test_parse_config_file_duplicate_discovery_endpoint),
         cmocka_unit_test(test_discovery_json_advertises_s256),
@@ -2122,6 +2436,8 @@ int main(void) {
         cmocka_unit_test(test_discovery_probe_pkce_failsafe_malformed_document),
         cmocka_unit_test(test_discovery_probe_pkce_support_matrix),
         cmocka_unit_test(test_discovery_probe_pkce_null_args),
+        cmocka_unit_test(test_is_retryable_token_http_status_matrix),
+        cmocka_unit_test(test_poll_interval_backoff_math),
         cmocka_unit_test(test_qr_config_parsing),
         cmocka_unit_test(test_qr_render_matrix),
         cmocka_unit_test(test_qr_encode_uri),
