@@ -5,7 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.2] - 2026-11-16
+
+### Added
+
+- **Terminal UX / accessibility:** Failed sign-in attempts now present a plain-text,
+  actionable notice in the login terminal (delivered through the PAM conversation,
+  `PAM_TEXT_INFO`) — the identity provider service is unavailable, the sign-in code
+  expired before approval, or the account was denied — so a failure never ends in an
+  unexplained "permission denied" (WCAG 3.3.1 *Error Identification*;
+  `notify_user_failure()` in `src/pam_module.c`). Wording is deliberately generic:
+  which specific control rejected the attempt remains in the syslog audit trail only.
+  Delivery is best-effort (OpenSSH keyboard-interactive clients may buffer
+  informational messages until a prompt round-trip; local console logins always
+  display the notice). User-initiated cancellation (**Ctrl-C**) produces no notice.
+- **Documentation:** `docs/getting-started.md` §7 gains a *User-Visible Failure
+  Notices* subsection, and the README `## Accessibility` section now documents the
+  failure-feedback guarantee.
+- **Testing:** Six opt-in libFuzzer harnesses (`tests/fuzz/`) drive the module's
+  pure, input-parsing leaf functions — config parsing, JWT Base64URL/claim
+  extraction, JWT token-metadata checks, the terminal/URL string validators, regex
+  claim verification, and the PKCE S256 challenge — under ASan+UBSan+LSan (the same
+  sanitizer set as `make test-sanitize`). New `make fuzz` / `make fuzz-build`
+  targets include a preflight gate with actionable per-platform install guidance
+  and a committed seed corpus (`tests/fuzz/seed/`); fuzzing is strictly opt-in and
+  runs in no CI workflow. See `tests/fuzz/README.md` for rationale and crash
+  triage.
+
+### Fixed
+
+- **Docs:** `examples/README.md` — replaced a raw LaTeX `$\rightarrow$` with a plain
+  `→` (GitHub Markdown does not render LaTeX, so the literal source was displayed).
+- **Docs (accessibility):** replaced `≠` and inline `→` arrows in prose with explicit
+  words ("results in", "maps to", "shows"), gave every link a descriptive, context-unique
+  label (no bare-URL link labels, no repeated unanchored link text), and added a
+  `## Table of Contents` to the long guides (`getting-started`, `testing`,
+  `jwt-validation`, `access-control`) to match `threat-model.md` and `SECURITY.md`
+  (WCAG 2.4.4 *Identify Link Purpose* / 2.4.5 *Identify Purpose*).
+- **Docs (accessibility):** The two fixed-width box diagrams in
+  `docs/threat-model.md` are now rendered as structured tables. Figure 1
+  (trust boundary overview) lists the three trust zones and the four trust
+  relationships with their protections; Figure 2 (pre-flight
+  access-control flow) lists the five evaluation gates with their
+  reject/continue conditions — including the UserInfo retrieval failure
+  path, which the old art did not show even though the gate is fail-closed.
+  The tables keep every relationship and decision the diagrams showed, read
+  as proper table semantics by screen readers, and survive narrow/mobile
+  rendering where the ~77-char-wide ASCII art wrapped into illegible
+  fragments.
+- **Docs (accuracy):** `docs/threat-model.md` Figure 2 now matches the
+  implementation (verified against `src/identity.c`): gate 4 evaluates the
+  provider's group/role claim values (`group_claim_field`, default
+  `groups`) against `allow_groups`/`deny_groups` — not local NSS group
+  memberships — and states its fail-closed edge cases (enforcement enabled
+  with no list rejects; no group policy configured bypasses the gate). Gate 1
+  now documents the default `root` denial, which requires an explicit
+  `allow_root = true` opt-in. Figure 1's zone rows list contents only, so
+  each security property is stated exactly once (in the relationships
+  table), and the two adjacent tables carry explicit lead-in labels.
+- **Docs (accuracy):** `docs/threat-model.md` re-verified against the C
+  implementation and simplified: trust zone 1 now includes the OIDC discovery
+  endpoint used by `use_pkce = auto`, the URL-validation bullet clarifies that
+  operator-configured endpoints are checked at load time in addition to
+  provider-returned verification URIs, and the Figure 2 lead-in now correctly
+  describes the access-control gates as running *after* the device-authorization
+  token exchange completes.
 
 ## [0.3.1] - 2026-11-15
 

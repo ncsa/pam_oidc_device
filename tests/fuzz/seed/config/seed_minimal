@@ -1,0 +1,9 @@
+[oauth]
+client_id = pam-client
+device_authorization_endpoint = https://idp.example.com/device
+token_endpoint = https://idp.example.com/token
+userinfo_endpoint = https://idp.example.com/userinfo
+[claim]
+claim_field = email
+claim_regex = ^(.+)@example\.com$
+claim_capture_group = 1

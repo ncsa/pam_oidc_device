@@ -85,9 +85,9 @@ Treat the field as a *hint*, not proof.
    ```
    * **(b) returns the same normal device-code payload** (and, if you complete the flow, polling
      with the matching `code_verifier` succeeds while a wrong/missing verifier is rejected with
-     `invalid_grant`) → **supported**: set `use_pkce = true`.
-   * **(b) fails with an error naming `code_challenge` / an unsupported-parameter error** →
-     **not supported**: keep `use_pkce = false`.
+     `invalid_grant`) — the provider **supports** PKCE: set `use_pkce = true`.
+   * **(b) fails with an error naming `code_challenge` / an unsupported-parameter error** —
+     the provider **does not support** PKCE: keep `use_pkce = false`.
    * **Gotcha:** an *unregistered* `client_id` cannot be used for this test — most providers
      validate the client before inspecting the extra parameters and return an
      `unauthorized_client`-style error either way.
@@ -130,7 +130,7 @@ Instead of maintaining separate files for dozens of individual vendors, this rep
 * **Target Environment:** Multi-tenant enterprise cloud providers (e.g., Microsoft Entra ID, Okta, Auth0).
 * **Key Traits:**
   * Uses public client flows (empty `client_secret`).
-  * Demonstrates domain-pinned regular expressions that extract the local POSIX handle only from user principal names (UPNs) or emails belonging to your own tenant (e.g., `jdoe@company.com` $\rightarrow$ `jdoe`; `jdoe@otherdomain.com` does not match).
+  * Demonstrates domain-pinned regular expressions that extract the local POSIX handle only from user principal names (UPNs) or emails belonging to your own tenant (e.g., `jdoe@company.com` maps to `jdoe`; `jdoe@otherdomain.com` does not match).
   * Configures extended polling timeouts for enterprise MFA policies.
 
 ### 3. Academic & Research Federation Pattern

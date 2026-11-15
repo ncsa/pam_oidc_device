@@ -35,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.1, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.2, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).
@@ -428,6 +428,11 @@ The rules in this section are **non-negotiable** for any code you write or revie
   load-time notice is emitted).
 - **RFC 4648 §5** — unpadded Base64URL encoding.
 - **RFC 3986** — URI generic syntax & percent-encoding.
+- **WCAG 2.1 Level AA** — conformance baseline for repository documentation
+  and the documented terminal user experience: the shared technical baseline
+  of the three mandates on NCSA/UIUC public-facing content — IITAA 2.1
+  (30 ILCS 587), ADA Title II (28 CFR Part 35, effective April 2026), and
+  Rehabilitation Act § 508 (29 U.S.C. § 794d, via 36 CFR Part 1194); see §8.
 - **Project guidelines:** consult `CONTRIBUTING.md` and `README.md`.
 
 ### 5.3 C & PAM implementation gotchas
@@ -502,6 +507,26 @@ AI-assisted work on this repo — **not** a user-facing changelog (that is `CHAN
   sanitizer run (see §3.1 steps 6–7).
 - Wiping of sensitive memory buffers must use `secure_memzero()` or `explicit_bzero()` (see
   §4.1).
+- Documentation must remain **WCAG 2.1 Level AA** conformant (shared baseline
+  of IITAA 2.1, ADA Title II, and Rehabilitation Act § 508; see §5.2 and the
+  `README.md` `## Accessibility` section): semantic heading structure, tables
+  with header rows, meaningful alt text on every image, no information conveyed
+  by color alone, and a prose figure description (e.g., "**Figure N — …**")
+  preceding every ASCII-art diagram. Terminal-UX claims in docs must track the
+  implementation: the prompt is always plain text (QR is off-by-default and
+  strictly supplemental), fully keyboard-driven (**Enter** to begin,
+  **Ctrl-C** → `PAM_ABORT`), with no user-uncancellable time limits, and failed
+  attempts must deliver a user-visible, plain-text, actionable notice through
+  the PAM conversation (`notify_user_failure()` in `src/pam_module.c` —
+  best-effort, deliberately generic wording; detailed causes stay in the audit
+  log only). Never leave a new failure path log-only.
+- **Guide navigation & link labels (WCAG 2.4.4 / 2.4.5):** every long guide
+  (4+ H2 sections: `docs/getting-started.md`, `docs/testing.md`,
+  `docs/jwt-validation.md`, `docs/access-control.md`, `docs/threat-model.md`)
+  begins with a `## Table of Contents` in the threat-model format; link labels
+  are descriptive and context-unique (no bare-URL labels, no repeated
+  unanchored link text); prose uses words, not symbols — no `≠` and no inline
+  `→` arrows in prose (use "results in", "maps to", "shows", etc.).
 - Follow the agent operational safety rules in §6 when verifying changes.
 
 ---
@@ -781,6 +806,14 @@ coverage, and documentation accuracy.
 > 2. **Documentation accuracy:** Verify that `README.md`, the `docs/` guides, and inline comments
 >    accurately reflect the actual C implementation, syslog levels, and configuration parameters
 >    line-by-line.
+>    **Accessibility (WCAG 2.1 AA):** confirm every image has meaningful alt text, heading
+>    structure is unbroken, no information is conveyed by color alone, every ASCII-art
+>    diagram carries a preceding prose figure description, long guides begin with a
+>    Table of Contents, link labels are descriptive and context-unique (no bare-URL
+>    labels, no repeated unanchored labels), and prose uses words rather than symbols
+>    (no `≠`, no inline `→`) (§8) — and that no
+>    `pam_sm_authenticate()` failure path is log-only: every one must deliver a
+>    user-visible plain-text notice via `notify_user_failure()`.
 > 3. **Test suite coverage:** Evaluate the CMocka unit tests in `tests/test_suite.c`. Identify
 >    untested edge cases (null inputs, memory allocation failures, malformed JSON structures,
 >    invalid regex rules, network transport errors). Confirm test isolation and weak-symbol

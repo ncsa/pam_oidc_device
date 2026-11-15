@@ -1,0 +1,39 @@
+[oauth]
+client_id = pam-client
+client_secret = seed-secret
+device_authorization_endpoint = https://idp.example.com/device
+token_endpoint = https://idp.example.com/token
+userinfo_endpoint = https://idp.example.com/userinfo
+scopes = openid profile email
+verify_jwt_claims = true
+issuer = https://idp.example.com/oauth2
+audience = pam-client
+clock_skew_leeway = 60
+require_exp_claim = true
+use_pkce = true
+discovery_endpoint = https://idp.example.com/.well-known/openid-configuration
+[claim]
+claim_field = email
+claim_regex = ^(.+)@example\.com$
+claim_capture_group = 1
+case_sensitive = false
+[access]
+allow_users = alice,bob
+deny_users = mallory
+allow_groups = sysadmins,ops
+deny_groups = contractors
+enforce_groups = true
+group_claim_field = groups
+[prompt]
+init_message = Please sign in at {url} using code {code}
+[runtime]
+max_poll_seconds = 120
+loglevel = info
+[qr]
+enabled = true
+style = ascii
+block_char = #
+scale = 2
+vertical_quiet_zone = 4
+ec_level = M
+uri = complete

@@ -1,8 +1,8 @@
 # PAM OAuth 2.0 Device Authorization Grant Module (`pam_oidc_device`)
 
-[![Build Verification](https://github.com/ncsa/pam_oidc_device/actions/workflows/build.yml/badge.svg)](https://github.com/ncsa/pam_oidc_device/actions/workflows/build.yml)
-[![Lint & Static Analysis](https://github.com/ncsa/pam_oidc_device/actions/workflows/lint.yml/badge.svg)](https://github.com/ncsa/pam_oidc_device/actions/workflows/lint.yml)
-[![License](https://img.shields.io/github/license/ncsa/pam_oidc_device?color=green)](LICENSE)
+[![Build verification workflow status](https://github.com/ncsa/pam_oidc_device/actions/workflows/build.yml/badge.svg)](https://github.com/ncsa/pam_oidc_device/actions/workflows/build.yml)
+[![Lint and static analysis workflow status](https://github.com/ncsa/pam_oidc_device/actions/workflows/lint.yml/badge.svg)](https://github.com/ncsa/pam_oidc_device/actions/workflows/lint.yml)
+[![Project license: MIT](https://img.shields.io/github/license/ncsa/pam_oidc_device?color=green)](LICENSE)
 
 > [!WARNING]
 > **Pre-Release Notice**:
@@ -42,7 +42,7 @@ No passwords cross the wire in this flow, and no provider credentials live on th
 
 ## Quickstart
 
-Deploy `pam_oidc_device` in 4 steps. The complete walkthrough — prerequisites, provider configuration values, `authselect` on Enterprise Linux, and logging — lives in the [Getting Started guide](docs/getting-started.md); to install a prebuilt RPM/DEB instead of compiling, see [Building RPM & DEB Packages](docs/packaging.md).
+Deploy `pam_oidc_device` in 4 steps. The complete walkthrough — prerequisites, provider configuration values, `authselect` on Enterprise Linux, and logging — lives in the [Getting Started guide](docs/getting-started.md); to install a prebuilt RPM/DEB instead of compiling, see the [RPM/DEB packaging guide](docs/packaging.md).
 
 ### Step 1: Install the Module
 
@@ -173,7 +173,7 @@ Pick the guide that matches what you are about to do:
 
 ## Security & Credential Handling
 
-For a complete security analysis, attack vector breakdown, and trust boundary mapping, see the [Threat Model](docs/threat-model.md).
+For a complete security analysis, attack vector breakdown, and trust boundary mapping, see the [Threat Model & Security Architecture](docs/threat-model.md).
 
 * **Zero Disk Footprint:** OAuth device codes, tokens, and response bodies are never written to disk or swap files.
 * **Volatile Memory Scrubbing:** Module-owned secret materials (client secrets, access/refresh tokens, decoded JSON payload fields) are explicitly zeroed out in process RAM via `secure_memzero` before memory is released.
@@ -214,6 +214,58 @@ Full licensing, provenance pins, local-deviation records, and the license-audit 
 
 ---
 
+## Accessibility
+
+This project's documentation and terminal user experience are built to
+[WCAG 2.1 Level AA](https://www.w3.org/TR/WCAG21/) — the shared technical
+baseline of the three accessibility mandates governing NCSA / University of
+Illinois public-facing content:
+
+* **Illinois Information Technology Accessibility Act (IITAA 2.1,
+  30 ILCS 587):** applies to Illinois state agencies and state-supported
+  universities (including the University of Illinois), requiring digital
+  content and documentation to meet WCAG 2.1 Level AA.
+* **ADA Title II Web Accessibility Rule (28 CFR Part 35):** requires public
+  universities and state entities to conform public web content and
+  documentation to WCAG 2.1 Level AA (effective April 2026).
+* **Section 508 of the Rehabilitation Act (29 U.S.C. § 794d):** applies to
+  federally funded research, software, and documentation (e.g., NSF-supported
+  NCSA projects) and incorporates the WCAG Level AA standards (36 CFR
+  Part 1194, per the Access Board's 2017 final rule).
+
+In concrete terms, this means:
+
+* **Documentation:** The README and the guides under `docs/` use semantic
+  heading structure, data tables with header rows, text alternatives for every
+  image, no information conveyed by color alone, and content that remains fully
+  navigable by keyboard and screen reader in rendered form.
+* **Terminal sign-in experience:** The authentication prompt is text-first and
+  screen-reader friendly. The sign-in URL and user code are *always* presented
+  as plain, selectable terminal text — never image-only — and no prompt
+  information depends on color. The interaction is entirely keyboard-driven:
+  **Enter** begins waiting for your approval, and **Ctrl-C** aborts the attempt
+  at any point (the login is denied — `PAM_ABORT`). There are no time-limited
+  interactions that cannot be cancelled; the user-code lifetime itself is set by
+  your identity provider (`expires_in`), and idle time at the confirmation
+  prompt counts against it (see [Getting Started, §4](docs/getting-started.md#4-openssh-server-setup-etcsshsshd_config)).
+  Failed attempts are never silent: the module delivers a plain-text, actionable
+  explanation to the terminal (for example, the sign-in code expired, the identity
+  provider service is unavailable, or the account is denied) so users are not left
+  with an unexplained "permission denied" (WCAG 3.3.1 *Error Identification*).
+  Delivery is best-effort, and detailed causes remain in the audit log only
+  (see [Getting Started, §7](docs/getting-started.md#7-logging--auditing)).
+* **QR sign-in (opt-in):** The `[qr]` terminal QR code is strictly
+  *supplemental* (WCAG 1.1.1 *Non-text Content*): authentication never depends
+  on it, it is off by default, and `style = ascii` renders it in plain ASCII
+  for minimal fonts. Screen-reader and low-vision users should rely on the
+  text prompt, which is displayed in all cases.
+
+If you encounter an accessibility barrier in this documentation or in the
+module's terminal experience, please [open an issue](https://github.com/ncsa/pam_oidc_device/issues)
+describing the barrier; accessibility reports are triaged with priority.
+
+---
+
 ## License & Community
 
 * **License:** This project is licensed under the [MIT License](LICENSE).
@@ -221,4 +273,4 @@ Full licensing, provenance pins, local-deviation records, and the license-audit 
 * **Security Disclosures:** See [SECURITY.md](SECURITY.md).
 * **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Developed and maintained by **NCSA CyberInfrastructure** ([https://www.ncsa.illinois.edu/](https://www.ncsa.illinois.edu/)).
+Developed and maintained by **NCSA CyberInfrastructure** ([NCSA website](https://www.ncsa.illinois.edu/)).

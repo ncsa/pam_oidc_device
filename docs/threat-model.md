@@ -2,7 +2,7 @@
 
 `pam_oidc_device` is a Linux Pluggable Authentication Module (PAM) executing inside privileged process spaces (such as OpenSSH `sshd`) to authenticate system users via the [OAuth 2.0 Device Authorization Grant](https://oauth.net/2/device-flow/) ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Because authentication modules operate at the primary security boundary of the operating system, this document details the system trust boundaries, threat matrix, defense mechanisms, and implementation specifics.
 
-> **Security disclosures.** To report a vulnerability in `pam_oidc_device`, follow the [Security Policy](../SECURITY.md).
+> **Security disclosures.** To report a vulnerability in `pam_oidc_device`, follow the [security disclosure procedure](../SECURITY.md).
 
 ## Table of Contents
 
@@ -25,38 +25,25 @@
 
 The module operates across three distinct operational boundaries:
 
-```text
- +-------------------------------------------------------------------------+
- |                                LOCAL HOST                               |
- |                                                                         |
- | +---------------------------+    Config & POSIX Access    +----------+  |
- | |  PAM Application Context  |  <----------------------->  | Config   |  |
- | |  (e.g., /usr/sbin/sshd)   |  /etc/pam_oidc_device.conf  | File     |  |
- | +---------------------------+                             +----------+  |
- |              |                                                          |
- +--------------|----------------------------------------------------------+
-                | Enforced TLS Transport (HTTPS)
-                v
- +-------------------------------------------------------------------------+
- |                         IDENTITY PROVIDER (IdP)                         |
- |                                                                         |
- |  +--------------------+   +-------------------+   +------------------+  |
- |  | Device Auth Endpt  |   |  Token Endpoint   |   | UserInfo Endpt   |  |
- |  +--------------------+   +-------------------+   +------------------+  |
- +-------------------------------------------------------------------------+
-                |
-                | Out-of-Band Browser Session
-                v
- +-------------------------------------------------------------------------+
- |                           USER & CLIENT DEVICE                          |
- |                                                                         |
- |  +--------------------+                           +------------------+  |
- |  |  SSH Terminal      | <-----------------------> | External Web     |  |
- |  |  Prompt            |   User Verification Code  | Browser          |  |
- |  +--------------------+                           +------------------+  |
- +-------------------------------------------------------------------------+
+**Figure 1 — Trust boundary overview.** The three trust zones, and the
+trust relationships that run within and between them:
 
-```
+*Zones:*
+
+| Zone | Contents |
+| --- | --- |
+| **Local host** | A PAM application context (e.g., `/usr/sbin/sshd`) and the configuration file `/etc/pam_oidc_device.conf`. |
+| **Identity provider (IdP)** | The device-authorization, token, and UserInfo endpoints — plus the OIDC discovery endpoint when `use_pkce = auto`. |
+| **User & client device** | The SSH terminal prompt and an external web browser. |
+
+*Trust relationships:*
+
+| Trust relationship | Connects | Protection |
+| --- | --- | --- |
+| Config & POSIX access | PAM application context to configuration file (within the local host) | Ownership and permission checks (`root:root`, `0600`/`0640`) on a fail-closed open; any deviation aborts authentication |
+| Enforced TLS transport | Local host to the IdP's OAuth/OIDC endpoints | HTTPS only, TLS 1.2+, certificate verification enabled (`CURLOPT_SSL_VERIFYPEER=1`, `CURLOPT_SSL_VERIFYHOST=2`) |
+| Out-of-band browser session | IdP to the user's browser | A standard authenticated browser session; user credentials are never presented to, or seen by, the module |
+| User verification code | SSH terminal to web browser (on the user's own device) | The code is the only material shared between the two; it is never transmitted through the module |
 
 ### 1. Local Host Integrity (Privileged Kernel & Process Boundary)
 
@@ -84,7 +71,7 @@ The module operates across three distinct operational boundaries:
 | **High** | Policy Bypass via Local Mapping | Authenticated IdP identity maps to an unauthorized local system account name. | POSIX extended regex claim matching with strict capture groups, case sensitivity controls, and local allow/deny list checks. | `verify_claim()`, `verify_user_access()` |
 | **Medium** | Privilege Escalation via Group Claims | IdP user lacking required operational roles gains host machine access. | Evaluation of UserInfo group/role claims against strict allow and deny group lists (deny list takes precedence). | `verify_group_membership()` |
 | **Medium** | Config File Manipulation | Low-privileged local user tampers with `/etc/pam_oidc_device.conf` or uses symlink traversal to alter auth logic. | Secure file descriptor opening (`O_NOFOLLOW`, `O_CLOEXEC`), strict file ownership checks (`uid 0`, `gid 0`), and permission validation (`0600`/`0640`). | `load_config()` |
-| **Medium** | Token Replay / Token Spoofing | Stale, expired, or wrong-audience access tokens are accepted by the PAM module. | Pre-flight claims inspection (`exp`, `nbf`, `iss`, `aud`) combined with authoritative IdP signature validation at the UserInfo endpoint. | `verify_token_metadata()` |
+| **Medium** | Token Replay / Token Spoofing | Stale, expired, or wrong-audience access tokens are accepted by the PAM module. | Authoritative IdP enforcement when the token is presented to the `userinfo_endpoint`, complemented by a fail-closed `token_type = Bearer` check, opt-in local claims inspection (`exp`, `nbf`, `iss`, `aud`), and a JWT-sub ↔ UserInfo-sub consistency check. | `verify_token_metadata()`, `jwt_extract_claim_string()` |
 | **Medium** | Device Code Interception / Replay | An attacker who obtains a live `device_code` (log leakage, network compromise, or a code-phishing relay) completes the token exchange instead of the legitimate user. | Optional PKCE (RFC 7636) S256 binding: a fresh per-attempt CSPRNG `code_verifier` ties the token exchange to the originating device flow, so a stolen `device_code` alone cannot obtain tokens when enabled. | `pkce_generate_code_verifier()`, `pkce_compute_s256_challenge()`, `use_pkce` |
 | **Low** | Denial of Service (DoS) via HTTP Buffers | Rogue server sends unbounded HTTP response payloads or redirection loops to exhaust host resources. | Strict HTTPS protocol enforcement, redirection disabling, request timeouts, and fixed response size limits (256 KiB). | `http_request()`, `write_callback()` |
 
@@ -96,7 +83,7 @@ The module operates across three distinct operational boundaries:
 
 Terminal escape sequences (e.g., ANSI control codes) sent to an SSH terminal can manipulate terminal settings, obscure prompt text, or execute unauthorized commands in vulnerable terminal emulators.
 
-* **URL Validation**: Endpoints returned by the identity provider are validated using `is_valid_https_url()`, ensuring they begin strictly with `https://`, contain printable ASCII characters (range 33–126), omit URL fragment hashes, and reject authority userinfo (`user:pass@host`) components.
+* **URL Validation**: Verification URIs returned by the identity provider — and, at load time, every operator-configured endpoint — are validated by `is_valid_https_url()`, which requires the `https://` scheme, printable ASCII only (no control bytes), no fragment (`#`), and rejects authority userinfo (`user:pass@host`). Malformed or non-HTTPS URIs are refused before they can reach the terminal.
 * **User Code Filtering**: User codes are sanitized by `is_safe_user_code()`, which limits length to 64 bytes and restricts characters exclusively to alphanumeric characters, spaces, hyphens, and underscores.
   * The sanitizer enforces terminal safety only — not code *format*: RFC 8628 §3.1's character-set recommendations (e.g., a consonant-only base-20 set, or omission of visually ambiguous characters such as `0`/`O` and `1`/`l`/`I`) and display chunking (e.g., `WDJB-MJHT`) are server-side choices made by the identity provider when it issues the code.
   * The module therefore deliberately neither rejects nor reformats codes containing vowels, ambiguous glyphs, or un-chunked sequences — rejecting them would break compatibility with providers that do not follow those recommendations.
@@ -120,41 +107,30 @@ Configuration files stored at `/etc/pam_oidc_device.conf` contain identity provi
 
 ### 4. Identity Mapping & Pre-Flight Access Control
 
-Mapping identity claims from an [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html) provider to a local system account requires strict policy verification to prevent unauthorized account access. For configuration options, see [Account & Group Access Control](access-control.md).
+Mapping identity claims from an [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html) provider to a local system account requires strict policy verification to prevent unauthorized account access. For configuration options, see the [account and group access control guide](access-control.md).
 
-```text
-Incoming PAM User ("jdoe")
-       |
-       v
-[verify_user_access] ---> Deny List Match? ----------> (YES) ---> REJECT ACCESS
-       |                               (NO)
-       v
-Allow List Configured? ---> (YES) ---> User in List? -> (NO) ---> REJECT ACCESS
-       | (NO)                           | (YES)
-       +--------------------------------+
-       v
-Query Provider UserInfo Endpoint
-       |
-       v
-[verify_claim] ---------> Extract Claim via Regex
-       |                  Compare with PAM User
-       |                  Match Succeeded? -----------> (NO) ---> REJECT ACCESS
-       v (YES)
-[verify_group_membership] -> Check allow/deny groups
-       |                  Group Permitted? ------------> (NO) ---> REJECT ACCESS
-       v (YES)
-GRANT AUTHENTICATION
+**Figure 2 — Access-control decision flow.** After the device-authorization
+token exchange completes, a linear sequence of gates is evaluated using the PAM
+username and the provider's UserInfo payload: any failed gate fails closed and
+rejects the login, and only a fully passing path reaches
+**GRANT AUTHENTICATION** (`PAM_SUCCESS`).
 
-```
+| # | Gate | What is evaluated | Rejects when | Continues when |
+| --- | --- | --- | --- | --- |
+| 1 | `verify_user_access()` | `deny_users` / `allow_users` on the PAM username; the deny list always takes precedence; `root` is denied unless `allow_root = true` is set explicitly | The user is listed in `deny_users`; the user is `root` without an explicit `allow_root = true` opt-in; or the user is absent from a configured `allow_users` list | The user passes local account filtering |
+| 2 | Provider UserInfo retrieval | `HTTPS GET /userinfo` over the enforced TLS 1.2+ transport | The transport or HTTP request fails — the gate is fail-closed | The claim payload arrives (HTTP 200) |
+| 3 | `verify_claim()` | The configured identity claim, extracted from the payload by regex, compared against the PAM username | No configured claim is present, or the extracted value does not match the PAM username | The claim matches the PAM username |
+| 4 | `verify_group_membership()` | The group/role values of the configured UserInfo claim (`group_claim_field`, default `groups`) compared against `allow_groups` / `deny_groups`; deny values take precedence | The user holds a group/role listed in `deny_groups`, or holds none that satisfy a configured `allow_groups` list; the gate also rejects when group enforcement is enabled but no list is configured | Group policy passes, or no group policy is configured (gate bypassed) |
+| 5 | — | — | — | **GRANT AUTHENTICATION** — `PAM_SUCCESS` is returned to the PAM stack |
 
-* **Local Pre-Flight Filtering**: Before initiating network requests to the provider, `verify_user_access()` evaluates the requesting `PAM_USER` against `deny_users` and `allow_users` lists. Denial lists take precedence over allow lists.
-* **Regex Claim Extraction**: `verify_claim()` compiles the configured `claim_regex` using [POSIX Extended Regular Expressions](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) (`REG_EXTENDED`), extracts the specified capture group (`claim_capture_group`), and compares the extracted substring to `PAM_USER`.
-* **Deterministic Matching**: Comparison honors `case_sensitive` settings, using `ascii_strcasecmp()` for case-insensitive matching to avoid locale-dependent parsing anomalies.
-* **Group Authorization**: `verify_group_membership()` evaluates array or string claims (e.g., `groups` or `roles`) returned by UserInfo against comma-separated `allow_groups` and `deny_groups` settings.
+* **Local pre-flight filtering**: `verify_user_access()` (gate 1) runs *before* any provider contact, so a locally-denied account never triggers a device-flow. Deny lists take precedence; `root` is refused unless `allow_root = true`.
+* **Regex claim extraction**: `verify_claim()` compiles `claim_regex` with [POSIX extended regular expressions](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) (`REG_EXTENDED`), extracts capture group `claim_capture_group`, and compares it to the PAM user. Matching honors `case_sensitive`; the case-insensitive path uses a byte-wise `ascii_strcasecmp()` so results never vary with the ambient locale.
+* **Group authorization**: `verify_group_membership()` (gate 4) compares the `group_claim_field` value (default `groups`) — a JSON array, a single string, or a comma-separated string — against `allow_groups` / `deny_groups`; deny values take precedence.
+* **PII-safe audit logging**: The raw UserInfo payload (which holds personal data) is never written to the system log. At `DEBUG` the module records only the payload size and configured claim field; at `VERBOSE` it additionally lists claim *names* (never values), and a name is withheld if it contains non-printable bytes.
 
 ### 5. Local JWT Claims Inspection vs. Downstream Signature Enforcement
 
-When local JWT verification is enabled (`verify_jwt_claims = true`), `verify_token_metadata()` performs pre-flight claim inspection per [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519). For details on configuring issuer and audience checks, see [Local JWT Claim Inspection](jwt-validation.md).
+When local JWT verification is enabled (`verify_jwt_claims = true`), `verify_token_metadata()` performs pre-flight claim inspection per [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519). For details on configuring issuer and audience checks, see the [local JWT claim inspection guide](jwt-validation.md).
 
 * **Structural Integrity**: Confirms standard 3-part Base64URL JWT structure (`header.payload.signature`).
 * **Temporal Validation**: Validates `exp` (Expiration Time) and `nbf` (Not Before) numeric claims against host time (`time(NULL)`), allowing for configurable clock skew (`clock_skew_leeway`).
@@ -176,7 +152,7 @@ HTTP network interactions managed by `http_request()` enforce security and stabi
 
 ### 7. PKCE Device-Flow Binding (RFC 7636)
 
-The [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) device flow treats the `device_code` as its sole proof of possession. Modern identity providers pair the device grant with [Proof Key for Code Exchange](https://www.rfc-editor.org/rfc/rfc7636) (RFC 7636) to harden against device-code interception and replay; this module provides that extension as an opt-in.
+The [RFC 8628 device flow](https://www.rfc-editor.org/rfc/rfc8628) treats the `device_code` as its sole proof of possession. Modern identity providers pair the device grant with [Proof Key for Code Exchange](https://www.rfc-editor.org/rfc/rfc7636) (RFC 7636) to harden against device-code interception and replay; this module provides that extension as an opt-in.
 
 * **Config Gate**: `use_pkce` in the `[oauth]` section — three states:
   * `false` (default): the device flow runs without PKCE.
