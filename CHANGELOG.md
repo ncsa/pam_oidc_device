@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.1] - 2026-11-15
+
+### Added
+
+- **Docs:** Added `.agents/context.md` §9.1 — an OAuth 2.0 Device Authorization Grant
+  (RFC 8628) cross-vendor reference covering IETF specs, commercial/enterprise IdPs,
+  academic/research federation IdPs, reference PAM implementations, and a cross-vendor
+  implementation matrix for `pam_oidc_device`.
+- **Poll-loop backoff unit tests:** new CMocka cases pin the transient/retryable
+  HTTP status classification (`is_retryable_token_http_status()`) and the
+  `slow_down` / transient 429·5xx / cURL-transport-error poll-interval arithmetic
+  (`+5 s` and doubling, each clamped at the supported maximum of 120 s), which is
+  extracted from the polling loop into the helpers `poll_interval_after_slow_down()`
+  and `poll_interval_after_transient()` (`src/pam_module.c`).
+
+### Security
+
+- **Fail-closed JWT `iss`/`aud` checks + load-time binding requirement (config cross-validation):** the claims-only `iss` and `aud` checks in `src/jwt.c` now fail the authentication attempt when `verify_jwt_claims = true` but `issuer` or `audience` is unconfigured (previously the missing check was silently skipped — with no local signature verification this left identity binding to the IdP's UserInfo acceptance alone, which does not distinguish tokens minted for a different client on multi-audience IdPs). Enforced up front: `load_config()` now rejects `verify_jwt_claims = true` unless both `issuer` and `audience` are set (same pattern as the existing PKCE auto-binding check), so the fail-closed token-side branches are a defense-in-depth backstop rather than a reachable normal path.
+- **JWT-`sub` vs UserInfo-`sub` consistency check:** when `verify_jwt_claims = true` and the access token carries a `sub` claim, the module now requires it to match the `sub` the provider's UserInfo endpoint returns for the same Bearer token (extracted via a new `jwt_extract_claim_string()` helper). A present-but-mismatched or malformed `sub` aborts with `PAM_AUTH_ERR` (token-substitution suspected); a `sub` absent on either side is skipped with a log line, since providers legitimately differ. Both the extracted token `sub` and the rendered prompt buffer (user code + URIs) are now securely scrubbed (`secure_memzero()`) on every exit path, and `scripts/check-memory-scrubbing.sh` anchors the new sensitive buffers.
+- **PII-safe UserInfo logging:** DEBUG/VERBOSE logging of the UserInfo response no longer prints claim *values*. DEBUG logs the response size and the mapped claim field only; VERBOSE additionally lists claim *names* (capped at 32, with non-printable names withheld) so operators can discover the right `claim_regex` without identity data landing in syslog.
+
+### Fixed
+
+- **`[access]` user/group list capacity:** `allow_users`/`deny_users`/`allow_groups`/`deny_groups` are now 2048-byte fields (previously 256). Large production deny lists of local service accounts (commonly >500 bytes, e.g. most of `/etc/passwd`) previously failed config load with `Failed to parse key 'deny_users'` and aborted the login with `PAM_AUTH_ERR`. The matching scratch buffer in `identity.c` (`list_contains`) was raised to the same `ACCESS_LIST_LEN` bound in lockstep, so the longer lists still enforce correctly at runtime instead of silently failing to match.
+- **Scrub provider JSON trees on every release path:** the two token-poll re-parse
+  sites in `poll_for_access_token()` released the prior `tok_json` tree with a bare
+  `json_object_put(*tok_json)`; they now run `secure_zero_json_tree()` first. The
+  prior tree can only be a 4xx `authorization_pending`/`slow_down` error response
+  (a 2xx response always exits the loop, so no secrets are ever held), but the
+  scrub-before-release discipline now holds on every release path.
+  `scripts/check-memory-scrubbing.sh` (S3) now also matches
+  pointer/dereference forms (`json_object_put(*handle)`), closing the lexical
+  blind spot that left those exact release sites invisible to the gate.
+
+### Changed
+
+- **Provider `interval` clamping instead of hard failure:** a device-authorization response with `interval` above the supported maximum (120 s) — or below the RFC 8628 5 s floor — is now clamped into range with a syslog notice instead of aborting the login. RFC 8628 §3.5 only forbids polling *faster* than the server's interval; rejecting an over-long interval made the module incompatible with conservative providers. (E2E-covered via the sandbox; not unit-testable as it lives inside the HTTP-coupled device-request path.)
+- **Default `max_poll_seconds` lowered 300 → 120:** the shipped `config/pam_oidc_device.conf` default now matches the project's own PAM-safe guidance (60–120 s): RFC 8628 device-code lifetimes routinely exceed SSH `LoginGraceTime` and systemd PAM timeouts, so the module-side polling window must stay conservative. Existing deployments that explicitly set `max_poll_seconds` are unaffected.
+- **AI-agent docs restructure:** the root `AGENTS.md` is now a thin, canonical entry point
+  (copy-paste build/verify commands + three-tier boundaries) instead of a symlink to the full
+  context doc. Deep architecture, protocol guardrails, and reference/audit material remain in
+  `.agents/context.md`; every tool entry point (`CLAUDE.md`, `.github/copilot-instructions.md`,
+  `.clinerules`, `.cursorrules`, `.roorules`, `.windsurfrules`) is a symlink to the root
+  `AGENTS.md` (the Copilot file was previously a full duplicate and is now a link). Added
+  `.agents/plans/` scaffolding and eight `.agents/skills/` (four audit passes ported from
+  `.agents/context.md` §10, plus `release-bump`, `sanitizer-audit`, `add-c-module`, and
+  `run-e2e`). No module code, build, or packaging behavior changed.
+
+### Documentation
+
+- **PKCE verifier bias note:** `src/pkce.c` now documents why the CSPRNG draw is 48 bytes mapped 6 bits → 1 char (64 divides evenly into 384, no modulo bias; the earlier review's `%66`-style modulo-bias concern is a confirmed false positive for this code).
+
 ## [0.3.0] - 2026-11-11
 
 ### Added

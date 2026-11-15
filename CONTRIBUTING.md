@@ -13,7 +13,7 @@ clang-format --dry-run --Werror src/*.c include/*.h tests/*.c
 
 ## Static Analysis & Testing
 
-All PRs must pass the local lint gate, compile with zero warnings under **both** compilers, pass the CMocka suite, pass dynamic sanitizer analysis, and (on every push/PR to `main`) the EL8/EL9/EL10 RPM build plus the SUSE (openSUSE Leap 16.0) RPM and Debian 13 / Ubuntu 26.04 DEB native builds. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does. The loop below mirrors the gate set in `AGENTS.md` §3:
+All PRs must pass the local lint gate, compile with zero warnings under **both** compilers, pass the CMocka suite, pass dynamic sanitizer analysis, and (on every push/PR to `main`) the EL8/EL9/EL10 RPM build plus the SUSE (openSUSE Leap 16.0) RPM and Debian 13 / Ubuntu 26.04 DEB native builds. `make lint` runs clang-format + clang-tidy + cppcheck + flawfinder exactly as `.github/workflows/lint.yml` does. The loop below mirrors the gate set in `.agents/context.md` §3:
 
 ```bash
 # 1. Lint / static analysis (clang-format, clang-tidy, cppcheck, flawfinder)
@@ -29,8 +29,8 @@ make clean && make CC=clang && make test CC=clang
 #    NOT a CI gate — run it only as an optional fast pre-check.
 make test-sanitize CC=clang
 
-# 4. Packaging (CI's rpm-build job on EL8/EL9/EL10; distro-build.yml adds
-#    SUSE Leap 16.0 RPM + Debian 13 / Ubuntu 26.04 DEB)
+# 4. Packaging (CI's distro-build.yml: EL8/EL9/EL10 + SUSE Leap 16.0 RPM;
+#    Debian 13 / Ubuntu 26.04 DEB)
 make rpm          # EL/SUSE host with the spec's BuildRequires
 make deb          # Debian/Ubuntu host with dpkg-dev + build deps
 ```
@@ -65,9 +65,9 @@ docker run -it --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
   '
 ```
 
-(Or push your branch and let the GitHub Actions `ubuntu-latest` workflows — `lint.yml` and `build.yml` — run the authoritative gates. The `rpm-build` gate cannot be mirrored in the Ubuntu container — it requires an EL image such as `rockylinux:9` with `rpm-build` and `pam-devel`, as in `build.yml` — or simply run it in CI.)
+(Or push your branch and let the GitHub Actions `ubuntu-latest` workflows — `lint.yml`, `build.yml`, and `distro-build.yml` — run the authoritative gates. The `make rpm` gate cannot be mirrored in the Ubuntu container — it requires an EL image such as `rockylinux:9` with `rpm-build` and `pam-devel`, as in `distro-build.yml` — or simply run it in CI.)
 
-For PAM-independent logic you can still work locally: `brew install clang-format` for formatting, isolated stub-based compile checks under the project's strict warning flags, and decoding any new base64url JWT test fixtures in Python to confirm they encode the intended JSON. See `AGENTS.md` §3 (Non-Linux Hosts) for details.
+For PAM-independent logic you can still work locally: `brew install clang-format` for formatting, isolated stub-based compile checks under the project's strict warning flags, and decoding any new base64url JWT test fixtures in Python to confirm they encode the intended JSON. See `.agents/context.md` §3.3 (Non-Linux Hosts) for details.
 
 ## Pull Request Guidelines
 

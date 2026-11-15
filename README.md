@@ -16,47 +16,33 @@ Users authenticating over SSH are presented with a verification URL and standard
 
 ## How It Works
 
-The device flow delivers out-of-band multi-factor authentication without any
-client-side software on the login host:
+The device flow delivers out-of-band multi-factor authentication without any client-side software on the login host:
 
-1. **Login starts.** A user runs `ssh user@host`; the PAM `auth` stack invokes
-   `pam_oidc_device.so`.
-2. **Verification prompt.** The module requests a one-time user code from your
-   identity provider and displays the sign-in URL and code in the terminal
-   (optionally also as a scannable QR code).
-3. **User approves.** On a *second* device, the user opens the URL in a
-   browser, signs in to their OIDC account, and authorizes the login for this
-   host.
-4. **Module validates.** The module polls the token endpoint on a monotonic
-   clock, then validates the returned token and identity claims against the
-   local system user (plus optional group/role and JWT claim checks) before
-   completing the login — or fails closed, blocking it.
+1. **Login starts.** A user runs `ssh user@host`; the PAM `auth` stack invokes `pam_oidc_device.so`.
+2. **Verification prompt.** The module requests a one-time user code from your identity provider and displays the sign-in URL and code in the terminal (optionally also as a scannable QR code), then waits for you to press **Enter** to begin; the keystroke reliably flushes the prompt to OpenSSH keyboard-interactive clients, which otherwise buffer informational text until a prompt triggers a round-trip.
+3. **User approves.** On a *second* device, the user opens the URL in a browser, signs in to their OIDC account, and authorizes the login for this host.
+4. **Module validates.** The module polls the token endpoint on a monotonic clock — a stopwatch that only ever counts forward — so its timing stays accurate even if the system's wall-clock time is adjusted (e.g., via NTP or a manual time change). Once approved, it validates the returned token and identity claims against the local system user (plus optional group/role and JWT claim checks) before completing the login — or fails closed, blocking it.
 
-No passwords cross the wire in this flow, and no provider credentials live on
-the host beyond the `client_id`/`client_secret` in the root-only config file.
+No passwords cross the wire in this flow, and no provider credentials live on the host beyond the `client_id`/`client_secret` in the root-only config file.
 
 ---
 
 ## Key Features
 
-* **Standard RFC 8628 Flow:** Monotonic clock polling (`CLOCK_MONOTONIC`), resilient backoff for transient network errors, and real-time prompt streaming over SSH `keyboard-interactive` sessions. The module polls immediately after displaying the sign-in instructions — no Enter keypress is required — so approval is detected the moment it happens on the second device.
+* **Standard RFC 8628 Flow:** Monotonic-clock (`CLOCK_MONOTONIC`) polling immune to wall-clock time adjustments, resilient backoff for transient network errors, and real-time prompt streaming over SSH `keyboard-interactive` sessions. The first token poll fires immediately once you press Enter, so approval on the second device is detected the moment polling begins — even if it happened while the confirmation prompt was still waiting.
 * **PKCE (RFC 7636):** Optional S256 code-verifier/code-challenge pairs bind the token exchange to the originating device-flow attempt; enabled via `use_pkce = true|false|auto` (`auto` probes the provider's discovery document once and fails safe to off).
 * **Flexible Claim Mapping:** Extract local system usernames from OIDC UserInfo claims (`sub`, `preferred_username`, etc.) using POSIX Extended Regular Expressions.
 * **Pre-Flight Access Controls:** Reject unauthorized local accounts *before* contacting the identity provider, limiting identity mapping risks.
 * **Group & Role Authorization:** Restrict access to users belonging to specific provider groups or roles.
-* **Terminal QR Sign-in:** Opt-in `[qr]` section renders the device-flow sign-in URL as a scannable QR code on TTY logins so users can open it with a phone camera; authentication never depends on the QR — when it is disabled or rendering fails, the plain text prompt is still shown.
-* **Sign-In Confirmation:** The module shows the sign-in URL and code, then waits for the user to press Enter before polling the token endpoint begins. This round-trip flushes the prompt to OpenSSH keyboard-interactive clients, which buffer `PAM_TEXT_INFO` until a prompt triggers a `USERINFO` round-trip, and ensures the user has had time to note the URL and code on a secondary device.
+* **Terminal QR Sign-In:** Opt-in `[qr]` section renders the device-flow sign-in URL as a scannable QR code on TTY logins so users can open it with a phone camera; authentication never depends on the QR — when it is disabled or rendering fails, the plain text prompt is still shown.
+* **Sign-In Confirmation:** The module shows the sign-in URL and code, then waits for a single Enter before polling the token endpoint begins — giving you time to note the URL and code on a secondary device.
 * **Security & Memory Hardening:** Zeroes sensitive memory buffers in process RAM (`secure_memzero`), enforces strict root ownership (`0600`/`0640` permissions), and sanitizes terminal output against ANSI escape sequence injection.
 
 ---
 
 ## Quickstart
 
-Deploy `pam_oidc_device` in 4 steps. The complete walkthrough — prerequisites,
-provider configuration values, `authselect` on Enterprise Linux, and
-logging — lives in the [Getting Started guide](docs/getting-started.md); to
-install a prebuilt RPM/DEB instead of compiling, see
-[Building RPM & DEB Packages](docs/packaging.md).
+Deploy `pam_oidc_device` in 4 steps. The complete walkthrough — prerequisites, provider configuration values, `authselect` on Enterprise Linux, and logging — lives in the [Getting Started guide](docs/getting-started.md); to install a prebuilt RPM/DEB instead of compiling, see [Building RPM & DEB Packages](docs/packaging.md).
 
 ### Step 1: Install the Module
 
@@ -98,6 +84,7 @@ Create or edit `/etc/pam_oidc_device.conf`. Ensure the file is owned by `root:ro
 ```ini
 [oauth]
 client_id = your-oauth-client-id
+# client_secret = your-oauth-client-secret   # only for confidential clients (leave unset for public clients)
 device_authorization_endpoint = https://auth.example.com/oauth2/v2.0/devicecode
 token_endpoint = https://auth.example.com/oauth2/v2.0/token
 userinfo_endpoint = https://auth.example.com/oauth2/v2.0/userinfo
@@ -112,15 +99,14 @@ case_sensitive = false
 
 [runtime]
 loglevel = info
-max_poll_seconds = 300
+max_poll_seconds = 120
 
 [prompt]
 # Optional custom prompt template (printable ASCII; use \n for newlines).
-# init_message = Sign in at {verification_uri} with code {user_code}
+# init_message = Sign in at {url} with code {code}   # placeholders: {url}, {url_complete}, {code}
 
 [qr]
 # Optional: render the sign-in URL as a scannable QR code on TTY logins (phone-camera friendly).
-# When disabled or rendering fails, the plain text prompt is still displayed.
 enabled = false
 style = utf8        # or ascii for minimal/legacy fonts (pair with: block_char = #)
 # scale = 1         # 1-3 module enlargement
@@ -164,15 +150,7 @@ auth        include       postlogin
 ```
 
 > [!WARNING]
-> **Use `required` (or `requisite`), not `sufficient`.** `pam_oidc_device.so` fails for any
-> reason a device-flow login can't complete — a rejected user code, a claim/identity mismatch,
-> a network/IdP error, or an invalid `/etc/pam_oidc_device.conf`. With `sufficient`, that
-> failure does **not** block login: PAM moves on to the next module and can authenticate the
-> user through your fallback method **without ever completing the OIDC flow**. `required` /
-> `requisite` keeps the module fail-closed so a misconfiguration can't silently downgrade
-> authentication. See [Getting Started §5](docs/getting-started.md) for the full
-> discussion, and §6 for keeping the integration across `authselect` profile
-> re-applications on Enterprise Linux.
+> **Use `required` (or `requisite`), not `sufficient`.** If `pam_oidc_device.so` fails for any reason — a rejected user code, a claim/identity mismatch, a network/IdP error, or an invalid `/etc/pam_oidc_device.conf` — a device-flow login can't complete, and with `sufficient` that failure does **not** block login: PAM moves on to the next module and can authenticate the user through your fallback method **without ever completing the OIDC flow**. `required` / `requisite` keeps the module fail-closed so a misconfiguration can't silently downgrade authentication. See [Getting Started §5](docs/getting-started.md) for the full discussion, and §6 for keeping the integration across `authselect` profile re-applications on Enterprise Linux.
 
 ---
 
@@ -199,7 +177,7 @@ For a complete security analysis, attack vector breakdown, and trust boundary ma
 
 * **Zero Disk Footprint:** OAuth device codes, tokens, and response bodies are never written to disk or swap files.
 * **Volatile Memory Scrubbing:** Module-owned secret materials (client secrets, access/refresh tokens, decoded JSON payload fields) are explicitly zeroed out in process RAM via `secure_memzero` before memory is released.
-* **Terminal Injection Defense:** URL endpoints and user verification codes are validated (`is_valid_https_url`, `is_safe_user_code`) before display, and the fully rendered prompt is validated line-by-line (`is_safe_terminal_string`, newline-tolerant) before it reaches the user's terminal, to prevent ANSI sequence and control-character injection. Custom `init_message` templates are therefore limited to printable ASCII with escaped `\n` newlines.
+* **Terminal Injection Defense:** URL endpoints and user verification codes are validated (`is_valid_https_url`, `is_safe_user_code`) before display, and the fully rendered prompt is validated line-by-line (`is_safe_terminal_string`, newline-tolerant) before it reaches the user's terminal to prevent ANSI sequence and control-character injection. Custom `init_message` templates are therefore limited to printable ASCII with escaped `\n` newlines.
 * **User Code Format:** Verification codes are displayed exactly as issued by the identity provider. The RFC 8628 §3.1 recommendations on code character sets (consonant-only base-20 or pure-numeric sets, omission of visually ambiguous characters) and chunked display formatting are server-side choices, so the module does not reject or reformat codes to enforce them — it applies terminal-safety filtering only.
 * **Client Authentication:** `client_id`/`client_secret` are transmitted as form-encoded request-body parameters (the RFC 6749 §2.3.1 `client_secret_post` pattern). The `client_secret_basic` (HTTP Basic `Authorization`) client-authentication method is not supported — the identity provider must accept body-posted client secrets.
 
@@ -215,15 +193,13 @@ To trace live logins and troubleshoot issues:
 sudo journalctl -f -u sshd | grep pam_oidc_device
 ```
 
-To enable detailed tracing, set `loglevel = debug` or `loglevel = verbose` in the `[runtime]` section of `/etc/pam_oidc_device.conf`.
+To enable detailed tracing temporarily, set `loglevel = debug` or `loglevel = verbose` in the `[runtime]` section of `/etc/pam_oidc_device.conf`.
 
 ---
 
 ## Third-Party Components & Licenses
 
-The module's own code is MIT-licensed. It vendors exactly one third-party component —
-**Project Nayuki's QR Code generator (C edition, MIT)** — and otherwise links against standard
-system libraries that ship as distribution packages:
+The module's own code is MIT-licensed. It vendors exactly one third-party component — **Project Nayuki's QR Code generator (C edition, MIT)** — and otherwise links against standard system libraries that ship as distribution packages:
 
 | Component | Role | License |
 | --- | --- | --- |
@@ -234,10 +210,7 @@ system libraries that ship as distribution packages:
 | OpenSSL | Runtime system library | Apache-2.0 |
 | CMocka | Build/test only — never shipped | Apache-2.0 |
 
-Full licensing, provenance pins, local-deviation records, and the license-audit procedure are
-maintained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and checked automatically in CI
-(the [license audit workflow](.github/workflows/license-audit.yml) plus the
-[vendor drift audit](.github/workflows/vendor-audit.yml)).
+Full licensing, provenance pins, local-deviation records, and the license-audit procedure are maintained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and checked automatically in CI (the [license audit workflow](.github/workflows/license-audit.yml) plus the [vendor drift audit](.github/workflows/vendor-audit.yml)).
 
 ---
 

@@ -347,6 +347,13 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
 #define DEVICE_CODE_MAX_LEN 2048
 
 /*
+ * Capacity (bytes, including the terminating NUL) of the stack buffer holding
+ * the JWT 'sub' claim for the JWT-sub vs UserInfo-sub consistency check.
+ * OIDC Core caps 'sub' at 255 ASCII characters, so 256 = 255 + NUL.
+ */
+#define JWT_SUB_CLAIM_MAX 256
+
+/*
  * Result of a successful device-authorization request (RFC 8628 s3.1/s3.2).
  * The verification_uri / verification_uri_complete / user_code members are
  * BORROWED from the *dev_json tree parsed by request_device_authorization()
@@ -364,6 +371,35 @@ typedef struct {
 } device_auth_t;
 
 /**
+ * @brief RFC 8628 s3.5 `slow_down` poll-interval adjustment.
+ *
+ * The provider asks for polling 5 s less frequently: bump the interval by 5 s,
+ * clamped to `MAX_SUPPORTED_POLL_INTERVAL` (an interval already at — or within
+ * 5 s of — the supported maximum stays at the maximum). Extracted from the
+ * polling loop so the arithmetic is unit-testable.
+ *
+ * @param[in] interval Current poll interval in seconds (>= `MIN_POLL_INTERVAL`).
+ * @return Next poll interval in seconds.
+ */
+int poll_interval_after_slow_down(int interval) {
+    return (interval > MAX_SUPPORTED_POLL_INTERVAL - 5) ? MAX_SUPPORTED_POLL_INTERVAL : interval + 5;
+}
+
+/**
+ * @brief Transient-error (HTTP 429/5xx or cURL transport error) poll-interval backoff.
+ *
+ * Double the interval, clamped to `MAX_SUPPORTED_POLL_INTERVAL` (an interval
+ * already more than half the supported maximum stays at the maximum).
+ * Extracted from the polling loop so the arithmetic is unit-testable.
+ *
+ * @param[in] interval Current poll interval in seconds (>= `MIN_POLL_INTERVAL`).
+ * @return Next poll interval in seconds.
+ */
+int poll_interval_after_transient(int interval) {
+    return (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
+}
+
+/**
  * @brief RFC 8628 s3.1/s3.2 device-authorization request phase.
  *
  * Builds and POSTs the device-authorization request, then parses and validates
@@ -371,7 +407,10 @@ typedef struct {
  * expiry) and computes the monotonic polling deadline. The network/JSON
  * resources (the cURL-escaped request body, the HTTP response, and the parsed
  * JSON tree) are stored in caller-owned storage so the caller's single
- * `cleanup` path releases and scrubs them.
+ * `cleanup` path releases and scrubs them. This function performs NO local
+ * teardown of its own: every return path (success or failure) must leave all
+ * allocated resources in the caller-owned out-parameters, so do not introduce
+ * function-local allocations here.
  *
  * @param[in] pamh           PAM framework handle (may be NULL in unit tests).
  * @param[in] cfg            Loaded module configuration.
@@ -501,11 +540,15 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
     }
 
     if (interval > MAX_SUPPORTED_POLL_INTERVAL) {
+        /* RFC 8628 §3.5 only forbids polling FASTER than the advertised interval;
+         * an unusually long interval is safe to honor, so clamp to the supported
+         * maximum instead of failing the authentication attempt. */
         if (pamh) {
-            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Provider poll interval %d exceeds supported maximum", interval);
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_WARNING,
+                          "Provider poll interval %ds exceeds supported maximum; clamping to %ds", interval,
+                          MAX_SUPPORTED_POLL_INTERVAL);
         }
-        return PAM_SERVICE_ERR;
+        interval = MAX_SUPPORTED_POLL_INTERVAL;
     }
 
     int expires_in = (j_exp && json_object_is_type(j_exp, json_type_int)) ? json_object_get_int(j_exp) : 300;
@@ -540,7 +583,10 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
  * issuance, expiration, denial, or an unrecoverable error. As with
  * request_device_authorization(), the network/JSON resources are stored in
  * caller-owned storage so the caller's single `cleanup` path releases and
- * scrubs them.
+ * scrubs them. This function performs NO local teardown of its own: every
+ * return path (success or failure) must leave all allocated resources in the
+ * caller-owned out-parameters, so do not introduce function-local
+ * allocations here.
  *
  * @param[in] pamh            PAM framework handle (may be NULL in unit tests).
  * @param[in] cfg             Loaded module configuration.
@@ -677,12 +723,19 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                  * JSON object, or an HTML error page returned by a proxy/load balancer. Back off and
                  * retry within the device-authorization deadline instead of aborting authentication.
                  */
-                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
+                interval = poll_interval_after_transient(interval);
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                               "Transient HTTP status %ld from token endpoint; backing off poll interval to %ds",
                               token_resp->status_code, interval);
             } else if (token_resp->status_code >= 200 && token_resp->status_code < 300 && token_resp->body) {
                 if (*tok_json) {
+                    /*
+                     * The prior tree can only be a 4xx `authorization_pending`/`slow_down` error
+                     * response (a 2xx response always exits the loop), so it holds no secrets — but
+                     * the scrub-before-release discipline holds on every release path, matching the
+                     * `cleanup` section in pam_sm_authenticate().
+                     */
+                    secure_zero_json_tree(*tok_json);
                     json_object_put(*tok_json);
                 }
                 *tok_json = json_tokener_parse(token_resp->body);
@@ -744,6 +797,9 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                  * is also treated as definitive.
                  */
                 if (*tok_json) {
+                    /* Scrub-before-release, same discipline as the 2xx re-parse above; the prior tree
+                     * is only ever the previous poll's 4xx error response (non-sensitive). */
+                    secure_zero_json_tree(*tok_json);
                     json_object_put(*tok_json);
                 }
                 *tok_json = json_tokener_parse(token_resp->body);
@@ -756,8 +812,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                         pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Token endpoint returned error: %s",
                                       err);
                         if (strcmp(err, "slow_down") == 0) {
-                            interval = (interval > MAX_SUPPORTED_POLL_INTERVAL - 5) ? MAX_SUPPORTED_POLL_INTERVAL
-                                                                                    : interval + 5;
+                            interval = poll_interval_after_slow_down(interval);
                             pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                                           "Adjusted poll interval to %ds after slow_down", interval);
                         } else if (strcmp(err, "authorization_pending") != 0) {
@@ -784,7 +839,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
             if (token_resp->curl_code == CURLE_OPERATION_TIMEDOUT || token_resp->curl_code == CURLE_COULDNT_CONNECT ||
                 token_resp->curl_code == CURLE_COULDNT_RESOLVE_HOST ||
                 token_resp->curl_code == CURLE_COULDNT_RESOLVE_PROXY || token_resp->curl_code == CURLE_GOT_NOTHING) {
-                interval = (interval > MAX_SUPPORTED_POLL_INTERVAL / 2) ? MAX_SUPPORTED_POLL_INTERVAL : interval * 2;
+                interval = poll_interval_after_transient(interval);
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                               "Transient cURL error (%d); backing off poll interval to %ds", token_resp->curl_code,
                               interval);
@@ -826,8 +881,10 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
  *    denial (see poll_for_access_token()).
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
- * 8. Logs a redacted UserInfo receipt record (size + claim field) at debug level; the full claim payload
- *    is logged only at verbose (troubleshooting) level to keep PII out of routine logs.
+ * 8. Logs a PII-safe UserInfo receipt record (size + claim field) at debug level; the
+ *    troubleshooting (verbose) level additionally lists claim NAMES only — claim values are
+ *    never logged. When local JWT inspection is enabled, the JWT `sub` claim is also
+ *    cross-checked against the UserInfo `sub` claim (token-substitution defense).
  * 9. Verifies user identity claim against `PAM_USER` via `verify_claim`.
  * 10. Evaluates group membership via `verify_group_membership` if enabled and returns `PAM_PERM_DENIED` on denial.
  * 11. Zeroes sensitive credentials in RAM and releases memory allocations.
@@ -861,6 +918,11 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
     char code_challenge[PKCE_S256_CHALLENGE_LEN + 1];
     memset(code_challenge, 0, sizeof(code_challenge));
+
+    /* JWT 'sub' claim for the JWT-sub vs UserInfo-sub consistency check
+     * (Step 7b); scrubbed unconditionally at `cleanup` below. */
+    char jwt_sub[JWT_SUB_CLAIM_MAX];
+    memset(jwt_sub, 0, sizeof(jwt_sub));
 
     http_response_t resp;
     memset(&resp, 0, sizeof(resp));
@@ -975,7 +1037,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
-    /* Step 4: Display instructions and verification code to client terminal */
+    /* Step 4: Display instructions and verification code to client terminal. The
+     * rendered prompt embeds the user code and verification URIs; the stack buffer
+     * is scrubbed unconditionally at `cleanup` like the other sensitive material. */
     char prompt_buf[MAX_INIT_MSG_LEN];
     if (render_prompt_message(&cfg, dev.verification_uri, dev.verification_uri_complete, dev.user_code, prompt_buf,
                               sizeof(prompt_buf)) != 0) {
@@ -1077,15 +1141,52 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
-    /* Redacted PII-safe UserInfo audit log at LOGLEVEL_DEBUG: the raw claim payload
-     * contains personal data (emails, phone numbers, group memberships) and must not
-     * be persisted to the system log at the routine debug level. The full payload is
-     * emitted only at LOGLEVEL_VERBOSE, the troubleshooting level. */
+    /* PII-safe UserInfo audit logging: the raw claim payload contains personal
+     * data (emails, phone numbers, group memberships) and must never be
+     * persisted to the system log. Routine logging (DEBUG) records only the
+     * payload size and the configured claim field; the troubleshooting level
+     * (VERBOSE) additionally lists the claim NAMES returned by the provider —
+     * enough to debug claim-field configuration — without logging any claim
+     * VALUES. */
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                   "UserInfo claim payload received: %zu bytes, claim field '%s' present", userinfo_resp.size,
                   cfg.claim_field);
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim payload received: %s",
-                  userinfo_resp.body);
+    {
+        struct json_object_iter it;
+        /* Cap the claim-name listing; larger payloads get a summary line
+         * instead. json_object_object_length() returns int on older json-c
+         * (EL8/EL9) and size_t on newer releases, so capture through an
+         * explicit long and range-check it; both the total and the remaining
+         * budget stay opaque runtime values, so the budget check below is
+         * not statically foldable. */
+        const long claims_raw = (long)json_object_object_length(uinfo_json);
+        const size_t total_claims = (claims_raw > 0) ? (size_t)claims_raw : 0;
+        size_t names_left = (total_claims < 32) ? total_claims : 32;
+        json_object_object_foreachC(uinfo_json, it) {
+            if (names_left == 0) {
+                break;
+            }
+            int name_safe = 1;
+            for (const char *p = it.key; p && *p != '\0'; p++) {
+                if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
+                    name_safe = 0;
+                    break;
+                }
+            }
+            if (name_safe) {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim present: '%s'",
+                              it.key);
+            } else {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
+                              "UserInfo claim present: (name contains non-printable bytes; withheld)");
+            }
+            names_left--;
+        }
+        if (total_claims > 32) {
+            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
+                          "UserInfo claim list truncated: 32 of %zu claim names shown", total_claims);
+        }
+    }
 
     struct json_object *j_claim = NULL;
     if (!json_object_object_get_ex(uinfo_json, cfg.claim_field, &j_claim) || !j_claim ||
@@ -1094,6 +1195,45 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                       "UserInfo response missing string claim field '%s'", cfg.claim_field);
         retval = PAM_AUTH_ERR;
         goto cleanup;
+    }
+
+    /* Step 7b: JWT-sub vs UserInfo-sub consistency check (token-substitution
+     * defense). When local JWT claim inspection is enabled and the access
+     * token carries a 'sub' claim, it must match the UserInfo 'sub': the
+     * UserInfo exchange is the module's only authoritative token
+     * validity/signature check, and on multi-audience IdPs a token minted
+     * for a different client could otherwise authorize the wrong subject. A
+     * missing 'sub' on either side is skipped (logged; providers differ),
+     * while a present-but-mismatched or malformed 'sub' fails closed. */
+    if (cfg.verify_jwt_claims) {
+        int sub_rc = jwt_extract_claim_string(access_token, "sub", jwt_sub, sizeof(jwt_sub));
+        if (sub_rc == 0) {
+            struct json_object *j_uinfo_sub = NULL;
+            if (json_object_object_get_ex(uinfo_json, "sub", &j_uinfo_sub) && j_uinfo_sub &&
+                json_object_is_type(j_uinfo_sub, json_type_string)) {
+                if (strcmp(jwt_sub, json_object_get_string(j_uinfo_sub)) != 0) {
+                    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                  "JWT subject does not match UserInfo subject for user '%s' "
+                                  "(token substitution suspected)",
+                                  pam_user);
+                    retval = PAM_AUTH_ERR;
+                    goto cleanup;
+                }
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                              "JWT subject matches UserInfo subject for user '%s'", pam_user);
+            } else {
+                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_WARNING,
+                              "UserInfo response carries no string 'sub' claim; JWT subject consistency check skipped");
+            }
+        } else if (sub_rc == 1) {
+            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                          "Access token carries no 'sub' claim; JWT subject consistency check skipped");
+        } else {
+            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Malformed 'sub' claim in access token for user '%s'", pam_user);
+            retval = PAM_AUTH_ERR;
+            goto cleanup;
+        }
     }
 
     /* Step 8: Verify identity claim against requesting PAM user */
@@ -1164,6 +1304,11 @@ cleanup:
     secure_memzero(&dev, sizeof(dev));
     secure_memzero(code_verifier, sizeof(code_verifier));
     secure_memzero(code_challenge, sizeof(code_challenge));
+    /* prompt_buf embeds the user code and verification URIs; jwt_sub holds the
+     * JWT subject identifier. Both are sensitive display/identity material and
+     * are scrubbed unconditionally, like every other secret above. */
+    secure_memzero(prompt_buf, sizeof(prompt_buf));
+    secure_memzero(jwt_sub, sizeof(jwt_sub));
     secure_memzero(&cfg, sizeof(cfg));
 
     if (curl) {

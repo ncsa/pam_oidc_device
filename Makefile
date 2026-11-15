@@ -12,12 +12,18 @@
 #     make VERSION=0.3.0
 # Keep these in sync with include/metadata.h when the metadata changes.
 NAME        ?= pam_oidc_device
-VERSION     ?= 0.3.0
+VERSION     ?= 0.3.1
 DESCRIPTION ?= PAM authentication module for OAuth 2.0 Device Authorization Grant
 
 CC ?= gcc
 CPPFLAGS += -Iinclude -D_GNU_SOURCE
-CFLAGS ?= -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
+# -D_FORTIFY_SOURCE=2 (not 3): level 3 is only honored by glibc >= 2.39 / GCC 12+;
+# on EL8/EL9 (glibc 2.28/2.34) glibc emits
+#   #warning _FORTIFY_SOURCE > 2 is treated like 2 on this platform
+# which is fatal under the CI zero-warning bar (-Werror). Level 2 is the maximum
+# universally-supported level and the project's documented hardening target
+# (`.agents/context.md` §10.3), and it builds warning-free on every target distro.
+CFLAGS ?= -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
           -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wformat-security -fPIE -O2 -g
 # NOTE: no -pie at link time. -pie is an *executable* link flag: with -shared
 # the gcc driver still pulls in the executable CRT start file (Scrt1.o), whose
@@ -64,7 +70,7 @@ build: $(TARGET)
 lint:
 	./scripts/lint.sh
 
-# Memory-management inspection (AGENTS.md §4.1): verifies that sensitive
+# Memory-management inspection (`.agents/context.md` §4.1): verifies that sensitive
 # buffers (tokens, secrets, PKCE material, HTTP response bodies, JSON PII
 # trees) are zeroed with secure_memzero()/explicit_bzero()/
 # secure_zero_json_tree() before every release (free()/json_object_put()).
@@ -104,10 +110,18 @@ src/%.o: src/%.c
 	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 # Vendored third-party code (Nayuki QR Code generator) is kept outside src/ so it
-# is not subject to the project's lint/static-analysis gates; it is still
-# compiled with the full warning CFLAGS.
+# is not subject to the project's lint/static-analysis gates. It is compiled with
+# the hardening flags and basic warnings, but deliberately NOT held to the
+# project's strict -Wconversion / -Wpedantic / -Werror bar: the upstream code
+# predates those checks, and its int->uint8_t module-bit writes
+# (setModuleBounded) trip -Wconversion on older compilers (EL8's GCC 8), where
+# -Werror would otherwise break the build. Dropping the strict warning set and
+# EXTRA_CFLAGS for this one TU keeps upstream pristine (preserving the
+# in-directory drift audit) while -fstack-protector-strong / -D_FORTIFY_SOURCE=2
+# / -fPIE / -O2 preserve the same code hardening the rest of the module gets.
+QR_CFLAGS = -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wall -Wextra -fPIE -O2 -g
 third_party/qrcodegen/%.o: third_party/qrcodegen/%.c
-	$(CC) -fPIC $(CPPFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+	$(CC) -fPIC $(CPPFLAGS) $(QR_CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
 	$(CC) -shared $(LDFLAGS) -o $@ $^ $(LIBS)

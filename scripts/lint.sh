@@ -8,7 +8,7 @@
 #
 #   1. clang-format  --dry-run --Werror   src/*.c include/*.h tests/*.c
 #   2. clang-tidy    src/*.c -- -Iinclude -D_GNU_SOURCE
-#   3. cppcheck      --enable=all ... src/
+#   3. cppcheck      --enable=warning,style,performance,portability ... src/
 #   4. flawfinder    --minlevel=3 --error-level=3 src/ include/
 #   5. check-memory-scrubbing.sh          (sensitive-buffer scrub discipline)
 #
@@ -69,10 +69,17 @@ fi
 
 # --- 3. cppcheck (standalone parser; no system headers required) ------------
 if command -v cppcheck >/dev/null 2>&1; then
-  note "cppcheck --enable=all --std=c99 -I include/ src/  (CI flags)"
-  if ! cppcheck --enable=all \
+  note "cppcheck --enable=warning,style,performance,portability --std=c99 -I include/ src/  (CI flags)"
+  # Not --enable=all: newer cppcheck emits information-level diagnostics
+  # (checkersReport, normalCheckLevelMaxBranches) that --error-exitcode=1 would
+  # treat as failures. error-severity checks are always enabled regardless.
+  if ! cppcheck --enable=warning \
+        --enable=style \
+        --enable=performance \
+        --enable=portability \
         --suppress=missingIncludeSystem \
         --suppress=unusedFunction \
+        --suppress=staticFunction \
         --suppress=constParameterCallback \
         --error-exitcode=1 \
         --std=c99 \
