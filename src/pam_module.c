@@ -341,6 +341,39 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
 }
 
 /*
+ * Plain-text, user-facing failure notices delivered through the PAM conversation
+ * (`PAM_TEXT_INFO`) so a failed attempt never ends in an unexplained
+ * "permission denied" (accessibility: clear, actionable error feedback).
+ *
+ * Wording is deliberately generic: it identifies the class of failure and the
+ * next action without revealing *which* security control rejected the attempt
+ * (deny-list membership, claim-mismatch detail, group-policy specifics, ...) —
+ * those details remain in the audit log only. The strings are static,
+ * compile-time constants and contain only printable ASCII.
+ *
+ * Delivery is best-effort (a `pam_prompt` failure is intentionally ignored):
+ * on a degraded conversation the notice is simply not shown, and it must never
+ * change the authentication outcome. OpenSSH keyboard-interactive clients may
+ * additionally buffer `PAM_TEXT_INFO` until a prompt round-trip, so SSH clients
+ * are not guaranteed to display it; local console logins are.
+ */
+static const char *const USER_NOTICE_SERVICE =
+    "Sign-in could not be completed: the identity provider service is unavailable.\n"
+    "Please try again, or contact your system administrator if the problem persists.\n";
+static const char *const USER_NOTICE_DENIED =
+    "Authentication was denied for this account.\n"
+    "Please contact your system administrator if you believe this is an error.\n";
+static const char *const USER_NOTICE_EXPIRED =
+    "Sign-in was not approved in time: the sign-in code expired or the identity provider\n"
+    "service became unavailable. Please sign in again to start a new session.\n";
+
+static void notify_user_failure(pam_handle_t *pamh, const char *msg) {
+    if (pamh && msg != NULL) {
+        (void)pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", msg);
+    }
+}
+
+/*
  * Maximum length (bytes, including the terminating NUL) of the provider-issued
  * RFC 8628 device_code.
  */
@@ -957,6 +990,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Failed to initialize global cURL environment");
         }
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         return PAM_SERVICE_ERR;
     }
 
@@ -975,6 +1009,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     /* Step 2: Load and validate module configuration */
     if (load_config(config_file, &cfg, pamh) != 0) {
         retval = PAM_SERVICE_ERR;
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
     if (loglevel_override != LOGLEVEL_UNSET) {
@@ -986,6 +1021,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     if (!verify_user_access(pam_user, &cfg, pamh)) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Authentication refused for user '%s': account blocked by allow/deny user lists", pam_user);
+        notify_user_failure(pamh, USER_NOTICE_DENIED);
         retval = PAM_PERM_DENIED;
         goto cleanup;
     }
@@ -1008,6 +1044,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     if (!curl) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to initialize cURL handle");
         retval = PAM_BUF_ERR;
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
 
@@ -1022,6 +1059,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Failed to generate PKCE code verifier or S256 challenge");
             retval = PAM_SERVICE_ERR;
+            notify_user_failure(pamh, USER_NOTICE_SERVICE);
             goto cleanup;
         }
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
@@ -1034,6 +1072,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     retval = request_device_authorization(pamh, &cfg, active_loglevel, pkce_active, code_challenge, curl, &dev, &resp,
                                           &dev_json, &postfields);
     if (retval != PAM_SUCCESS) {
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
 
@@ -1047,6 +1086,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to render prompt message");
         }
         retval = PAM_SERVICE_ERR;
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
 
@@ -1107,6 +1147,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     retval = poll_for_access_token(pamh, &cfg, active_loglevel, pam_user, &dev, code_verifier, pkce_active, curl,
                                    &token_resp, &tok_json, &access_token, &token_postfields);
     if (retval != PAM_SUCCESS) {
+        /* User-initiated cancellation (Ctrl-C) gets no notice — the user already knows. */
+        if (retval != PAM_ABORT) {
+            notify_user_failure(pamh, USER_NOTICE_EXPIRED);
+        }
         goto cleanup;
     }
 
@@ -1117,6 +1161,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "JWT claim inspection failed for user '%s'",
                           pam_user);
             retval = PAM_AUTH_ERR;
+            notify_user_failure(pamh, USER_NOTICE_DENIED);
             goto cleanup;
         }
     }
@@ -1131,6 +1176,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "UserInfo query failed (HTTP status %ld)",
                       userinfo_resp.status_code);
         retval = PAM_AUTHINFO_UNAVAIL;
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
 
@@ -1138,6 +1184,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     if (!uinfo_json || !json_object_is_type(uinfo_json, json_type_object)) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Invalid JSON response from UserInfo endpoint");
         retval = PAM_SERVICE_ERR;
+        notify_user_failure(pamh, USER_NOTICE_SERVICE);
         goto cleanup;
     }
 
@@ -1216,6 +1263,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
                                   "JWT subject does not match UserInfo subject for user '%s' "
                                   "(token substitution suspected)",
                                   pam_user);
+                    notify_user_failure(pamh, USER_NOTICE_DENIED);
                     retval = PAM_AUTH_ERR;
                     goto cleanup;
                 }
@@ -1232,6 +1280,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Malformed 'sub' claim in access token for user '%s'", pam_user);
             retval = PAM_AUTH_ERR;
+            notify_user_failure(pamh, USER_NOTICE_DENIED);
             goto cleanup;
         }
     }
@@ -1243,6 +1292,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Authentication failed for user '%s': claim verification failed", pam_user);
         retval = PAM_AUTH_ERR;
+        notify_user_failure(pamh, USER_NOTICE_DENIED);
         goto cleanup;
     }
 
@@ -1251,6 +1301,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Group authorization denied for user '%s': group/role allow/deny lists not satisfied", pam_user);
         retval = PAM_PERM_DENIED;
+        notify_user_failure(pamh, USER_NOTICE_DENIED);
         goto cleanup;
     }
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Group authorization succeeded for user '%s'",

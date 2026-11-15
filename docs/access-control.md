@@ -6,6 +6,13 @@ The optional `[access]` section in `/etc/pam_oidc_device.conf` provides fine-gra
 
 These controls limit the blast radius of overly permissive claim regular expressions (`claim_regex`) and prevent unauthorized system access.
 
+## Table of Contents
+
+* [Configuration Reference](#configuration-reference)
+* [1. Local Account Filtering (`allow_users` / `deny_users`)](#1-local-account-filtering-allow_users--deny_users)
+* [2. Group & Role Authorization (`allow_groups` / `deny_groups`)](#2-group--role-authorization-allow_groups--deny_groups)
+* [Complete Example](#complete-example)
+
 ---
 
 ## Configuration Reference
@@ -58,9 +65,9 @@ allow_users = alice, bob
 deny_users = root
 ```
 
-* User `alice` → Allowed to proceed to OIDC polling.
-* User `root` → Immediately denied (`PAM_PERM_DENIED`), no HTTP network traffic generated.
-* User `eve` → Denied (not listed in `allow_users`).
+* User `alice` is allowed to proceed to OIDC polling.
+* User `root` is immediately denied (`PAM_PERM_DENIED`); no HTTP network traffic is generated.
+* User `eve` is denied (not listed in `allow_users`).
 
 ---
 
