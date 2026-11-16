@@ -12,7 +12,7 @@
 #     make VERSION=0.3.0
 # Keep these in sync with include/metadata.h when the metadata changes.
 NAME        ?= pam_oidc_device
-VERSION     ?= 0.3.1
+VERSION     ?= 0.3.2
 DESCRIPTION ?= PAM authentication module for OAuth 2.0 Device Authorization Grant
 
 CC ?= gcc
@@ -57,7 +57,7 @@ CONFIG_DEFAULT = config/$(NAME).conf
 PAM_DIR ?= /lib64/security
 CONFIG_DIR ?= /etc
 
-.PHONY: all build lint check-scrub check-licenses sanitize test test-sanitize sandbox sandbox-shell install uninstall clean rpm deb
+.PHONY: all build lint check-scrub check-licenses sanitize test test-sanitize fuzz-preflight fuzz fuzz-build sandbox sandbox-shell install uninstall clean rpm deb
 
 all: build
 
@@ -159,6 +159,91 @@ test-sanitize:
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(SAN_RUNNER)
 	@rm -rf build/sanitize
+
+# ---------------------------------------------------------------------------
+# Fuzzing (OPT-IN; not part of `make lint` and not run by any CI workflow).
+#
+# Builds and runs clang/libFuzzer crash/UB/leak harnesses over the module's
+# pure, input-parsing leaf functions (config parser, JWT base64url/claim
+# extraction, token-metadata checks, the terminal/URL string guards, regex
+# claim verification, and the PKCE S256 challenge). Each harness re-instruments
+# the module sources under ASan+UBSan+LSan -- the same sanitizer set as
+# `make test-sanitize` -- and drives a single function with fuzzer-generated
+# bytes. See tests/fuzz/README.md for rationale and crash triage.
+#
+# Usage:
+#   make fuzz                  # build + run every harness (FUZZ_MAX_TIME s each)
+#   make fuzz FUZZ_MAX_TIME=300 FUZZ_TARGETS=config   # one harness, longer
+#   make fuzz-build            # compile the harnesses only (no run)
+#
+# Requires clang (libFuzzer is clang-native) plus the same dev packages as the
+# native build: libpam0g-dev libcurl4-openssl-dev libjson-c-dev libssl-dev.
+# New "interesting" inputs are written under build/fuzz/ (git-ignored); the
+# committed seed corpus in tests/fuzz/seed/ is copied, never mutated.
+FUZZ_CC       ?= clang
+FUZZ_MAX_TIME ?= 30
+FUZZ_FLAGS    = -fsanitize=fuzzer,address,undefined,leak -fno-omit-frame-pointer
+FUZZ_TARGETS  ?= config jwt_extract token_meta string_validators verify_claim pkce
+FUZZ_SRC      = src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c \
+                src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c
+
+build/fuzz/fuzz_%: tests/fuzz/fuzz_%.c $(FUZZ_SRC)
+	@mkdir -p build/fuzz
+	$(FUZZ_CC) $(CPPFLAGS) -Wall -Wextra -g $(FUZZ_FLAGS) \
+		$< $(FUZZ_SRC) -o $@ $(LIBS)
+
+# Preflight gate for the fuzz targets. Fails fast with actionable, per-platform
+# guidance instead of a bare compiler/linker error:
+#   * non-Linux host -> libpam has no native macOS/Windows package; use a container.
+#   * clang missing  -> libFuzzer is clang-only; print the package-install line.
+#   * headers/libs   -> compile+link a trivial probe against pam/json-c/curl/ssl
+#                       and print the install line if anything is absent.
+fuzz-preflight:
+	@mkdir -p build/fuzz; \
+	u=$$(uname -s); \
+	case "$$u" in \
+	  Darwin|*MINGW*|*MSYS*) \
+	    echo "ERROR: 'make fuzz' requires a Linux host -- libpam has no native macOS/Windows package,"; \
+	    echo "so the fuzz harnesses cannot be built or run here. Run them in a Linux container instead:"; \
+	    printf '%s\n' "docker run --rm -v \"\$$PWD:/work\" -w /work -e DEBIAN_FRONTEND=noninteractive -e TZ=America/Chicago ubuntu:24.04 bash -c 'echo \"tzdata tzdata/Areas select America\" | debconf-set-selections; echo \"tzdata tzdata/Zones/America select Chicago\" | debconf-set-selections; apt-get update -qq; apt-get install -y clang make libpam0g-dev libcurl4-openssl-dev libjson-c-dev libssl-dev; make fuzz FUZZ_MAX_TIME=30'" ; \
+	    exit 1;; \
+	esac; \
+	if ! command -v $(FUZZ_CC) >/dev/null 2>&1; then \
+	  echo "ERROR: '$(FUZZ_CC)' not found. libFuzzer is clang-only. Install clang and the module dev packages:"; \
+	  echo "  RHEL/Rocky   : dnf install -y clang pam-devel libcurl-devel json-c-devel openssl-devel"; \
+	  echo "  Debian/Ubuntu: apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libssl-dev"; \
+	  echo "then re-run 'make fuzz'."; \
+	  exit 1; \
+	fi; \
+	printf '#include "pam_oidc_device.h"\n#include <openssl/evp.h>\nint main(void){return 0;}\n' > build/fuzz/.fuzz_probe.c; \
+	if ! $(FUZZ_CC) $(CPPFLAGS) build/fuzz/.fuzz_probe.c -o build/fuzz/.fuzz_probe $(LIBS) >build/fuzz/.fuzz_probe.log 2>&1; then \
+	  echo "ERROR: the fuzz build is missing required headers/libraries:"; \
+	  sed 's/^/    /' build/fuzz/.fuzz_probe.log; \
+	  echo "Install them and re-run 'make fuzz':"; \
+	  echo "  RHEL/Rocky   : dnf install -y clang pam-devel libcurl-devel json-c-devel openssl-devel"; \
+	  echo "  Debian/Ubuntu: apt-get install -y clang libpam0g-dev libcurl4-openssl-dev libjson-c-dev libssl-dev"; \
+	  echo "(macOS/Windows: run 'make fuzz' in a Linux container -- see tests/fuzz/README.md)"; \
+	  exit 1; \
+	fi; \
+	rm -f build/fuzz/.fuzz_probe.c build/fuzz/.fuzz_probe build/fuzz/.fuzz_probe.log
+
+fuzz-build: fuzz-preflight $(addprefix build/fuzz/fuzz_, $(FUZZ_TARGETS))
+
+fuzz: fuzz-preflight $(addprefix build/fuzz/fuzz_, $(FUZZ_TARGETS))
+	@rc=0; \
+	for t in $(FUZZ_TARGETS); do \
+		echo "==== fuzz $$t  (max_total_time=$(FUZZ_MAX_TIME)s) ===="; \
+		rm -rf build/fuzz/corpus_$$t; mkdir -p build/fuzz/corpus_$$t; \
+		cp -fR tests/fuzz/seed/$$t/. build/fuzz/corpus_$$t/ 2>/dev/null || true; \
+		if ./build/fuzz/fuzz_$$t -max_total_time=$(FUZZ_MAX_TIME) -rss_limit_mb=4096 \
+				-artifact_prefix=build/fuzz/ build/fuzz/corpus_$$t; then \
+			echo "PASS: fuzz_$$t crash/UB/leak-free"; \
+		else \
+			echo "FAIL: fuzz_$$t found a crash/UB/leak -- reproducer in build/fuzz/ (crash-*)"; \
+			rc=1; \
+		fi; \
+	done; \
+	exit $$rc
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(PAM_DIR)

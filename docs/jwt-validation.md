@@ -4,6 +4,15 @@ Local JWT claim inspection is an optional defense-in-depth security feature conf
 
 When enabled (`verify_jwt_claims = true`), the module parses Base64URL-encoded access token payloads locally to validate expiration (`exp`), not-before (`nbf`), issuer (`iss`), and audience (`aud`) claims *before* querying downstream endpoints.
 
+## Table of Contents
+
+* [Important Security Clarification](#important-security-clarification)
+* [Configuration Reference](#configuration-reference)
+* [Key Benefits of Pre-Flight Inspection](#key-benefits-of-pre-flight-inspection)
+* [Provider Setup Guidance](#provider-setup-guidance)
+* [NumericDate Handling (RFC 7519)](#numericdate-handling-rfc-7519)
+* [Troubleshooting Claim Mismatches](#troubleshooting-claim-mismatches)
+
 ---
 
 ## Important Security Clarification

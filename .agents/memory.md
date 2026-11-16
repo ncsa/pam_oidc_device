@@ -191,6 +191,140 @@
 
 ## Interaction Log (newest first)
 
+### 2026-11-16 — `make fuzz` container one-liner: preseed tzdata (Chicago) + noninteractive
+- **Task:** The suggested `docker run` one-liners (Makefile `fuzz-preflight` guidance +
+  `tests/fuzz/README.md`) hung on tzdata's interactive "Please select the time zone" prompt.
+- **Changes:** Both now pass `-e DEBIAN_FRONTEND=noninteractive -e TZ=America/Chicago` and preseed
+  debconf **before** `apt-get` (`tzdata tzdata/Areas select America` +
+  `tzdata tzdata/Zones/America select Chicago` via `debconf-set-selections`). The Makefile now
+  prints the command as a single `printf '%s\n' "…"` line (one-liner; no backslash-continuation
+  echoes).
+- **Gotchas & Lessons:** (1) In make recipe lines, `\$PWD` is corrupted — make expands the
+  undefined variable `$P`, leaving a stray backslash (`\WD`). Use `\$$PWD` (→ shell `\$` →
+  literal `$PWD`) or `$$PWD` inside single quotes. (2) Multi-line guidance via
+  `echo '…\'' / \\` continuations is a quoting trap across dash vs bash-as-sh echo semantics —
+  prefer `printf '%s\n'`. (3) `debconf-set-selections` ships in the base `ubuntu:24.04` image,
+  so preseeding works before any `apt-get install`.
+- **Verification:** Both the preflight-printed one-liner and the README block were executed verbatim
+  in a fresh `ubuntu:24.04` container — no prompts, `Current default time zone: 'America/Chicago'`,
+  all six fuzz harnesses PASS (`FUZZ_MAX_TIME=5`).
+
+### 2026-11-15 — Added opt-in libFuzzer harnesses + `make fuzz` (tests/fuzz/)
+- **Task:** Add "loose" crash/UB/leak fuzzing as an opt-in `make fuzz` target, without touching `make lint` or any CI workflow.
+- **Changes:** New `tests/fuzz/` with six libFuzzer harnesses — `fuzz_config` (`parse_config_file` via `fmemopen`), `fuzz_jwt_extract` (`jwt_extract_claim_string`), `fuzz_token_meta` (`verify_token_metadata`), `fuzz_string_validators` (`is_valid_https_url`/`is_safe_terminal_string`/`is_safe_user_code`/`copy_checked`/`parse_loglevel`), `fuzz_verify_claim` (`verify_claim`; regex *subject* only, pattern held fixed), `fuzz_pkce` (`pkce_compute_s256_challenge`) — a hand-picked seed corpus under `tests/fuzz/seed/<target>/`, a `tests/fuzz/README.md`, and a Makefile `fuzz`/`fuzz-build` block plus a `fuzz-preflight` gate that fails fast with per-platform install guidance (clang missing / dev headers missing / non-Linux host → container one-liner).
+- **Decisions & Rationale:** Kept it fully opt-in and out of lint: `make lint`/pre-commit globs are `src/*.c include/*.h tests/*.c` (non-recursive), so `tests/fuzz/*.c` is never lint-checked or CI-gated. Each harness re-instruments the full module source set under `-fsanitize=fuzzer,address,undefined,leak -fno-omit-frame-pointer` (the `test-sanitize` sanitizer set + libFuzzer) and drives one leaf function; the PAM handle is `NULL` (proven safe by the CMocka suite). Fuzzing the regex *subject* (not the *pattern*) keeps `verify_claim` deterministic and crash-focused. Seeds are **copied** (never mutated) into `build/fuzz/corpus_<t>/`; crash reproducers land in `build/fuzz/` (git-ignored).
+- **Gotchas & Lessons:** (1) libFuzzer's duration flag is `-max_total_time=N`, **not** `-max_time` (the latter is silently ignored → unbounded run; caught when a pass kept climbing past the tool's 300 s window and had to be `docker kill`ed). (2) GNU `cp` needs `-R` to copy a directory's contents (`cp -fR tests/fuzz/seed/<t>/. build/fuzz/corpus_<t>/`); plain `cp -f .../.` fails silently on Linux, so seeds never loaded (libFuzzer reported "0 files found" until fixed, then "2 files found"). (3) On Linux the PAM headers live under `security/` (`security/pam_modules.h`/`security/pam_ext.h`), **not** `pam/pam.h` (the macOS/HP-UX layout) — so the `fuzz-preflight` probe includes the module's own `pam_oidc_device.h` + `openssl/evp.h` and links `$(LIBS)`, rather than guessing individual headers.
+- **Verification:** In the `ubuntu:24.04` CI-mirror container (clang 18.1.3): `make fuzz-build` compiles all six with **zero warnings** (`-Wall -Wextra`); `make fuzz FUZZ_MAX_TIME=10` loads the seed corpus for every target and reports all six **PASS — crash/UB/leak-free** (up to ~1.8 M execs on the string/pkce targets). Baseline is clean. `make clean` wipes `build/fuzz/`; no C/packaging/CI behavior change.
+- **Follow-up:** Optional longer runs (`make fuzz FUZZ_MAX_TIME=3600`); extend to `verify_group_membership` (json array/string claims) and the cURL callbacks if a PAM-independent harness is wanted; a standalone (non-CI-gating) `fuzz.yml` workflow if continuous fuzzing is desired.
+
+### 2026-11-15 — Accessibility polish: plain-word symbols, link labels, TOC consistency
+- **Task:** Second accessibility audit pass (WCAG 2.4.4/2.4.5 + plain-language prose).
+- **Changes:** (1) `≠` → "does not match" (testing.md status table); all inline `→`
+  arrows in *prose* replaced with explicit words ("results in", "maps to", "shows",
+  "the result is") across `docs/testing.md`, `docs/threat-model.md` (Figure 2
+  caption now reads "next, …; and finally, …"), `docs/access-control.md`, and
+  `examples/README.md`. Arrows inside code fences / ASCII diagrams untouched.
+  (2) Bare-URL link label fixed (README footer → "[NCSA website]").
+  (3) Every repeated link label made context-unique (README ×2, getting-started ×5,
+  threat-model ×4). (4) `## Table of Contents` added to the four long guides lacking
+  one (`getting-started`, `testing`, `jwt-validation`, `access-control`) in the
+  threat-model format; anchors verified against GitHub's slug algorithm with a
+  Python check (all valid, incl. the tricky `#6-enterprise-linux--authselect`,
+  `#1-local-account-filtering-allow_users--deny_users` double-hyphen slugs).
+- **Standing invariants:** `.agents/context.md` §8 now requires TOC-on-long-guides,
+  descriptive context-unique link labels, and words-not-symbols in prose; §10.4
+  audit prompt extended accordingly. CHANGELOG `[Unreleased]` → Fixed.
+- **Gotchas & Lessons:** macOS `security/pam_ext.h` declares `pam_prompt`'s handle
+  **non-const** — a `const pam_handle_t *` helper signature breaks the clang build
+  under `-Werror` (gcc/tests pass silently); keep helper signatures
+  `pam_handle_t *`. The flaky terminal corrupts long multi-line heredocs — use the
+  editor tool to create script files, not `cat > file <<EOF`.
+- **Verification:** docs-only round (no C changes since the last green gate).
+  Grep sweep: zero `≠`, zero prose `→` (fence-external), zero bare-URL labels,
+  zero duplicate link labels; TOC-anchor checker passes on all five long guides.
+- **Figures 1 & 2 → tables:** both fixed-width box diagrams in
+  `threat-model.md` are now tables (Figure 1: zones + relationships;
+  Figure 2: five pre-flight gates with reject/continue conditions, incl.
+  the fail-closed UserInfo failure the old art omitted). Refined rule of
+  thumb: *any diagram whose branches all exit to the same terminal state is
+  a linear early-exit pipeline — table it*; keep ASCII art (with prose
+  caption) only for branches that re-converge into *different* later steps.
+  Mermaid was rejected: GitHub renders it, but as raw SVG with weak
+  screen-reader semantics, and it's a GitHub-only extension in plain-MD docs.
+  The old art also wrapped illegibly on GitHub mobile (~77 chars wide).
+- **Post-review accuracy fix (code-verified vs `src/identity.c`):** the first
+  table pass carried two factual slips: gate 4 said "local NSS group
+  memberships" (the codebase contains zero NSS calls — `verify_group_membership()`
+  matches UserInfo *claim* values against allow/deny lists), and gate 1
+  omitted the default `root` denial (`allow_root = true` opt-in). Lesson: when
+  converting or keeping figures, audit them against the implementation — do not
+  transcribe from the old art or adjacent prose. Also de-duplicated Figure 1
+  (security properties stated once, in the relationships table; zone rows list
+  contents only; added `*Zones:*` / `*Trust relationships:*` lead-ins).
+
+### 2026-11-15 — Full accessibility review (WCAG 2.1 AA): user-visible failure notices + docs fixes
+- **Task:** Repo-wide accessibility review of terminal UI/UX + documentation. Confirmed
+  earlier fixes hold: badge alt text, threat-model figure captions, every code fence
+  language-tagged, ASCII art only in `docs/threat-model.md` (captioned), all tables have
+  header rows, no color-only cues, no stray LaTeX.
+- **Decisions & Rationale:** Core UI/UX gap found: *every* failure path in
+  `pam_sm_authenticate()` was log-only — users saw an unexplained "permission denied"
+  (WCAG 3.3.1 *Error Identification*). Added `notify_user_failure()` (static, best-effort
+  `pam_prompt()`/`PAM_TEXT_INFO`) plus three static, deliberately-generic notices
+  (`USER_NOTICE_SERVICE` / `USER_NOTICE_DENIED` / `USER_NOTICE_EXPIRED`) at 14 failure
+  sites. No notice on `PAM_ABORT` (user-initiated Ctrl-C) or when the conversation
+  itself fails. Wording never reveals *which* control denied the attempt — details
+  stay in the syslog audit trail.
+- **Gotchas & Lessons:** Ubuntu's `security/pam_ext.h` declares
+  `pam_prompt(pam_handle_t *pamh, ...)` **non-const** — a `const pam_handle_t *` helper
+  signature breaks the clang build under `-Werror`
+  (`-Wincompatible-pointer-types-discards-qualifiers`); the gcc build/tests pass silently.
+  OpenSSH keyboard-interactive buffers `PAM_TEXT_INFO` until a prompt round-trip, so
+  post-Enter notices may not display on every SSH client — documented as best-effort
+  (local console always shows them) in code comment, README `## Accessibility`, and
+  getting-started §7.
+- **Docs touched:** README (Accessibility bullet + new §7 link), getting-started §7
+  (new *User-Visible Failure Notices* subsection), `examples/README.md` (literal
+  `$\rightarrow$` → `→`), CHANGELOG `[Unreleased]`, `.agents/context.md` §8 + §10.4
+  (standing invariant: "no failure path is log-only" + audit checklist item).
+- **Verification:** `ubuntu:24.04` Docker gate (§3.3) **PASSED end-to-end**: gcc +
+  clang builds (zero-warning), CMocka 57/57 under both compilers, `clang-tidy` gate
+  clean, `make test-sanitize CC=clang` (ASan/UBSan/LSan) 57/57. (First run caught
+  the const-qualifier bug on the clang build; fixed and re-verified.)
+  `make check-scrub` + `make check-licenses` pass on macOS.
+- **Follow-ups / Open Items:** Optional one-line "out of scope" note in README
+  Accessibility section (IdP web pages where the code is approved are not this
+  project's content).
+
+### 2026-11-15 — Accessibility alignment: docs + terminal UX to WCAG 2.1 AA (§508 / IL + US federal policy)
+
+- **Task:** Make repository documentation and the documented terminal UX
+  conform to State of Illinois and US federal accessibility policy.
+- **Decisions & Rationale:** Three overlapping mandates govern NCSA/UIUC
+  public-facing docs and all converge on **WCAG 2.1 Level AA** — IITAA 2.1
+  (30 ILCS 587), ADA Title II (28 CFR Part 35, effective April 2026), and
+  Rehabilitation Act § 508 (29 U.S.C. § 794d, via 36 CFR Part 1194) — so no
+  code change was needed — the terminal UX already satisfies the key criteria
+  (verified in `src/pam_module.c`: text prompt always carries URL + code, QR
+  is off-by-default and strictly supplemental, Enter/Ctrl-C keyboard control,
+  no time-limited interaction the user cannot cancel). Changes: README gained
+  an `## Accessibility` section (documentation conformance + terminal UX +
+  supplemental-QR note + issue-reporting path); README badge alt text made
+  meaningful (WCAG 1.1.1); `docs/getting-started.md` §4 gained an
+  "Accessible by default" NOTE (text-first prompt, no color-only cues,
+  `style = ascii` fallback, Enter/Ctrl-C).
+- **Gotchas & Lessons:** prompt-template placeholders in docs are
+  `{url}`/`{url_complete}`/`{code}` (NOT `{verification_uri}`/`{user_code}`)
+  — same-session finding, same fix direction: docs must track
+  `render_prompt_message()` in `src/pam_module.c`.
+- **Verification:** docs-only; all claims spot-checked against source
+  (`pam_module.c` Steps 4/4b/5, EINTR → `PAM_ABORT`). No build gates affected.
+- **Follow-ups / Open Items:** independent review flagged the un-described
+  ASCII art in `docs/threat-model.md` — fixed by adding "**Figure N — …**"
+  prose descriptions (text alternatives, WCAG 1.1.1) before both figures;
+  durable rule recorded in `.agents/context.md` (§5.2 WCAG 2.1 AA spec entry,
+  §8 documentation quality bar, §10.4 audit checklist item).
+
 ### 2026-11-15 — Docs audit: polling-timing contradiction fixed repo-wide (README + getting-started)
 
 - **Task:** User-driven review of `README.md` (polling-timing contradiction, dangling `If`

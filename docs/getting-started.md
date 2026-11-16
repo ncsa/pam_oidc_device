@@ -12,6 +12,17 @@ and logging.
 > mapping, per-provider PKCE support, and three complete configuration
 > templates (Keycloak, Microsoft Entra ID, CILogon).
 
+## Table of Contents
+
+* [1. Prerequisites](#1-prerequisites)
+* [2. Install the Module](#2-install-the-module)
+* [3. Configure `/etc/pam_oidc_device.conf`](#3-configure-etcpam_oidc_deviceconf)
+* [4. OpenSSH Server Setup (`/etc/ssh/sshd_config`)](#4-openssh-server-setup-etcsshsshd_config)
+* [5. PAM Stack Integration (`/etc/pam.d/sshd`)](#5-pam-stack-integration-etcpamdsshd)
+* [6. Enterprise Linux & `authselect`](#6-enterprise-linux--authselect)
+* [7. Logging & Auditing](#7-logging--auditing)
+* [What's Next](#whats-next)
+
 ---
 
 ## 1. Prerequisites
@@ -121,9 +132,9 @@ Sections and where their full option references live:
 
 | Section | Purpose | Full reference |
 | --- | --- | --- |
-| `[oauth]` | Endpoints, client credentials, scopes, PKCE (`use_pkce`), local JWT claim inspection (`verify_jwt_claims`, `issuer`, `audience`) | [Local JWT Claim Inspection](jwt-validation.md) |
-| `[claim]` | Which provider claim maps to the local POSIX username | [Account & Group Access Control](access-control.md) |
-| `[access]` | Local user allow/deny + provider group/role allow/deny | [Account & Group Access Control](access-control.md) |
+| `[oauth]` | Endpoints, client credentials, scopes, PKCE (`use_pkce`), local JWT claim inspection (`verify_jwt_claims`, `issuer`, `audience`) | [the local JWT claim inspection reference](jwt-validation.md) |
+| `[claim]` | Which provider claim maps to the local POSIX username | [the access-control guide's claim-mapping section](access-control.md) |
+| `[access]` | Local user allow/deny + provider group/role allow/deny | [the access-control guide's user and group lists](access-control.md) |
 | `[runtime]` | `loglevel`, `max_poll_seconds` | [Logging & Auditing](#7-logging--auditing) |
 | `[prompt]` / `[qr]` | Terminal prompt template and QR rendering | sample config (above) |
 
@@ -159,6 +170,17 @@ AuthenticationMethods keyboard-interactive
 > [!IMPORTANT]
 > **Why `KbdInteractiveAuthentication`?**
 > Standard non-interactive SSH authentication methods suppress standard PAM informational text messages. `KbdInteractiveAuthentication yes` enables real-time message flushing via `pam_prompt()`, allowing `pam_oidc_device` to stream the verification URL and user code directly to the user's terminal.
+
+> [!NOTE]
+> **Accessible by default.** The prompt is always plain, selectable text — the
+> URL and user code never appear only in the (opt-in, off by default) QR art —
+> and carries no color-only cues, keeping it screen-reader and low-vision
+> friendly; `[qr] style = ascii` renders the optional QR in plain ASCII for
+> minimal fonts. The interaction is entirely keyboard-driven: **Enter** begins
+> waiting for your approval, **Ctrl-C** aborts the attempt (`PAM_ABORT`, login
+> denied). The user-code lifetime is set by your identity provider — see the
+> Note below, idle time at the confirmation prompt counts against it. See also
+> the [Accessibility section of the README](../README.md#accessibility).
 
 Apply configuration changes:
 
@@ -301,6 +323,17 @@ timeout) is reached without a token, authentication fails with
 confirmation prompt (see the Note in §4), approve the code on your second
 device promptly after it is displayed.
 
+### User-Visible Failure Notices
+
+In addition to syslog, a failed sign-in attempt shows a plain-text, actionable
+notice in the login terminal (delivered through the PAM conversation): the
+identity provider service is unavailable, the sign-in code expired before
+approval, or the account was denied. The wording is intentionally generic —
+which specific control rejected the attempt remains in the syslog entries
+above. Delivery is best-effort: local console logins always display the
+notice; some SSH clients buffer informational messages until the next prompt
+round-trip, so the notice may not appear on every client.
+
 ### PAM Directive Override Example
 
 Configuration settings specified directly on the PAM module command line take precedence over configuration file defaults:
@@ -325,10 +358,10 @@ sudo journalctl -f -u sshd | grep pam_oidc_device
   [Testing & Pre-Production Audit Guide](testing.md) covers the one-command
   e2e sandbox, `pamtester` manual tests, a real-IdP trial, and the
   pre-production audit/rollback checklist.
-* **Restrict who can log in** —
-  [Account & Group Access Control](access-control.md).
-* **Harden token acceptance** —
-  [Local JWT Claim Inspection](jwt-validation.md).
+* **Restrict who can log in** — read the
+  [Account & Group Access Control guide](access-control.md).
+* **Harden token acceptance** — read the
+  [Local JWT Claim Inspection guide](jwt-validation.md).
 * **Understand the security model** —
   [Threat Model & Security Architecture](threat-model.md).
 

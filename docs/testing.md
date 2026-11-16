@@ -11,6 +11,14 @@ prove two things before rollout:
    protection, and logging all work on *your* hosts, with a rollback path
    that restores normal logins in seconds.
 
+## Table of Contents
+
+* [1. Test layers at a glance](#1-test-layers-at-a-glance)
+* [2. One-command sandbox (`make sandbox`)](#2-one-command-sandbox-make-sandbox)
+* [3. Manual testing with `pamtester` on a Linux host](#3-manual-testing-with-pamtester-on-a-linux-host)
+* [4. Trial against a real IdP](#4-trial-against-a-real-idp)
+* [5. Pre-production audit checklist](#5-pre-production-audit-checklist)
+
 ---
 
 ## 1. Test layers at a glance
@@ -108,10 +116,10 @@ echo approve-alice > /tmp/pam_oidc_device_e2e/scenario
 > document, and `/health`), so opening the link in a real browser gets you a
 > JSON 404. Set the scenario file *before* starting the driver — or
 > `pamtester` — and the outcome is deterministic. Useful values:
-> `approve-alice` (success), `approve-bob` (claim mismatch → `PAM_AUTH_ERR`),
-> `denied` (user denies on their device → `PAM_AUTH_ERR`),
-> `slowdown-approve` (one `slow_down`, then success), `expired` (code lapses
-> → `PAM_AUTH_ERR`).
+> `approve-alice` (success), `approve-bob` (the claim mismatch results in
+> `PAM_AUTH_ERR`), `denied` (denying the code on the user's device results in
+> `PAM_AUTH_ERR`), `slowdown-approve` (one `slow_down`, then success),
+> `expired` (the lapsed code results in `PAM_AUTH_ERR`).
 
 ---
 
@@ -174,7 +182,7 @@ for you):
 | 0 | `PAM_SUCCESS` | Device flow completed; claim mapped to PAM user |
 | 3 | `PAM_SERVICE_ERR` | Config missing / not `0600`–`0640` root:root / invalid key — **fails closed** |
 | 6 | `PAM_PERM_DENIED` | `root` denied, `deny_users`/`deny_groups` match, group policy unsatisfied |
-| 7 | `PAM_AUTH_ERR` | Claim ≠ PAM user, provider denied the code, polling deadline expired, JWT claims check failed |
+| 7 | `PAM_AUTH_ERR` | Claim does not match PAM user, provider denied the code, polling deadline expired, JWT claims check failed |
 | 9 | `PAM_AUTHINFO_UNAVAIL` | UserInfo endpoint unreachable / non-200 |
 | 10 | `PAM_USER_UNKNOWN` | PAM could not resolve the user at all |
 | 26 | `PAM_ABORT` | User cancelled (Ctrl-C) mid-flow |
@@ -185,24 +193,24 @@ for you):
 Run each of these and confirm the *status and log line*, not just success:
 
 1. **Wrong local user.** Approve the code for `alice@…` but run
-   `pamtester oidc-test bob authenticate` → `PAM_AUTH_ERR`, log says
-   "claim verification failed".
-2. **Provider denial.** On the second device, *deny* the code →
-   `PAM_AUTH_ERR`, log says "Non-retryable OAuth authorization error".
-3. **Let the code expire.** Do not sign in; wait past `max_poll_seconds` →
-   `PAM_AUTH_ERR`, log says "timed out or denied".
-4. **Root.** `pamtester oidc-test root authenticate` → `PAM_PERM_DENIED`
-   before any provider traffic (check the log: no "device authentication
-   initiated" line).
-5. **Broken config.** `sudo chmod 0644 /etc/pam_oidc_device.conf` →
+   `pamtester oidc-test bob authenticate`; the result is `PAM_AUTH_ERR`, and
+   the log says "claim verification failed".
+2. **Provider denial.** On the second device, *deny* the code; the result is
+   `PAM_AUTH_ERR`, and the log says "Non-retryable OAuth authorization error".
+3. **Let the code expire.** Do not sign in; wait past `max_poll_seconds`; the
+   result is `PAM_AUTH_ERR`, and the log says "timed out or denied".
+4. **Root.** `pamtester oidc-test root authenticate` results in
+   `PAM_PERM_DENIED` before any provider traffic (check the log: no "device
+   authentication initiated" line).
+5. **Broken config.** `sudo chmod 0644 /etc/pam_oidc_device.conf` results in
    `PAM_SERVICE_ERR`; the log records the permission check failure. Restore
    `0600`.
 6. **Wrong issuer.** With `verify_jwt_claims = true`, set `issuer` to a
-   different value than the IdP's `iss` → `PAM_AUTH_ERR`, log says "JWT
-   claim inspection failed".
-7. **Kill the IdP.** Stop the mock / point `token_endpoint` at a dead port →
-   the module retries with backoff until the deadline, then `PAM_AUTH_ERR`.
-   It must never hang past `max_poll_seconds`.
+   different value than the IdP's `iss`; the result is `PAM_AUTH_ERR`, and
+   the log says "JWT claim inspection failed".
+7. **Kill the IdP.** Stop the mock / point `token_endpoint` at a dead port:
+   the module retries with backoff until the deadline, then returns
+   `PAM_AUTH_ERR`. It must never hang past `max_poll_seconds`.
 
 > [!NOTE]
 > `pamtester`'s built-in conversation handler cannot always answer the
@@ -266,7 +274,7 @@ Run on a **staging host that mirrors production** (same distro, PAM version,
 
 **Configuration & filesystem**
 
-- [ ] `ls -l /etc/pam_oidc_device.conf` → `root:root`, mode `0600` (or
+- [ ] `ls -l /etc/pam_oidc_device.conf` shows `root:root`, mode `0600` (or
       `0640` with `root` group). Anything else fails closed — verify that
       is actually what happens (checklist item 5 in §3.3).
 - [ ] No provider secrets beyond `client_secret` in the file; no
@@ -277,10 +285,10 @@ Run on a **staging host that mirrors production** (same distro, PAM version,
 **Fail-closed behavior (the most important check)**
 
 - [ ] `sudo mv /etc/pam_oidc_device.conf /root/conf.bak`, then attempt a
-      login → **must fail** (`PAM_SERVICE_ERR`), and the PAM line's control
+      login — the login **must fail** (`PAM_SERVICE_ERR`), and the PAM line's control
       flag must be `required`/`requisite` (never `sufficient`) — see
       `docs/getting-started.md` §5.
-- [ ] Stop the network / firewall-block the IdP → logins fail with
+- [ ] Stop the network / firewall-block the IdP; logins fail with
       `PAM_AUTH_ERR` after bounded retries and never hang past
       `max_poll_seconds`.
 - [ ] Rollback drill: comment out the `pam_oidc_device.so` line in
