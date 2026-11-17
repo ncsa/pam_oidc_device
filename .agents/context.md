@@ -35,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.2, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.3, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).
@@ -61,7 +61,7 @@
   - `tests/` — CMocka suite (`tests/test_suite.c`, run via `tests/runner`), plus `lsan.supp`
     (intentional third-party LSan suppressions), `tests/qr_scan` (QR fixture tooling), and
     `tests/e2e/` (one-command device-flow sandbox: `Dockerfile`, `mock_oidc.py` HTTPS mock IdP,
-    `pam_driver.c` deterministic PAM driver, `run_e2e.sh` 7-scenario harness, config/PAM-stack
+    `pam_driver.c` deterministic PAM driver, `run_e2e.sh` 9-scenario harness, config/PAM-stack
     fixtures — `make sandbox` / `make sandbox-shell`, mirrored by the CI `e2e-sandbox` job).
   - `config/pam_oidc_device.conf` — sample/documented configuration.
   - `docs/` — operator documentation (getting started, testing, access control,

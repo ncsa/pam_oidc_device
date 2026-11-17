@@ -19,6 +19,7 @@
 
 #include "../include/pam_oidc_device.h"
 #include <ctype.h>
+#include <math.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
@@ -232,6 +233,10 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
      * json_type_double, so both must be accepted. Any other JSON type is a
      * malformed claim and is rejected outright.
      *
+     * `exp` must additionally be finite: json-c accepts the non-standard `NaN`
+     * and `Infinity` literals as json_type_double, and every comparison with
+     * NaN is false — a NaN `exp` would silently disable the expiry check.
+     *
      * A missing `exp` is accepted by default (an unexpired-check is left to the
      * downstream UserInfo endpoint) unless `require_exp_claim` is set, in which
      * case tokens lacking a well-formed `exp` are rejected.
@@ -246,6 +251,13 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         } else {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Malformed JWT 'exp' claim: expected a NumericDate (numeric) value");
+            secure_zero_json_tree(payload_json);
+            json_object_put(payload_json);
+            return -1;
+        }
+        if (!isfinite(exp_val)) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Token has a non-finite 'exp' claim (NaN or Infinity)");
             secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
@@ -269,6 +281,8 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
      * `nbf` is an optional RFC 7519 NumericDate; accept json_type_int or
      * json_type_double (fractional) and reject any other JSON type. A missing
      * `nbf` is always accepted, as it is commonly omitted and not security-relevant.
+     * As with `exp`, a non-finite value (json-c's `NaN`/`Infinity` literals) is
+     * rejected: comparisons with NaN never trip the not-yet-valid check.
      */
     struct json_object *j_nbf = NULL;
     if (json_object_object_get_ex(payload_json, "nbf", &j_nbf)) {
@@ -280,6 +294,13 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         } else {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Malformed JWT 'nbf' claim: expected a NumericDate (numeric) value");
+            secure_zero_json_tree(payload_json);
+            json_object_put(payload_json);
+            return -1;
+        }
+        if (!isfinite(nbf_val)) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "Token has a non-finite 'nbf' claim (NaN or Infinity)");
             secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
@@ -305,9 +326,14 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         struct json_object *j_iss = NULL;
         if (!json_object_object_get_ex(payload_json, "iss", &j_iss) || !json_object_is_type(j_iss, json_type_string) ||
             strcmp(json_object_get_string(j_iss), cfg->issuer) != 0) {
+            /* PII-safe: the received claim value is logged only as its length,
+             * never as the value itself (the expected value is
+             * administrator configuration, not provider data). */
+            const char *iss_received =
+                json_object_is_type(j_iss, json_type_string) ? json_object_get_string(j_iss) : NULL;
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Token issuer mismatch (expected: '%s', received: '%s')", cfg->issuer,
-                          j_iss ? json_object_get_string(j_iss) : "(null)");
+                          "Token issuer mismatch (expected: '%s', received value length: %zu)", cfg->issuer,
+                          iss_received ? strlen(iss_received) : 0);
             secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;
@@ -364,9 +390,17 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         }
 
         if (!aud_valid) {
+            /* PII-safe: the received claim value is logged only as its length,
+             * never as the value itself (same rationale as the issuer check). */
+            size_t aud_received_len = 0;
+            const char *aud_repr = NULL;
+            if (j_aud != NULL) {
+                aud_repr = json_object_to_json_string(j_aud);
+                aud_received_len = (aud_repr != NULL) ? strlen(aud_repr) : 0;
+            }
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Token audience mismatch (expected: '%s', received: %s)", cfg->audience,
-                          j_aud ? json_object_to_json_string(j_aud) : "(null)");
+                          "Token audience mismatch (expected: '%s', received value length: %zu)", cfg->audience,
+                          aud_received_len);
             secure_zero_json_tree(payload_json);
             json_object_put(payload_json);
             return -1;

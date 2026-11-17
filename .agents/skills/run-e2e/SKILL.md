@@ -7,7 +7,7 @@ description: Drive the one-command e2e device-flow sandbox (`make sandbox`, Dock
 
 **Run it:**
 ```bash
-make sandbox        # builds the module, installs it into a PAM stack, runs the 7-scenario harness
+make sandbox        # builds the module, installs it into a PAM stack, runs the 9-scenario harness
 make sandbox-shell  # enter the sandbox image interactively for manual PAM tests
 ```
 `tests/e2e/run_e2e.sh` drives the **installed** `pam_oidc_device.so` through a real PAM stack
