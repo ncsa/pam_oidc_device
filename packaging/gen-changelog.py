@@ -21,7 +21,7 @@ def parse_metadata(metadata_path):
 
 def generate_rpm_changelog(changelog_path, metadata):
     maintainer = metadata.get('MODULE_MAINTAINER', 'NCSA Cyberinfrastructure <help@ncsa.illinois.edu>')
-    default_ver = metadata.get('MODULE_VERSION', '0.3.2')
+    default_ver = metadata.get('MODULE_VERSION', '0.3.3')
 
     entries = []
     current_ver = None
@@ -53,8 +53,16 @@ def generate_rpm_changelog(changelog_path, metadata):
             current_ver = m.group(1)
             current_date = m.group(2)
             current_items = []
-        elif current_ver and (stripped.startswith('-') or stripped.startswith('*')):
-            current_items.append(stripped)
+        elif current_ver:
+            # Collect bullet lines for the entry body. A bullet is a line
+            # starting at column 0 with "- " or "* "; indented lines are
+            # wrapped prose continuing the previous bullet and must NOT
+            # become %changelog lines. Items are normalized to "- " so no
+            # generated line begins with "*": rpmbuild parses ANY
+            # "*" -leading %changelog line as a new entry header and
+            # demands a valid date there.
+            if (not line[:1].isspace()) and (line.startswith('- ') or line.startswith('* ')):
+                current_items.append('- ' + line[2:].strip())
 
     if current_ver:
         try:

@@ -250,24 +250,79 @@ static int is_safe_rendered_prompt(const char *str) {
 }
 
 /**
+ * @brief Formats a device-code approval window (seconds) as a compact human-readable duration.
+ *
+ * Renders the RFC 8628 `expires_in` value for the prompt's `{expiry}` template token and the
+ * `[prompt] show_expiry` status-line clause: whole seconds under a minute, whole minutes
+ * (rounded up) up to an hour, and "N hour(s) [M minute(s)]" at or above it. The duration text
+ * is static-ASCII-derived (only digits, spaces, and the fixed unit words), so it requires no
+ * separate terminal-safety check.
+ *
+ * @param[in]  expires_in Approval window in seconds (0 or negative = unknown).
+ * @param[out] out        Buffer receiving the NUL-terminated duration text.
+ * @param[in]  out_len    Output buffer byte capacity.
+ * @return 0 on success, -1 when the window is unknown or the output buffer is too small.
+ */
+static int format_expiry_seconds(int expires_in, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return -1;
+    }
+    if (expires_in <= 0) {
+        out[0] = '\0';
+        return -1;
+    }
+    int w = 0;
+    if (expires_in < 60) {
+        w = snprintf(out, out_len, "%d second%s", expires_in, (expires_in == 1) ? "" : "s");
+    } else if (expires_in < 3600) {
+        int minutes = (expires_in + 59) / 60;
+        w = snprintf(out, out_len, "%d minute%s", minutes, (minutes == 1) ? "" : "s");
+    } else {
+        int total_minutes = (expires_in + 59) / 60;
+        int hours = total_minutes / 60;
+        int minutes = total_minutes % 60;
+        if (minutes == 0) {
+            w = snprintf(out, out_len, "%d hour%s", hours, (hours == 1) ? "" : "s");
+        } else {
+            w = snprintf(out, out_len, "%d hour%s %d minute%s", hours, (hours == 1) ? "" : "s", minutes,
+                         (minutes == 1) ? "" : "s");
+        }
+    }
+    return (w >= 0 && (size_t)w < out_len) ? 0 : -1;
+}
+
+/**
  * @brief Renders the user prompt message presented during SSH / PAM interactive authentication.
  *
- * Replaces placeholders `{url}`, `{url_complete}`, `{code}`, and newline escape sequences `\\n`.
- * If no custom template is configured, generates a clean default prompt message.
- * The fully rendered result is validated line-by-line for terminal-injection safety
- * (newline-tolerant `is_safe_terminal_string`); unsafe output fails the call.
+ * Replaces placeholders `{host}`, `{url}`, `{url_complete}`, `{code}`, `{expiry}`, and newline
+ * escape sequences `\\n`. The `{host}` token expands to the target host's hostname when
+ * `cfg->show_host` is set and to an empty string when it is not. The `{expiry}` token expands to
+ * the human-readable device-code approval window (`expires_in` seconds, via
+ * `format_expiry_seconds()`; e.g. "15 minutes") and to an empty string when the window is
+ * unknown. If no custom template is configured, generates a clean default prompt message: when
+ * `cfg->show_host` is set, the target host (the `{host}` value) is named in the trailing status
+ * line; when it is not, the prompt carries no host. When `cfg->show_expiry` is set (set by
+ * default) and the window is known, the trailing status line additionally carries the
+ * "(expires in ...)" clause. The fully rendered result is validated line-by-line for
+ * terminal-injection safety (newline-tolerant `is_safe_terminal_string`); unsafe output fails
+ * the call.
  *
  * @param[in]  cfg          Module configuration options.
+ * @param[in]  host         Target host's hostname (device-code phishing mitigation: shown so the
+ *                          approving user can tell which machine this sign-in belongs to); used
+ *                          only when `cfg->show_host` is set.
  * @param[in]  url          OAuth verification URI string.
  * @param[in]  url_complete Complete verification URI containing embedded user code (optional).
  * @param[in]  code         User verification code string.
+ * @param[in]  expires_in   Device-code approval window in seconds (provider `expires_in`,
+ *                          clamped to `[runtime] max_poll_seconds`); 0 or negative = unknown.
  * @param[out] out          Buffer receiving rendered text output.
  * @param[in]  out_len      Output buffer byte capacity.
  * @return 0 on success, -1 on buffer overflow, rendering error, or terminal-safety rejection.
  */
-int render_prompt_message(const config_t *cfg, const char *url, const char *url_complete, const char *code, char *out,
-                          size_t out_len) {
-    if (!cfg || !url || !code || !out || out_len == 0) {
+int render_prompt_message(const config_t *cfg, const char *host, const char *url, const char *url_complete,
+                          const char *code, int expires_in, char *out, size_t out_len) {
+    if (!cfg || !host || !url || !code || !out || out_len == 0) {
         return -1;
     }
 
@@ -275,18 +330,46 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
     if (tpl[0] == '\0') {
         /* Compact default: no leading blank line. When the QR code is shown, its bottom vertical
          * quiet zone already separates the prompt from the rendered art; when it is not, the
-         * prompt follows the preceding terminal output directly, saving a blank line. */
+         * prompt follows the preceding terminal output directly, saving a blank line. When
+         * show_host is set, the target host is named in the trailing status line as the user's
+         * cross-check against device-code phishing (an attacker phishing a code initiated from a
+         * *different* machine should not be claiming this one); [prompt] show_host = false
+         * hides it and reverts to the host-free wording. When the
+         * provider advertised an expiry, the same trailing line carries the approval window
+         * ("(expires in ...)") by default; [prompt] show_expiry = false omits it. Both
+         * clauses are optional strings, so disabling a clause renders exactly the same
+         * wording as before the option existed. */
+        char host_clause[280];
+        host_clause[0] = '\0';
+        if (cfg->show_host) {
+            int hlen = snprintf(host_clause, sizeof(host_clause), " to sign in to %s", host);
+            if (hlen < 0 || (size_t)hlen >= sizeof(host_clause)) {
+                return -1;
+            }
+        }
+        char expiry_clause[48];
+        expiry_clause[0] = '\0';
+        if (cfg->show_expiry) {
+            char expiry_text[32];
+            if (format_expiry_seconds(expires_in, expiry_text, sizeof(expiry_text)) == 0) {
+                int elen = snprintf(expiry_clause, sizeof(expiry_clause), " (expires in %s)", expiry_text);
+                if (elen < 0 || (size_t)elen >= sizeof(expiry_clause)) {
+                    return -1;
+                }
+            }
+        }
         int w = 0;
         if (url_complete && strcmp(url, url_complete) != 0) {
             w = snprintf(out, out_len,
-                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n  (Direct: %s)\n"
-                         "Waiting for your approval; this session completes automatically once you sign in.\n",
-                         url, code, url_complete);
+                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n"
+                         "  (Direct: %s)\n"
+                         "Waiting for your approval%s%s; this session completes automatically once you sign in.\n",
+                         url, code, url_complete, host_clause, expiry_clause);
         } else {
             w = snprintf(out, out_len,
                          "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n"
-                         "Waiting for your approval; this session completes automatically once you sign in.\n",
-                         url, code);
+                         "Waiting for your approval%s%s; this session completes automatically once you sign in.\n",
+                         url, code, host_clause, expiry_clause);
         }
         if (w < 0 || (size_t)w >= out_len) {
             return -1;
@@ -321,6 +404,19 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
             memcpy(out + out_pos, url, vlen);
             out_pos += vlen;
             i += 4;
+        } else if (strncmp(tpl + i, "{host}", 6) == 0) {
+            /* show_host gates the hostname display (device-code phishing cross-check): when the
+             * flag is not set the token expands to an empty string, so a template can carry
+             * {host} without the hostname appearing. */
+            if (cfg->show_host) {
+                size_t vlen = strlen(host);
+                if (out_pos + vlen >= out_len) {
+                    return -1;
+                }
+                memcpy(out + out_pos, host, vlen);
+                out_pos += vlen;
+            }
+            i += 5;
         } else if (strncmp(tpl + i, "{code}", 6) == 0) {
             size_t vlen = strlen(code);
             if (out_pos + vlen >= out_len) {
@@ -329,6 +425,20 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
             memcpy(out + out_pos, code, vlen);
             out_pos += vlen;
             i += 5;
+        } else if (strncmp(tpl + i, "{expiry}", 8) == 0) {
+            /* {expiry} expands to the human-readable device-code approval window (provider
+             * expires_in, clamped by max_poll_seconds); when the window is unknown the token
+             * expands to an empty string (same convention as {host} with show_host off). */
+            char expiry_text[32];
+            if (format_expiry_seconds(expires_in, expiry_text, sizeof(expiry_text)) == 0) {
+                size_t vlen = strlen(expiry_text);
+                if (out_pos + vlen >= out_len) {
+                    return -1;
+                }
+                memcpy(out + out_pos, expiry_text, vlen);
+                out_pos += vlen;
+            }
+            i += 7;
         } else {
             if (out_pos + 1 >= out_len) {
                 return -1;
@@ -366,6 +476,9 @@ static const char *const USER_NOTICE_DENIED =
 static const char *const USER_NOTICE_EXPIRED =
     "Sign-in was not approved in time: the sign-in code expired or the identity provider\n"
     "service became unavailable. Please sign in again to start a new session.\n";
+static const char *const USER_NOTICE_NOT_APPROVED =
+    "Sign-in was declined: the sign-in request was not approved at the identity provider.\n"
+    "Please sign in again to start a new session.\n";
 
 static void notify_user_failure(pam_handle_t *pamh, const char *msg) {
     if (pamh && msg != NULL) {
@@ -607,6 +720,20 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
     return PAM_SUCCESS;
 }
 
+/*
+ * Classification of a FAILED token-polling outcome (poll_for_access_token()),
+ * mapped to the user-visible notice in pam_sm_authenticate(). The PAM status
+ * code alone cannot carry this distinction — token-phase failures collapse
+ * into PAM_AUTH_ERR, so without it the user would see the same notice for an
+ * expired code, a declined sign-in, and a broken network path.
+ */
+typedef enum {
+    TOKEN_PHASE_EXPIRED = 0, /* Poll deadline reached, or the provider reported expired_token. */
+    TOKEN_PHASE_DENIED,      /* The provider reported access_denied (sign-in not approved). */
+    TOKEN_PHASE_UNAVAILABLE  /* Everything else: network failure, malformed/oversized token,
+                               unexpected status, allocation error. */
+} token_phase_t;
+
 /**
  * @brief RFC 8628 s3.4/s3.5 token-polling phase.
  *
@@ -633,13 +760,20 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
  * @param[out] tok_json       Last parsed token JSON tree (caller owns).
  * @param[out] access_token   Acquired access token, or NULL on failure (caller scrubs/frees).
  * @param[out] token_postfields cURL-escaped token request body (caller scrubs and frees).
- * @return `PAM_SUCCESS` when an access token was acquired, or the PAM error
- *         code of the failing sub-step (PAM_AUTH_ERR on timeout/denial).
+ * @param[out] phase            On any non-success return, which user-visible notice the
+ *                              caller should show (TOKEN_PHASE_EXPIRED / TOKEN_PHASE_DENIED
+ *                              / TOKEN_PHASE_UNAVAILABLE; TOKEN_PHASE_UNAVAILABLE default).
+ * @return `PAM_SUCCESS` when an access token was acquired, `PAM_ABORT` on user
+ *         cancellation, or the PAM error code of the failing sub-step.
  */
 static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, const char *pam_user,
                                  const device_auth_t *dev, const char *code_verifier, int pkce_active, CURL *curl,
                                  http_response_t *token_resp, struct json_object **tok_json, char **access_token,
-                                 char **token_postfields) {
+                                 char **token_postfields, token_phase_t *phase) {
+    /* Default notice classification for every failure path below; the sites that
+     * correspond to an expired code or a declined sign-in overwrite it. */
+    *phase = TOKEN_PHASE_UNAVAILABLE;
+
     /*
      * Form-field table for the token request. Every append goes through
      * form_field_append(), which enforces TOKEN_FORM_MAX_FIELDS so an oversized
@@ -697,6 +831,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
             if (!timespec_before(&next_poll, &dev->deadline)) {
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                               "Polling reached device authorization expiration deadline");
+                *phase = TOKEN_PHASE_EXPIRED;
                 break;
             }
 
@@ -725,6 +860,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || !timespec_before(&now, &dev->deadline)) {
             pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling authorization deadline reached");
+            *phase = TOKEN_PHASE_EXPIRED;
             break;
         }
 
@@ -737,6 +873,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
              * CURLOPT_TIMEOUT_MS as "no timeout", so stop polling instead of
              * firing a request with an unbounded lifetime.
              */
+            *phase = TOKEN_PHASE_EXPIRED;
             break;
         }
         long req_timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
@@ -776,7 +913,9 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                 if (*tok_json && json_object_is_type(*tok_json, json_type_object)) {
                     /*
                      * RFC 6749 s5.1: token responses carry a `token_type` field (always "Bearer" for
-                     * device-flow grants). Fail closed on a present-but-foreign token type so a
+                     * device-flow grants; the RFC defines the value as case-insensitive, so compare
+                     * case-insensitively — some providers and proxies send "bearer"). Fail closed on a
+                     * present-but-foreign token type so a
                      * malformed or unexpected token can never be passed to the UserInfo endpoint as
                      * a Bearer credential; a missing field is tolerated (DEBUG-logged) since some
                      * providers omit it.
@@ -784,7 +923,7 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                     struct json_object *j_ttype = NULL;
                     if (json_object_object_get_ex(*tok_json, "token_type", &j_ttype) && j_ttype) {
                         const char *ttype = json_object_get_string(j_ttype);
-                        if (!ttype || strcmp(ttype, "Bearer") != 0) {
+                        if (!ttype || strcasecmp(ttype, "Bearer") != 0) {
                             pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
                                           "Token response token_type '%s' is not 'Bearer'; refusing to use the token",
                                           ttype ? ttype : "<absent>");
@@ -849,6 +988,15 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
                             pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                                           "Adjusted poll interval to %ds after slow_down", interval);
                         } else if (strcmp(err, "authorization_pending") != 0) {
+                            /* Map the definitive OAuth error to its user-visible notice: an
+                             * expired code and a declined sign-in each have their own
+                             * wording; every other definitive error keeps the generic
+                             * service-unavailable notice. */
+                            if (strcmp(err, "expired_token") == 0) {
+                                *phase = TOKEN_PHASE_EXPIRED;
+                            } else if (strcmp(err, "access_denied") == 0) {
+                                *phase = TOKEN_PHASE_DENIED;
+                            }
                             pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
                                           "Non-retryable OAuth authorization error: %s", err);
                             break; /* Non-retryable OAuth authorization error */
@@ -1079,9 +1227,34 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     /* Step 4: Display instructions and verification code to client terminal. The
      * rendered prompt embeds the user code and verification URIs; the stack buffer
      * is scrubbed unconditionally at `cleanup` like the other sensitive material. */
+    /* The target host's hostname is named in the trailing prompt status line as the user's
+     * cross-check against device-code phishing (docs/threat-model.md §8; [prompt] show_host,
+     * on by default): an attacker who social-engineers an approval for a code initiated from
+     * a different machine should not be claiming this host. PAM exposes no peer-address API,
+     * so the connecting client's IP is not (and cannot reliably be) displayed here. The
+     * rendered-prompt safety check below still fail-closes on any hostname containing
+     * non-printable bytes. When show_host is off, the prompt carries no host, the {host}
+     * template token expands to an empty string, and gethostname() is not called at all. The
+     * device-code approval window (provider expires_in, clamped by [runtime] max_poll_seconds —
+     * the module's effective wait limit) reaches the prompt as dev.expires_in: by default it
+     * appears in the built-in default template's trailing status line,
+     * [prompt] show_expiry = false omits it, and any {expiry} template token expands it
+     * regardless. */
+    char host_buf[256];
+    const char *host_disp = "";
+    if (cfg.show_host) {
+        if (gethostname(host_buf, sizeof(host_buf)) == 0) {
+            host_buf[sizeof(host_buf) - 1] = '\0';
+            host_disp = host_buf;
+        } else {
+            host_disp = "(unknown)";
+            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "gethostname() failed (%s); prompt will show an unknown host", strerror(errno));
+        }
+    }
     char prompt_buf[MAX_INIT_MSG_LEN];
-    if (render_prompt_message(&cfg, dev.verification_uri, dev.verification_uri_complete, dev.user_code, prompt_buf,
-                              sizeof(prompt_buf)) != 0) {
+    if (render_prompt_message(&cfg, host_disp, dev.verification_uri, dev.verification_uri_complete, dev.user_code,
+                              dev.expires_in, prompt_buf, sizeof(prompt_buf)) != 0) {
         if (pamh) {
             pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to render prompt message");
         }
@@ -1144,12 +1317,23 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     /* Step 5/6: Build the token request and poll the Token Endpoint (first poll immediate,
      * then RFC 8628 interval spacing with slow_down / transient-error backoff) until token
      * issuance, expiration, denial, or an unrecoverable error. See poll_for_access_token(). */
+    token_phase_t poll_phase = TOKEN_PHASE_UNAVAILABLE;
     retval = poll_for_access_token(pamh, &cfg, active_loglevel, pam_user, &dev, code_verifier, pkce_active, curl,
-                                   &token_resp, &tok_json, &access_token, &token_postfields);
+                                   &token_resp, &tok_json, &access_token, &token_postfields, &poll_phase);
     if (retval != PAM_SUCCESS) {
-        /* User-initiated cancellation (Ctrl-C) gets no notice — the user already knows. */
+        /* User-initiated cancellation (Ctrl-C) gets no notice — the user already knows.
+         * Every other token-phase failure shows the notice matching its outcome: an
+         * expired sign-in code, a declined sign-in request, or the generic
+         * service-unavailable notice for everything else (network failure,
+         * malformed/oversized token, ...). */
         if (retval != PAM_ABORT) {
-            notify_user_failure(pamh, USER_NOTICE_EXPIRED);
+            if (poll_phase == TOKEN_PHASE_DENIED) {
+                notify_user_failure(pamh, USER_NOTICE_NOT_APPROVED);
+            } else if (poll_phase == TOKEN_PHASE_EXPIRED) {
+                notify_user_failure(pamh, USER_NOTICE_EXPIRED);
+            } else {
+                notify_user_failure(pamh, USER_NOTICE_SERVICE);
+            }
         }
         goto cleanup;
     }

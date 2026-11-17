@@ -42,6 +42,8 @@ typedef struct {
     unsigned int claim_capture_group : 1;           /**< Flag set when claim_capture_group key is parsed. */
     unsigned int max_poll_seconds : 1;              /**< Flag set when max_poll_seconds key is parsed. */
     unsigned int init_message : 1;                  /**< Flag set when init_message key is parsed. */
+    unsigned int show_host : 1;                     /**< Flag set when show_host key is parsed. */
+    unsigned int show_expiry : 1;                   /**< Flag set when show_expiry key is parsed. */
     unsigned int case_sensitive : 1;                /**< Flag set when case_sensitive key is parsed. */
     unsigned int loglevel : 1;                      /**< Flag set when loglevel key is parsed. */
     unsigned int issuer : 1;                        /**< Flag set when issuer key is parsed. */
@@ -54,6 +56,9 @@ typedef struct {
     unsigned int allow_users : 1;                   /**< Flag set when allow_users key is parsed. */
     unsigned int deny_users : 1;                    /**< Flag set when deny_users key is parsed. */
     unsigned int allow_root : 1;                    /**< Flag set when allow_root key is parsed. */
+    unsigned int deny_system_uids : 1;              /**< Flag set when deny_system_uids key is parsed. */
+    unsigned int system_uid_min : 1;                /**< Flag set when system_uid_min key is parsed. */
+    unsigned int system_uid_max : 1;                /**< Flag set when system_uid_max key is parsed. */
     unsigned int allow_groups : 1;                  /**< Flag set when allow_groups key is parsed. */
     unsigned int deny_groups : 1;                   /**< Flag set when deny_groups key is parsed. */
     unsigned int enforce_groups : 1;                /**< Flag set when enforce_groups key is parsed. */
@@ -606,6 +611,24 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->allow_root = 1;
             return parse_bool(val, &cfg->allow_root);
+        } else if (strcasecmp(key, "deny_system_uids") == 0) {
+            if (seen->deny_system_uids) {
+                goto duplicate_key;
+            }
+            seen->deny_system_uids = 1;
+            return parse_bool(val, &cfg->deny_system_uids);
+        } else if (strcasecmp(key, "system_uid_min") == 0) {
+            if (seen->system_uid_min) {
+                goto duplicate_key;
+            }
+            seen->system_uid_min = 1;
+            return parse_int_range(val, 0, INT_MAX, &cfg->system_uid_min);
+        } else if (strcasecmp(key, "system_uid_max") == 0) {
+            if (seen->system_uid_max) {
+                goto duplicate_key;
+            }
+            seen->system_uid_max = 1;
+            return parse_int_range(val, 0, INT_MAX, &cfg->system_uid_max);
         } else if (strcasecmp(key, "allow_groups") == 0) {
             if (seen->allow_groups) {
                 goto duplicate_key;
@@ -638,6 +661,18 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             }
             seen->init_message = 1;
             return copy_checked(cfg->init_message, sizeof(cfg->init_message), val);
+        } else if (strcasecmp(key, "show_host") == 0) {
+            if (seen->show_host) {
+                goto duplicate_key;
+            }
+            seen->show_host = 1;
+            return parse_bool(val, &cfg->show_host);
+        } else if (strcasecmp(key, "show_expiry") == 0) {
+            if (seen->show_expiry) {
+                goto duplicate_key;
+            }
+            seen->show_expiry = 1;
+            return parse_bool(val, &cfg->show_expiry);
         }
     } else if (sec == SEC_RUNTIME) {
         if (strcasecmp(key, "max_poll_seconds") == 0) {
@@ -839,6 +874,19 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
         return -1;
     }
 
+    /* claim_regex is an explicit operator decision with no implicit default: an empty
+     * value would otherwise match (or behave differently than) the operator intended,
+     * and the historical default "^(.*)$" accepted any provider claim equal to the PAM
+     * username. Fail the load instead. */
+    if (strlen(cfg->claim_regex) == 0) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "claim_regex must be explicitly set in the [claim] section");
+        }
+        secure_memzero(cfg, sizeof(config_t));
+        return -1;
+    }
+
     /* Verify regular expression syntax validity */
     regex_t reg;
     if (regcomp(&reg, cfg->claim_regex, REG_EXTENDED) != 0) {
@@ -881,6 +929,19 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
         if (pamh) {
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "verify_jwt_claims = true requires both issuer and audience to be configured");
+        }
+        secure_memzero(cfg, sizeof(config_t));
+        return -1;
+    }
+
+    /* An inverted system-account UID range is unsatisfiable and a configuration
+     * error: reject it up front instead of silently denying (or failing to deny)
+     * system accounts at authentication time. */
+    if (cfg->system_uid_min > cfg->system_uid_max) {
+        if (pamh) {
+            pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                          "system_uid_min (%d) must not exceed system_uid_max (%d)", cfg->system_uid_min,
+                          cfg->system_uid_max);
         }
         secure_memzero(cfg, sizeof(config_t));
         return -1;
@@ -931,14 +992,32 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     memset(cfg, 0, sizeof(config_t));
     (void)copy_checked(cfg->scopes, sizeof(cfg->scopes), "openid");
     (void)copy_checked(cfg->claim_field, sizeof(cfg->claim_field), "sub");
-    (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
+    /* No claim_regex default: the identity-mapping regex is required (an implicit
+     * catch-all would let any provider claim that equals the PAM username map to a
+     * local account). parse_config_file() rejects a missing/empty value. */
     cfg->claim_capture_group = 1;
     /* Default bounded to the PAM-safe 120 s ceiling (SSH LoginGraceTime and
      * systemd PAM timeouts are typically shorter than RFC 8628 device-code
      * lifetimes; the operator may still raise it explicitly up to 3600). */
     cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
+    /* Device-code phishing cross-check: the sign-in prompt names the target host's
+     * hostname (built-in default template and the `{host}` template token) by
+     * default; [prompt] show_host = false hides it. */
+    cfg->show_host = 1;
+    /* The device-code approval window (provider expires_in, clamped by max_poll_seconds)
+     * is shown by default: the built-in default template's trailing status line carries
+     * it so the user knows how long they have to complete the approval;
+     * [prompt] show_expiry = false hides it. The `{expiry}` template token works in
+     * any template regardless of this flag. */
+    cfg->show_expiry = 1;
     cfg->loglevel = LOGLEVEL_INFO;
+    /* System-account guard: deny local accounts whose numeric UID falls within the
+     * conventional system range [0..999] before any provider contact; the operator
+     * may disable the guard or narrow/widen the range in [access]. */
+    cfg->deny_system_uids = 1;
+    cfg->system_uid_min = 0;
+    cfg->system_uid_max = 999;
     cfg->verify_jwt_claims = 0;
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;

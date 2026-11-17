@@ -181,10 +181,27 @@ typedef struct {
     char userinfo_endpoint[512];             /**< OpenID Connect UserInfo Endpoint URL. */
     char scopes[256];                        /**< Requested OAuth/OIDC authorization scopes. */
     char claim_field[64];                    /**< JSON field name in UserInfo response containing user identity. */
-    char claim_regex[256];                   /**< Regular expression pattern to extract local username. */
+    char claim_regex[256];                   /**< Regular expression pattern to extract local username. Required: the
+                                              *  operator must set it explicitly (there is no default); config loading
+                                              *  fails closed when it is missing or empty. */
     int claim_capture_group;                 /**< Regex capture group index to select username slice. */
     int max_poll_seconds;                    /**< Maximum total polling time allowed before timing out. */
     char init_message[MAX_INIT_MSG_LEN];     /**< Custom template string for user terminal prompt. */
+    int show_host;                           /**< Flag: 1 (default) to display the target host's hostname in the
+                                              *  sign-in prompt as the user's cross-check against device-code phishing
+                                              *  — named in the trailing status line of the built-in default template
+                                              *  ("Waiting for your approval to sign in to <host>; ...") and expanded by the
+                                              *  `{host}` token in custom templates; 0 hides the host entirely — the
+                                              *  built-in default drops the host clause and `{host}` expands to an
+                                              *  empty string. */
+    int show_expiry;                         /**< Flag: 1 (default) adds the device-code approval window to the
+                                              *  trailing status line of the built-in default template
+                                              *  ("Waiting for your approval to sign in to <host> (expires in
+                                              *  15 minutes); ..."); 0 hides it. The window is the provider's
+                                              *  `expires_in` clamped by `max_poll_seconds`. Independent of this
+                                              *  flag, the `{expiry}` token in any template expands to the
+                                              *  human-readable duration or to an empty string when the window
+                                              *  is unknown. */
     int case_sensitive;                      /**< Flag: 1 for case-sensitive username comparison, 0 otherwise. */
     loglevel_t loglevel; /**< Configured syslog verbosity level (none, error, info, debug, verbose). */
     char issuer[512];    /**< Expected token issuer claim (iss). */
@@ -201,7 +218,17 @@ typedef struct {
                                           allowed). */
     char deny_users[ACCESS_LIST_LEN];  /**< Comma-separated local usernames denied authentication (takes precedence over
                                           allow). */
-    int allow_root; /**< Flag: 1 to permit the `root` account to authenticate; 0 (default) denies root. */
+    int allow_root;                    /**< Flag: 1 to permit uid-0 accounts (`root` and any alternative uid-0 name) to
+                                        *   authenticate; 0 (default) denies every uid-0 account. */
+    int deny_system_uids;              /**< Flag: 1 (default) to deny local accounts whose numeric UID falls within
+                                        *   [system_uid_min, system_uid_max] before any provider contact; 0 disables
+                                        *   the guard. Targets the UID, not the name. A uid-0 account explicitly
+                                        *   permitted via `allow_root` is exempt. */
+    int system_uid_min;                /**< Inclusive lower bound of the numeric-UID range denied by
+                                        *   `deny_system_uids` (default 0, the conventional system-account floor). */
+    int system_uid_max;                /**< Inclusive upper bound of the numeric-UID range denied by
+                                        *   `deny_system_uids` (default 999, the conventional system-account ceiling).
+                                        *   Must be >= `system_uid_min`; an inverted range is rejected at load. */
     char allow_groups[ACCESS_LIST_LEN]; /**< Comma-separated provider groups/roles granting access (any single match
                                            suffices). */
     char deny_groups[ACCESS_LIST_LEN];  /**< Comma-separated provider groups/roles denying access (takes precedence over
@@ -252,10 +279,13 @@ typedef struct {
  * ============================================================================ */
 
 /**
- * @brief Level-filtered wrapper around `pam_vsyslog`.
+ * @brief Level-filtered wrapper around the PAM syslog API.
  *
- * Emits log output via `pam_vsyslog` only if `cfg_level` is not `LOGLEVEL_NONE` and `cfg_level` is
- * greater than or equal to the required `msg_level`.
+ * Emits log output via PAM syslog only if `cfg_level` is not `LOGLEVEL_NONE` and `cfg_level` is
+ * greater than or equal to the required `msg_level`. The formatted line is escaped before it
+ * reaches syslog: bytes outside printable ASCII are replaced with C-style escapes ("\n", "\r",
+ * "\t" or "\xHH") so untrusted values embedded by callers (PAM usernames, provider-supplied
+ * claim values) cannot forge or garble log records.
  *
  * @param[in] pamh      PAM framework handle.
  * @param[in] cfg_level Active runtime log level threshold.
@@ -557,20 +587,28 @@ int pkce_compute_s256_challenge(const char *verifier, char *out, size_t out_len)
 /**
  * @brief Formats prompt display string presented to user during authentication.
  *
- * Evaluates configured template tokens ({url}, {url_complete}, {code}) and newline escape sequences.
- * The fully rendered result is validated line-by-line for terminal-injection safety
- * (newline-tolerant `is_safe_terminal_string`); unsafe output fails the call.
+ * Evaluates configured template tokens ({host}, {url}, {url_complete}, {code}, {expiry}) and
+ * newline escape sequences. The {host} token carries the target host's hostname so the approving
+ * user can tell which machine the sign-in request belongs to (device-code phishing mitigation; see
+ * docs/threat-model.md §8). The {expiry} token carries the human-readable device-code approval
+ * window (the provider's `expires_in`, clamped by `max_poll_seconds`; e.g. "15 minutes"), or
+ * expands to an empty string when the window is unknown. The fully rendered result is validated
+ * line-by-line for terminal-injection safety (newline-tolerant `is_safe_terminal_string`); unsafe
+ * output fails the call, including hostnames that are not printable ASCII (fail-closed).
  *
  * @param[in]  cfg          Active configuration context.
+ * @param[in]  host         Target host's hostname (e.g. from `gethostname()`).
  * @param[in]  url          Base verification URI string.
  * @param[in]  url_complete Complete verification URI string containing embedded user code (optional).
  * @param[in]  code         User verification code string.
+ * @param[in]  expires_in   Device-code approval window in seconds (provider `expires_in`, clamped
+ *                          to `[runtime] max_poll_seconds`); 0 or negative means unknown.
  * @param[out] out          Buffer receiving rendered prompt text.
  * @param[in]  out_len      Destination buffer size in bytes.
  * @return 0 on success, -1 on buffer overflow, rendering error, or terminal-safety rejection.
  */
-int render_prompt_message(const config_t *cfg, const char *url, const char *url_complete, const char *code, char *out,
-                          size_t out_len);
+int render_prompt_message(const config_t *cfg, const char *host, const char *url, const char *url_complete,
+                          const char *code, int expires_in, char *out, size_t out_len);
 
 /**
  * @brief Matches raw identity claim value against expected PAM username using regex mapping rules.
@@ -590,12 +628,18 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
  *
  * Evaluates the configured `deny_users` and `allow_users` lists (comma-separated, honoring
  * `case_sensitive`) for the requesting local account. Denial lists take precedence over
- * allow lists. The `root` account is denied by default and only authenticates when
- * `allow_root` is explicitly enabled, regardless of the user lists. This is a purely
+ * allow lists. Any uid-0 account (the account named `root` plus any alternative uid-0
+ * name, e.g. "toor") is denied by default and only authenticates when `allow_root` is
+ * explicitly enabled, regardless of the user lists. Independently, when
+ * `deny_system_uids` is enabled (default), any local account whose numeric UID falls
+ * within [system_uid_min, system_uid_max] (default 0-999, the conventional
+ * system-account range) is denied regardless of the user lists; a uid-0 account already
+ * exempted via `allow_root` is not re-denied by this range guard. This is a purely
  * local decision made before any provider interaction.
  *
  * @param[in] pam_user  Target POSIX system username.
- * @param[in] cfg       Module configuration parameters containing the account lists.
+ * @param[in] cfg       Module configuration parameters containing the account lists and
+ *                      the uid-range guard settings.
  * @param[in] pamh      PAM handle for syslog logging (optional).
  * @return 1 if the account is permitted to authenticate, 0 if it is denied.
  */

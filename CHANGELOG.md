@@ -5,6 +5,203 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-11-17
+
+### Added
+
+- **Security hardening (device-code phishing, `src/pam_module.c`, prompt):** the sign-in
+  prompt now names the target host's hostname in its trailing status line
+  ("Waiting for your approval to sign in to `<host>`; ...") so the approving user can cross-check
+  *which machine* the sign-in belongs to — the one piece of context a user can use
+  against the known device-code phishing attack. The display is opt-out via the new
+  `[prompt] show_host` key (default `true`; when `false` the host clause is dropped and
+  the `{host}` template token expands to an empty string). `render_prompt_message()`
+  gained a `host` parameter and a new `{host}` `init_message` template placeholder; the
+  default template and every shipped `init_message` (`config/pam_oidc_device.conf`,
+  `examples/*.conf`, the e2e sandbox config) carry the host clause in the trailing
+  status line. The hostname is rendered through the existing terminal-safety pipeline,
+  so a hostname with non-printable bytes fails authentication fail-closed. Note: the
+  PAM API exposes no peer address, so the *connecting client's* IP cannot be displayed
+  by the module; users should instead correlate the IdP approval page's client context
+  with the host shown in the prompt.
+
+- **Prompt approval-window display (`src/pam_module.c`, `src/config.c`):** the trailing
+  prompt status line can now tell the user how long they have to complete the
+  approval. The new `[prompt] show_expiry` key (default `true`) adds an
+  "(expires in 15 minutes)" clause to the built-in default template's trailing
+  status line, and every `init_message` template can carry the new `{expiry}`
+  placeholder, which expands to the provider's `expires_in` (clamped by
+  `[runtime] max_poll_seconds` — the module's effective wait limit) in human units
+  ("45 seconds", "15 minutes", "1 hour"); when the provider does not advertise an
+  expiry the token expands to an empty string and the default-template clause is
+  omitted. `render_prompt_message()` gained an `expires_in` parameter. No shipped
+  `init_message` carries the `{expiry}` token, so the only out-of-the-box wording
+  change is the built-in default template: when the provider advertises an expiry,
+  its trailing status line now carries the clause (`[prompt] show_expiry = false`
+  reverts to the previous wording).
+
+- **Security documentation (`docs/threat-model.md`):** the threat model now documents
+  **device-code phishing** as a High **residual risk** that PKCE and the identity
+  checks do *not* prevent (the attacker initiates the flow from the target host and
+  holds the PKCE secret; the identity really is the victim's). The "Device Code
+  Interception / Replay" row, which implied PKCE stops a "code-phishing relay", was
+  corrected to its actual scope (an *interceptor* who was not the flow's initiator).
+  New §8 gives the mitigation guidance: host identification in the prompt, preferring
+  providers whose approval page shows client context, and pairing the module with
+  network restrictions or a second factor for privileged accounts.
+
+- **System-account UID-range guard (`src/identity.c`, `src/config.c`, `docs/access-control.md`):**
+  the new `[access] deny_system_uids` key (default `true`) refuses local accounts whose
+  *numeric UID* falls within `[system_uid_min, system_uid_max]` (default `0-999`, the
+  conventional system-account range) with `PAM_PERM_DENIED` before any provider contact —
+  the same fail-closed, uid-not-name semantics as the existing uid-0/root gate, so
+  long-lived application or service accounts holding in-range UIDs can no longer
+  authenticate even when listed in `allow_users`. A uid-0 account explicitly permitted
+  via `allow_root = true` is exempt from this second gate; names that resolve to no
+  local account are not affected. `load_config()` rejects an inverted range
+  (`system_uid_min` > `system_uid_max`) and out-of-bounds values at config load. Existing
+  `allow_root`, `allow_users`, and `deny_users` behavior is unchanged.
+
+### Changed
+
+- **`[claim] claim_regex` is now required — there is no default**
+  (`src/config.c`, `config/pam_oidc_device.conf`, docs): the historical implicit
+  default `^(.*)$` mapped *any* provider claim equal to the local username onto
+  that account. Config loading now fails closed when `claim_regex` is missing
+  or empty (unit test: `test_parse_config_file_claim_regex_required`). The
+  shipped sample config and the quick-start / access-control documentation are
+  now internally consistent: a bare `preferred_username` is matched with an
+  anchored username character set, and the domain-pinning e-mail pattern
+  (`^([^@]+)@your[.]domain$`) is documented for domain-pinned claims.
+- **All module log output is sanitized before it reaches syslog**
+  (`src/http.c`): `pam_oauth_log()` now formats the line, replaces every byte
+  outside printable ASCII with a C-style escape (`\n`, `\r`, `\t`, `\xHH`), and
+  passes the escaped message to PAM syslog via a literal `"%s"`. PAM
+  usernames, provider-supplied claim values, and error strings can no longer
+  inject control characters that forge or garble syslog records.
+- **Explicit proxy handling in `http_request()` (`src/http.c`):**
+  `CURLOPT_PROXY` is now set to an empty string, overriding libcurl's fallback
+  to the `*_proxy` environment variables. Under setuid callers (e.g. `su`) that
+  environment belongs to the calling user, who could otherwise steer the
+  module's HTTPS traffic. No proxy support is provided by design.
+
+- **User-visible failure notices now match the token-phase outcome**
+  (`src/pam_module.c`, `tests/e2e/run_e2e.sh`): previously *every* token-polling
+  failure (other than a user abort) told the user the sign-in code had expired,
+  even when the provider had declined the sign-in or the network path was simply
+  broken. `poll_for_access_token()` now classifies its failure outcome via a new
+  `token_phase_t` out-parameter, and `pam_sm_authenticate()` maps it to the
+  matching notice: an expired code (poll deadline reached, or the provider's
+  `expired_token` error) keeps the "sign-in was not approved in time" notice; a
+  provider `access_denied` (the sign-in request was declined / never approved)
+  gets its own new "sign-in was declined" notice; every other token-phase
+  failure (fatal network error, `token_type` mismatch, oversized or unusable
+  token, unexpected response status) gets the generic "identity provider service
+  is unavailable" notice. No authentication outcome, PAM status code, or log
+  detail changed — only which user-visible notice is shown. The e2e suite now
+  asserts the exact notice shown in the declined-sign-in and expired-code
+  scenarios.
+
+### Fixed
+
+- **Security (memory scrub, `src/http.c`):** the request-header list is now
+  scrubbed before `curl_slist_free_all()` in `http_request()`.
+  `curl_slist_append()` keeps its own copy of the `Authorization: Bearer
+  <token>` header, and that copy previously survived in process memory after
+  the request; it is now securely zeroed alongside every other in-module copy
+  of the access token.
+- **Security (memory scrub, `src/http.c`):** `discovery_probe_pkce()` now
+  scrubs the provider-parsed discovery document with `secure_zero_json_tree()`
+  before `json_object_put()` on both exit paths (the not-a-JSON-object branch
+  and the success path). Provider-controlled JSON string elements can no longer
+  survive in freed json-c memory, closing the last spot where a provider-parsed
+  tree was released unscrubbed and aligning with the module-wide
+  scrub-before-release discipline that every other parse site already followed.
+- **Security (PII in logs, `src/identity.c`, `src/jwt.c`):** provider claim
+  values no longer appear in log lines emitted below the VERBOSE level,
+  matching the module's own PII policy (claim values are VERBOSE-gated).
+  `verify_claim()` now logs the raw claim's *length* instead of its value on a
+  regex non-match (DEBUG) and the extracted identity's *length* instead of the
+  value on both the verified (DEBUG) and mismatch (ERROR) paths; the JWT
+  issuer/audience mismatch messages (ERROR) now log the received value's
+  *length* instead of the value itself (the configured expectation, which is
+  administrator-controlled, is still logged). No authentication outcome,
+  return value, or scrubbing behavior changed.
+
+- **Security (JWT claim inspection, `src/jwt.c`):** the local `exp`/`nbf`
+  NumericDate checks now reject non-finite values. json-c accepts the
+  non-standard `NaN` and `Infinity` literals as `json_type_double`, and every
+  comparison with NaN is false — so a token carrying `"exp": NaN` previously
+  passed the expiry check unconditionally (and a NaN `nbf` skipped the
+  not-yet-valid check). Claims whose value is not finite now fail closed with
+  an audit-log entry. Regression coverage: a new CMocka case
+  (`test_jwt_non_finite_claims_rejected`) asserts rejection of `NaN` and
+  `Infinity` `exp` and `NaN` `nbf`, with a finite far-future `exp` control
+  that still passes.
+
+- **Protocol compliance (token endpoint, `src/pam_module.c`):** the token
+  response's `token_type` is now compared case-insensitively against "Bearer"
+  (`strcasecmp`), as RFC 6749 §5.1 defines the value as case-insensitive. Providers
+  and proxies that send lowercase `"bearer"` were previously refused with
+  `PAM_AUTH_ERR` (a valid sign-in rejected). Fail-closed behavior for missing or
+  foreign token types is unchanged.
+
+- **Security (`verify_group_membership`, `src/identity.c`):** A deny-only group policy
+  (`deny_groups` set, `allow_groups` empty) can no longer be bypassed by the *shape* of
+  the provider's group/role claim. Previously, a claim that was missing, JSON `null`, of
+  an unrecognized type (e.g. numeric), or a comma-delimited string that failed to fit the
+  fixed 256-byte scratch buffer (split silently skipped) was treated as "nothing to
+  check" and allowed — so anyone in enough groups, or any provider-side change in how
+  `groups` is serialized, could bypass a site's deny list (e.g. blocking
+  `contractors`). With any group policy active, the check is now fail-closed: missing
+  or null claims, unrecognized claim types, non-string array elements (with a deny list
+  configured), and allocation/parse failures all refuse access. Comma-delimited string
+  claims are now split in place on a heap copy sized to the input instead of a fixed
+  256-byte buffer, so arbitrarily long claims are fully matched. Allow-only policies
+  keep their previous skip semantics for non-string array elements.
+
+- **Security (`allow_root` guard, `src/identity.c`):** The root guard now protects
+  **uid 0, not just the name `root`**. Previously `verify_user_access()` refused only the
+  account literally named `root`, so any alternative uid-0 account (e.g. `toor`, or a
+  site-specific admin alias created with `useradd -o -u 0`) could authenticate even with
+  `allow_root = false`. The gate now resolves the requesting PAM username through
+  `getpwnam_r()` and refuses any account whose uid is 0 unless `allow_root = true` is
+  explicitly set; the name-based `root` check remains as a first line of defense. A name
+  that resolves to no local account cannot be a local uid-0 account (uid-0 accounts
+  always exist in the account database), so it is not refused by this gate — only the
+  `allow_users`/`deny_users` lists decide it. Regression coverage: a new e2e scenario
+  (`uid0-alias-denied`) creates a `toor` uid-0 account in the sandbox and asserts
+  `PAM_PERM_DENIED`. The scenario temporarily strips `allow_users` from the sandbox
+  config so that only the uid-0 gate can refuse the alias account.
+
+- **Testing (`tests/test_suite.c`):** Fixed an inverted return-value check in the
+  `group_claim_uinfo()` CMocka helper introduced with the F2 regression test. The
+  helper tested `!json_object_object_add(...)`, but `json_object_object_add()`
+  returns `0` on **success** and `-1` on failure — so the "error" path (free the tree,
+  return NULL) ran exactly when the add succeeded, and `test_verify_group_membership_deny_only_fail_closed`
+  failed on every Linux build (gcc and clang alike) with `assert_non_null(uinfo)`.
+  The helper now checks `json_object_object_add(...) != 0`. No module behavior
+  changed: production code never calls `json_object_object_add()`, and the bug was
+  invisible in the isolated macOS harnesses (which verified the `verify_group_membership()`
+  gate logic, not the helper) because the full CMocka suite cannot build without Linux
+  PAM headers.
+
+### Documentation
+
+- **sshd rate-limit hardening (`docs/getting-started.md`, `docs/threat-model.md`):**
+  documented how to keep connection loops from exhausting the provider-side
+  rate limit for this OAuth client. Every SSH connection for an allowed
+  username issues a device-code request *before* the user enters anything, so
+  a scanner, brute-forcer, or retry loop can lock legitimate users out (429 /
+  `slow_down`); because the PAM API exposes no peer address, per-source
+  throttling belongs in the SSH layer. Getting Started §4 gains a "Protecting
+  the Provider from Connection Bursts" subsection with a recommended drop-in
+  (`PerSourcePenalties yes` on OpenSSH ≥ 9.7, `MaxStartups 5:30:100`,
+  `MaxAuthTries 3`, `LoginGraceTime 120`) and a `sshd -T` verification
+  command, and the threat model gains §9 plus a "Provider Rate-Limit
+  Exhaustion (Self-DoS)" matrix row covering the attack, the in-module scope
+  boundary, the control table, and monitoring. No module behavior changed.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added
