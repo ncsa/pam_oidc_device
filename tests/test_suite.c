@@ -296,9 +296,14 @@ static void test_terminal_and_user_code_sanitizer(void **state) {
  * @brief Unit test verifying custom user prompt rendering, buffer overflow protection, and the
  *        rendered-prompt terminal-safety check (newline-tolerant `is_safe_terminal_string`)[cite: 7].
  *
- * Tests token substitution (`{url}`, `{code}`, `{url_complete}`, `\n`), buffer capacity limits,
- * default-template rendering, and rejection of C0 control characters (ANSI escapes, tabs)
- * introduced via the template, provider URL, or user code[cite: 7].
+ * Tests token substitution (`{host}`, `{url}`, `{code}`, `{url_complete}`, `{expiry}`, `\n`),
+ * buffer capacity limits,
+ * default-template rendering (the target host named in the trailing status line when `show_host`
+ * is set, as the user's cross-check against device-code phishing; absent when `show_host` is
+ * off; the device-code approval window named in the same line when `show_expiry` is set and the
+ * window is known; absent when `show_expiry` is off or the window is unknown), and rejection of
+ * C0 control characters (ANSI escapes, tabs)
+ * introduced via the template, provider URL, user code, or hostname[cite: 7].
  *
  * @param[in,out] state CMocka test state context (unused)[cite: 7].
  */
@@ -309,56 +314,186 @@ static void test_prompt_rendering(void **state) {
     strncpy(cfg.init_message, "\\nURL: {url}\\nCode: {code}\\nDirect: {url_complete}\\n", sizeof(cfg.init_message) - 1);
 
     char out[256];
-    int res =
-        render_prompt_message(&cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", out, sizeof(out));
+    int res = render_prompt_message(&cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 0,
+                                    out, sizeof(out));
     assert_int_equal(res, 0);
     assert_string_equal(out, "\nURL: https://auth.edu/dev\nCode: BCD-123\nDirect: https://auth.edu/dev?c=1\n");
 
+    /* {host} placeholder substitutes the target hostname when show_host is set (device-code
+     * phishing mitigation) */
+    config_t host_cfg;
+    memset(&host_cfg, 0, sizeof(host_cfg));
+    host_cfg.show_host = 1;
+    strncpy(host_cfg.init_message, "Host {host} at {url} with code {code}\\n", sizeof(host_cfg.init_message) - 1);
+    char host_out[256];
+    assert_int_equal(render_prompt_message(&host_cfg, "db-prod-3", "https://auth.edu/dev", NULL, "BCD-123", 0, host_out,
+                                           sizeof(host_out)),
+                     0);
+    assert_string_equal(host_out, "Host db-prod-3 at https://auth.edu/dev with code BCD-123\n");
+
+    /* With show_host off the {host} token expands to an empty string (host display gate) */
+    config_t host_off_cfg;
+    memset(&host_off_cfg, 0, sizeof(host_off_cfg));
+    strncpy(host_off_cfg.init_message, "Host {host} at {url} with code {code}\\n",
+            sizeof(host_off_cfg.init_message) - 1);
+    char host_off_out[256];
+    assert_int_equal(render_prompt_message(&host_off_cfg, "db-prod-3", "https://auth.edu/dev", NULL, "BCD-123", 0,
+                                           host_off_out, sizeof(host_off_out)),
+                     0);
+    assert_string_equal(host_off_out, "Host  at https://auth.edu/dev with code BCD-123\n");
+
     /* Verify buffer overflow / truncation handling[cite: 7] */
     char small_out[20];
-    int trunc_res = render_prompt_message(&cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123",
-                                          small_out, sizeof(small_out));
+    int trunc_res = render_prompt_message(&cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
+                                          "BCD-123", 0, small_out, sizeof(small_out));
     assert_int_equal(trunc_res, -1);
 
     /* Default template (empty init_message) must render and pass the terminal-safety check[cite: 7] */
     config_t def_cfg;
     memset(&def_cfg, 0, sizeof(def_cfg));
+    def_cfg.show_host = 1;
     char def_out[512];
-    int def_res = render_prompt_message(&def_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123",
-                                        def_out, sizeof(def_out));
+    int def_res = render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
+                                        "BCD-123", 0, def_out, sizeof(def_out));
     assert_int_equal(def_res, 0);
     /* The compact default template carries no leading blank line (the QR block's bottom quiet
-     * zone provides separation when the QR code is shown) and no internal blank line[cite: 7] */
-    assert_string_equal(def_out,
+     * zone provides separation when the QR code is shown), no internal blank line, and names
+     * the target host in the trailing status line so the approving user can cross-check which
+     * machine the sign-in belongs to[cite: 7] */
+    assert_string_equal(
+        def_out,
+        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+        "  (Direct: https://auth.edu/dev?c=1)\n"
+        "Waiting for your approval to sign in to testhost; this session completes automatically once you sign in.\n");
+    char def_plain_out[512];
+    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
+                                           def_plain_out, sizeof(def_plain_out)),
+                     0);
+    assert_string_equal(
+        def_plain_out,
+        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+        "Waiting for your approval to sign in to testhost; this session completes automatically once you sign in.\n");
+
+    /* With show_host off the built-in default drops the host clause entirely */
+    config_t def_off_cfg;
+    memset(&def_off_cfg, 0, sizeof(def_off_cfg));
+    char def_off_out[512];
+    assert_int_equal(render_prompt_message(&def_off_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
+                                           "BCD-123", 0, def_off_out, sizeof(def_off_out)),
+                     0);
+    assert_string_equal(def_off_out,
                         "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
                         "  (Direct: https://auth.edu/dev?c=1)\n"
                         "Waiting for your approval; this session completes automatically once you sign in.\n");
-    char def_plain_out[512];
-    assert_int_equal(
-        render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123", def_plain_out, sizeof(def_plain_out)),
-        0);
-    assert_string_equal(def_plain_out,
+    char def_off_plain_out[512];
+    assert_int_equal(render_prompt_message(&def_off_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
+                                           def_off_plain_out, sizeof(def_off_plain_out)),
+                     0);
+    assert_string_equal(def_off_plain_out,
                         "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
                         "Waiting for your approval; this session completes automatically once you sign in.\n");
 
+    /* With show_expiry on the built-in default carries the "(expires in ...)" clause in the
+     * trailing status line; the window is the provider's expires_in clamped by
+     * [runtime] max_poll_seconds, rendered in human units */
+    config_t def_exp_cfg;
+    memset(&def_exp_cfg, 0, sizeof(def_exp_cfg));
+    def_exp_cfg.show_host = 1;
+    def_exp_cfg.show_expiry = 1;
+    char def_exp_out[512];
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
+                                           "BCD-123", 900, def_exp_out, sizeof(def_exp_out)),
+                     0);
+    assert_string_equal(def_exp_out,
+                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+                        "  (Direct: https://auth.edu/dev?c=1)\n"
+                        "Waiting for your approval to sign in to testhost (expires in 15 minutes); this session "
+                        "completes automatically "
+                        "once you sign in.\n");
+    /* Sub-minute windows render in seconds (plain-URL form, no Direct line) */
+    char def_exp_sec_out[512];
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 45,
+                                           def_exp_sec_out, sizeof(def_exp_sec_out)),
+                     0);
+    assert_string_equal(
+        def_exp_sec_out,
+        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+        "Waiting for your approval to sign in to testhost (expires in 45 seconds); this session completes "
+        "automatically once you sign in.\n");
+    /* show_expiry on but the window unknown (0): the clause is omitted entirely */
+    char def_exp_unknown_out[512];
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
+                                           def_exp_unknown_out, sizeof(def_exp_unknown_out)),
+                     0);
+    assert_string_equal(
+        def_exp_unknown_out,
+        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+        "Waiting for your approval to sign in to testhost; this session completes automatically once you "
+        "sign in.\n");
+    /* show_expiry off with a known window: the approval window never appears in the
+     * built-in default */
+    char def_noexp_out[512];
+    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
+                                           "BCD-123", 900, def_noexp_out, sizeof(def_noexp_out)),
+                     0);
+    assert_string_equal(
+        def_noexp_out,
+        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
+        "  (Direct: https://auth.edu/dev?c=1)\n"
+        "Waiting for your approval to sign in to testhost; this session completes automatically once you "
+        "sign in.\n");
+
+    /* {expiry} template token expands to the human-readable approval window in any template
+     * (independent of show_expiry), or to an empty string when the window is unknown */
+    config_t exp_cfg;
+    memset(&exp_cfg, 0, sizeof(exp_cfg));
+    strncpy(exp_cfg.init_message, "Approval window: {expiry}\\n", sizeof(exp_cfg.init_message) - 1);
+    char exp_out[256];
+    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 900, exp_out,
+                                           sizeof(exp_out)),
+                     0);
+    assert_string_equal(exp_out, "Approval window: 15 minutes\n");
+    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 3600, exp_out,
+                                           sizeof(exp_out)),
+                     0);
+    assert_string_equal(exp_out, "Approval window: 1 hour\n");
+    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, exp_out,
+                                           sizeof(exp_out)),
+                     0);
+    assert_string_equal(exp_out, "Approval window: \n");
+
     /* Rendered-prompt terminal-injection defense: ANSI escape bytes in the template,
-     * the provider URL, or the user code must fail rendering[cite: 7] */
+     * the provider URL, the user code, or the hostname must fail rendering[cite: 7] */
     config_t esc_cfg;
     memset(&esc_cfg, 0, sizeof(esc_cfg));
     strncpy(esc_cfg.init_message, "Code: \x1b[31m{code}\x1b[0m", sizeof(esc_cfg.init_message) - 1);
     char esc_out[512];
-    assert_int_equal(render_prompt_message(&esc_cfg, "https://auth.edu/dev", NULL, "BCD-123", esc_out, sizeof(esc_out)),
+    assert_int_equal(render_prompt_message(&esc_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
+                                           sizeof(esc_out)),
                      -1);
-    assert_int_equal(
-        render_prompt_message(&def_cfg, "https://auth.edu/dev\x1b[31m", NULL, "BCD-123", esc_out, sizeof(esc_out)), -1);
-    assert_int_equal(
-        render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123\x1b[0m", esc_out, sizeof(esc_out)), -1);
+    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev\x1b[31m", NULL, "BCD-123", 0,
+                                           esc_out, sizeof(esc_out)),
+                     -1);
+    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123\x1b[0m", 0,
+                                           esc_out, sizeof(esc_out)),
+                     -1);
+    /* A hostname containing a non-printable byte is rejected fail-closed (the rendered-prompt
+     * check applies to the whole output, host bytes included)[cite: 7] */
+    assert_int_equal(render_prompt_message(&def_cfg, "bad\x01host", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
+                                           sizeof(esc_out)),
+                     -1);
+    /* With show_host off the hostname never reaches the rendered output, so a non-printable
+     * hostname cannot fail the terminal-safety check */
+    assert_int_equal(render_prompt_message(&def_off_cfg, "bad\x01host", "https://auth.edu/dev", NULL, "BCD-123", 0,
+                                           esc_out, sizeof(esc_out)),
+                     0);
 
     /* Tab (C0) characters in a custom template are also rejected[cite: 7] */
     config_t tab_cfg;
     memset(&tab_cfg, 0, sizeof(tab_cfg));
     strncpy(tab_cfg.init_message, "Code:\t{code}", sizeof(tab_cfg.init_message) - 1);
-    assert_int_equal(render_prompt_message(&tab_cfg, "https://auth.edu/dev", NULL, "BCD-123", esc_out, sizeof(esc_out)),
+    assert_int_equal(render_prompt_message(&tab_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
+                                           sizeof(esc_out)),
                      -1);
 }
 
@@ -568,6 +703,55 @@ static void test_jwt_numeric_date_and_exp_policy(void **state) {
     /* Missing exp is rejected when require_exp_claim is enabled. */
     cfg.require_exp_claim = 1;
     assert_int_equal(verify_token_metadata(no_exp, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test verifying that non-finite exp/nbf claims are rejected.
+ *
+ * json-c accepts the non-standard `NaN` and `Infinity` literals as
+ * json_type_double, and every comparison with NaN is false — without an
+ * explicit finiteness check, a token carrying `"exp": NaN` would bypass the
+ * expiry check unconditionally.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_non_finite_claims_rejected(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://sts.windows.net/tenant/", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "00000003-0000-0000-c000-000000000000", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Payload with "exp": NaN (json-c parses it as json_type_double). */
+    const char *exp_nan =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjpOYU59.sig";
+
+    /* Payload with "exp": Infinity. */
+    const char *exp_inf =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjpJbmZpbml0eX0.sig";
+
+    /* Payload with "nbf": NaN. */
+    const char *nbf_nan =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwibmJmIjpOYU59.sig";
+
+    /* Control: a finite far-future exp is still accepted. */
+    const char *exp_future =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjoyNTI0NjA4MDAwfQ.sig";
+
+    assert_int_equal(verify_token_metadata(exp_nan, &cfg, NULL), -1);
+    assert_int_equal(verify_token_metadata(exp_inf, &cfg, NULL), -1);
+    assert_int_equal(verify_token_metadata(nbf_nan, &cfg, NULL), -1);
+    assert_int_equal(verify_token_metadata(exp_future, &cfg, NULL), 0);
 }
 
 /**
@@ -1010,10 +1194,55 @@ static void test_pkce_s256_challenge(void **state) {
  * @brief Unit test verifying local account allow/deny list enforcement.
  *
  * Exercises `verify_user_access` for no-lists, allow, deny, deny-precedence-over-allow,
- * and case-insensitive matching behaviors.
+ * case-insensitive matching, the uid-0 (root) gate semantics, and the system-account
+ * uid-range gate (deny_system_uids) semantics.
  *
  * @param[in,out] state CMocka test state context (unused).
  */
+/**
+ * @brief Locate the first non-root local account whose uid lies in the conventional system
+ *        range [1..999], returning its name and uid.
+ *
+ * No such account name (or uid) is guaranteed on the supported platforms: openSUSE ships no
+ * account at all below uid 1000, and RHEL and Debian assign different uids to conventional
+ * names such as "daemon" and "bin" — callers must therefore treat "not found" as vacuous.
+ * The static /etc/passwd file is parsed directly because the getpwent_r/setgrent APIs
+ * require _GNU_SOURCE, which the test target is not compiled with.
+ *
+ * @param[out] out_name    Receives the account name; must be at least 32 bytes.
+ * @param[out] out_uid     Receives the account's numeric uid.
+ * @return 1 if an account was found, 0 otherwise.
+ */
+static int find_system_range_account(char *out_name, int *out_uid) {
+    FILE *fp = fopen("/etc/passwd", "re");
+    if (fp == NULL) {
+        return 0;
+    }
+    int found = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        /* name (field 1) : ... : uid (field 3) : ... */
+        char *f1_end = strchr(line, ':');
+        char *f2_end = (f1_end != NULL) ? strchr(f1_end + 1, ':') : NULL;
+        char *f3_end = (f2_end != NULL) ? strchr(f2_end + 1, ':') : NULL;
+        if (f1_end == NULL || f2_end == NULL || f3_end == NULL) {
+            continue;
+        }
+        *f1_end = '\0';
+        *f3_end = '\0';
+        long uid = strtol(f2_end + 1, NULL, 10);
+        if (uid >= 1 && uid <= 999) {
+            strncpy(out_name, line, 31);
+            out_name[31] = '\0';
+            *out_uid = (int)uid;
+            found = 1;
+            break;
+        }
+    }
+    (void)fclose(fp);
+    return found;
+}
+
 static void test_verify_user_access(void **state) {
     (void)state;
     config_t cfg;
@@ -1036,6 +1265,19 @@ static void test_verify_user_access(void **state) {
     assert_int_equal(verify_user_access("alice", &cfg, NULL), 1);
     cfg.allow_root = 1;
     assert_int_equal(verify_user_access("root", &cfg, NULL), 1);
+
+    /* The root guard targets uid 0, not the name "root": a name that resolves to no
+     * local account cannot be a local uid-0 account (uid-0 accounts always exist in the
+     * account database), so the uid gate must NOT refuse it -- only the user lists
+     * decide. The name is longer than the Linux 32-character login-name limit, so it
+     * is guaranteed absent on any host. (The authoritative uid-0 alias case is covered
+     * deterministically by the e2e 'toor' scenario.) */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
+    strncpy(cfg.deny_users, "f3_unit_test_absent_user_name_long", sizeof(cfg.deny_users) - 1);
+    assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 0);
 
     /* deny_users blocks listed accounts, permits the rest. */
     memset(&cfg, 0, sizeof(cfg));
@@ -1070,6 +1312,68 @@ static void test_verify_user_access(void **state) {
     assert_int_equal(verify_user_access("alice", &cfg, NULL), 1);
     assert_int_equal(verify_user_access("BOB", &cfg, NULL), 1);
     assert_int_equal(verify_user_access("carol", &cfg, NULL), 0);
+
+    /* System-account uid-range gate: with the guard on at the default range (0-999), a
+     * uid-0 account is denied even when listed in allow_users — "root" resolves to uid 0
+     * by the module itself, so this is deterministic on every supported platform. A name
+     * that resolves to no local account cannot carry an in-range uid and is not denied by
+     * the gate. No non-root account name (or uid) in-range is guaranteed on every
+     * platform (openSUSE ships no accounts below uid 1000; RHEL and Debian disagree on
+     * "daemon"/"bin"), so the assertions covering one use a dynamically located account
+     * and are vacuously skipped where none exists. */
+    char peer[32];
+    int peer_uid = 0;
+    int have_peer = find_system_range_account(peer, &peer_uid);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.deny_system_uids = 1;
+    cfg.system_uid_min = 0;
+    cfg.system_uid_max = 999;
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
+    assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
+    strncpy(cfg.allow_users, "root", sizeof(cfg.allow_users) - 1);
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
+    cfg.allow_users[0] = '\0';
+    /* A non-root in-range account is denied by the range gate even though it is not
+     * listed in allow_users (the guard targets the uid, not the user lists). */
+    if (have_peer) {
+        assert_int_equal(verify_user_access(peer, &cfg, NULL), 0);
+    }
+    /* Raising the lower bound above the account's uid permits it; disabling the guard
+     * does as well. */
+    if (have_peer) {
+        cfg.system_uid_min = peer_uid + 1;
+        assert_int_equal(verify_user_access(peer, &cfg, NULL), 1);
+        cfg.system_uid_min = 0;
+        cfg.deny_system_uids = 0;
+        assert_int_equal(verify_user_access(peer, &cfg, NULL), 1);
+    }
+    /* An explicitly inverted range is unsatisfiable (load_config() rejects it) and is
+     * treated as inactive by the gate. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.deny_system_uids = 1;
+    cfg.system_uid_min = 999;
+    cfg.system_uid_max = 0;
+    if (have_peer) {
+        assert_int_equal(verify_user_access(peer, &cfg, NULL), 1);
+    }
+    /* The allow_root opt-in exempts uid-0 accounts from both the uid-0 gate and the range
+     * gate: root is permitted while other in-range system accounts are still refused. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.deny_system_uids = 1;
+    cfg.system_uid_min = 0;
+    cfg.system_uid_max = 999;
+    cfg.allow_root = 1;
+    assert_int_equal(verify_user_access("root", &cfg, NULL), 1);
+    if (have_peer) {
+        assert_int_equal(verify_user_access(peer, &cfg, NULL), 0);
+    }
 
     /* NULL pointers are rejected. */
     assert_int_equal(verify_user_access(NULL, &cfg, NULL), 0);
@@ -1159,6 +1463,122 @@ static void test_verify_group_membership_lists(void **state) {
 }
 
 /**
+ * @brief Test helper building a UserInfo object whose `groups` field holds `claim` as a JSON string.
+ *
+ * @param[in] claim NUL-terminated group claim string.
+ * @return New `{"groups": claim}` json_object tree (caller owns it), or NULL on allocation failure.
+ */
+static struct json_object *group_claim_uinfo(const char *claim) {
+    struct json_object *uinfo = json_object_new_object();
+    if (!uinfo) {
+        return NULL;
+    }
+    struct json_object *j_claim = json_object_new_string(claim);
+    /* json_object_object_add() returns 0 on success and -1 on failure, so a
+     * nonzero return (not a falsy one) is the failure condition. */
+    if (!j_claim || json_object_object_add(uinfo, "groups", j_claim) != 0) {
+        json_object_put(uinfo);
+        return NULL;
+    }
+    return uinfo;
+}
+
+/**
+ * @brief Unit test verifying that a deny-only group policy fails closed on unusable claims.
+ *
+ * Regression test: when `deny_groups` is configured (and `allow_groups` is empty), a claim that
+ * is missing, JSON null, of an unrecognized type, or a comma-delimited string that cannot be
+ * fully parsed must be DENIED — not treated as "nothing to check". Long string claims
+ * (past the old 256-byte scratch-buffer bound) must still be split and matched.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_group_membership_deny_only_fail_closed(void **state) {
+    (void)state;
+    config_t cfg;
+    struct json_object *uinfo;
+    char long_claim[300];
+    size_t pad;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.deny_groups, "contractors", sizeof(cfg.deny_groups) - 1);
+
+    /* deny-only: claim field absent from UserInfo -> denied. */
+    uinfo = json_tokener_parse("{\"sub\":\"jdoe\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* deny-only: NULL UserInfo payload -> denied. */
+    assert_int_equal(verify_group_membership(NULL, &cfg, NULL), 0);
+
+    /* deny-only: claim present but JSON null -> denied. */
+    uinfo = json_tokener_parse("{\"groups\":null}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* deny-only: claim present but wrong type (number) -> denied. */
+    uinfo = json_tokener_parse("{\"groups\":123}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* deny-only: array claim containing a non-string element -> denied. */
+    uinfo = json_tokener_parse("{\"groups\":[\"users\",123]}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* allow-only: non-string array elements are skipped; string items still match. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.allow_groups, "sysadmins", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":[123,\"users\",\"sysadmins\"]}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+
+    /* deny-only: 300-byte comma-separated claim containing a denied token -> denied. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.deny_groups, "contractors", sizeof(cfg.deny_groups) - 1);
+    memset(long_claim, 'a', sizeof(long_claim) - 1);
+    long_claim[sizeof(long_claim) - 1] = '\0';
+    memcpy(long_claim, "contractors,", 12);
+    uinfo = group_claim_uinfo(long_claim);
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* deny-only: denied token past byte 255 of a long comma-separated claim -> denied
+     * (previously the 256-byte scratch buffer made the split fail silently -> allowed). */
+    for (pad = 0; pad < 260; pad++) {
+        long_claim[pad] = (char)('a' + (pad % 26));
+    }
+    memcpy(long_claim + 260, ",contractors", 12);
+    long_claim[272] = '\0';
+    uinfo = group_claim_uinfo(long_claim);
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* deny-only: long claim with no denied group -> allowed (no spurious deny). */
+    for (pad = 0; pad < 299; pad++) {
+        long_claim[pad] = ((pad % 2) == 0) ? 'b' : ',';
+    }
+    long_claim[299] = '\0';
+    uinfo = group_claim_uinfo(long_claim);
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+}
+
+/**
  * @brief Initializes a config_t with the same defaults load_config() applies before parsing.
  *
  * parse_config_file() only writes keys present in the stream, so tests that assert on
@@ -1170,11 +1590,17 @@ static void init_config_defaults(config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     (void)copy_checked(cfg->scopes, sizeof(cfg->scopes), "openid");
     (void)copy_checked(cfg->claim_field, sizeof(cfg->claim_field), "sub");
-    (void)copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), "^(.*)$");
+    /* No claim_regex default (matches load_config): fixtures that parse successfully
+     * must set claim_regex explicitly; parse_config_file() rejects an empty value. */
     cfg->claim_capture_group = 1;
     cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
+    cfg->show_host = 1;
+    cfg->show_expiry = 1;
     cfg->loglevel = LOGLEVEL_INFO;
+    cfg->deny_system_uids = 1;
+    cfg->system_uid_min = 0;
+    cfg->system_uid_max = 999;
     cfg->verify_jwt_claims = 0;
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;
@@ -1208,7 +1634,9 @@ static void test_parse_config_file_minimal_valid(void **state) {
                                     "client_id = test-client\n"
                                     "device_authorization_endpoint = https://idp.example.com/device\n"
                                     "token_endpoint = https://idp.example.com/token\n"
-                                    "userinfo_endpoint = https://idp.example.com/userinfo\n";
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "[claim]\n"
+                                    "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     config_t cfg;
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(text);
@@ -1223,11 +1651,17 @@ static void test_parse_config_file_minimal_valid(void **state) {
     /* Defaults preserved when keys are absent. */
     assert_string_equal(cfg.scopes, "openid");
     assert_string_equal(cfg.claim_field, "sub");
-    assert_string_equal(cfg.claim_regex, "^(.*)$");
+    /* claim_regex is required (no default) and was explicitly set above. */
+    assert_string_equal(cfg.claim_regex, "^([a-zA-Z0-9._-]+)$");
     assert_int_equal(cfg.claim_capture_group, 1);
     assert_int_equal(cfg.max_poll_seconds, 120);
     assert_int_equal(cfg.case_sensitive, 1);
+    assert_int_equal(cfg.show_host, 1);
+    assert_int_equal(cfg.show_expiry, 1);
     assert_int_equal(cfg.loglevel, LOGLEVEL_INFO);
+    assert_int_equal(cfg.deny_system_uids, 1);
+    assert_int_equal(cfg.system_uid_min, 0);
+    assert_int_equal(cfg.system_uid_max, 999);
     assert_string_equal(cfg.group_claim_field, "groups");
     assert_int_equal(cfg.use_pkce, 0);
     /* QR defaults preserved when the [qr] section is absent. */
@@ -1238,6 +1672,44 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.qr_ec_level, QR_EC_MEDIUM);
     assert_int_equal(cfg.qr_uri_complete, 1);
     assert_int_equal(cfg.qr_vertical_quiet_zone, QR_QUIET_ZONE);
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects a configuration without
+ *        an explicit claim_regex (the identity-mapping regex is required; there is
+ *        no catch-all default, and an explicitly empty value is rejected as well).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_claim_regex_required(void **state) {
+    (void)state;
+    static const char *const missing = "[oauth]\n"
+                                       "client_id = test-client\n"
+                                       "device_authorization_endpoint = https://idp.example.com/device\n"
+                                       "token_endpoint = https://idp.example.com/token\n"
+                                       "userinfo_endpoint = https://idp.example.com/userinfo\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(missing);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+    /* All parsed content is securely zeroed on failure. */
+    assert_string_equal(cfg.client_id, "");
+
+    static const char *const empty = "[oauth]\n"
+                                     "client_id = test-client\n"
+                                     "device_authorization_endpoint = https://idp.example.com/device\n"
+                                     "token_endpoint = https://idp.example.com/token\n"
+                                     "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                     "[claim]\n"
+                                     "claim_regex = \n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(empty);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+    assert_string_equal(cfg.client_id, "");
 }
 
 /**
@@ -1312,12 +1784,17 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "allow_users = alice,bob\n"
                                     "deny_users = mallory\n"
                                     "allow_root = yes\n"
+                                    "deny_system_uids = no\n"
+                                    "system_uid_min = 100\n"
+                                    "system_uid_max = 500\n"
                                     "allow_groups = sysadmins\n"
                                     "deny_groups = terminated\n"
                                     "enforce_groups = yes\n"
                                     "group_claim_field = roles\n"
                                     "[prompt]\n"
                                     "init_message = Code: %s\n"
+                                    "show_host = false\n"
+                                    "show_expiry = false\n"
                                     "[runtime]\n"
                                     "max_poll_seconds = 60\n"
                                     "loglevel = verbose\n"
@@ -1350,11 +1827,16 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_string_equal(cfg.allow_users, "alice,bob");
     assert_string_equal(cfg.deny_users, "mallory");
     assert_int_equal(cfg.allow_root, 1);
+    assert_int_equal(cfg.deny_system_uids, 0);
+    assert_int_equal(cfg.system_uid_min, 100);
+    assert_int_equal(cfg.system_uid_max, 500);
     assert_string_equal(cfg.allow_groups, "sysadmins");
     assert_string_equal(cfg.deny_groups, "terminated");
     assert_int_equal(cfg.enforce_groups, 1);
     assert_string_equal(cfg.group_claim_field, "roles");
     assert_string_equal(cfg.init_message, "Code: %s");
+    assert_int_equal(cfg.show_host, 0);
+    assert_int_equal(cfg.show_expiry, 0);
     assert_int_equal(cfg.max_poll_seconds, 60);
     assert_int_equal(cfg.loglevel, LOGLEVEL_VERBOSE);
     assert_int_equal(cfg.verify_jwt_claims, 1);
@@ -1449,6 +1931,8 @@ static void test_parse_config_file_long_access_list(void **state) {
                         "device_authorization_endpoint = https://idp.example.com/device\n"
                         "token_endpoint = https://idp.example.com/token\n"
                         "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                        "[claim]\n"
+                        "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
                         "[access]\n"
                         "deny_users = %s\n",
                         deny);
@@ -1609,7 +2093,9 @@ static void test_parse_config_file_whitespace_and_comments(void **state) {
                                     "\tclient_id \t=\t spaced-value # kept in non-URL values \n"
                                     "device_authorization_endpoint=https://idp.example.com/device\n"
                                     "token_endpoint=https://idp.example.com/token\n"
-                                    "userinfo_endpoint = https://idp.example.com/userinfo\n";
+                                    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                    "[claim]\n"
+                                    "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     config_t cfg;
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(text);
@@ -1668,7 +2154,9 @@ static void test_parse_config_file_pkce_auto(void **state) {
                                     "token_endpoint = https://idp.example.com/token\n"
                                     "userinfo_endpoint = https://idp.example.com/userinfo\n"
                                     "use_pkce = auto\n"
-                                    "discovery_endpoint = https://idp.example.com/.well-known/openid-configuration\n";
+                                    "discovery_endpoint = https://idp.example.com/.well-known/openid-configuration\n"
+                                    "[claim]\n"
+                                    "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     config_t cfg;
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(text);
@@ -1722,7 +2210,9 @@ static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
                                        "device_authorization_endpoint = https://idp.example.com/device\n"
                                        "token_endpoint = https://idp.example.com/token\n"
                                        "userinfo_endpoint = https://idp.example.com/userinfo\n"
-                                       "verify_jwt_claims = true\n";
+                                       "verify_jwt_claims = true\n"
+                                       "[claim]\n"
+                                       "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(neither);
     assert_non_null(f);
@@ -1738,7 +2228,9 @@ static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
                                            "token_endpoint = https://idp.example.com/token\n"
                                            "userinfo_endpoint = https://idp.example.com/userinfo\n"
                                            "verify_jwt_claims = true\n"
-                                           "issuer = https://idp.example.com\n";
+                                           "issuer = https://idp.example.com\n"
+                                           "[claim]\n"
+                                           "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     init_config_defaults(&cfg);
     f = open_config_stream(issuer_only);
     assert_non_null(f);
@@ -1752,7 +2244,9 @@ static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
                                              "token_endpoint = https://idp.example.com/token\n"
                                              "userinfo_endpoint = https://idp.example.com/userinfo\n"
                                              "verify_jwt_claims = true\n"
-                                             "audience = aud-1\n";
+                                             "audience = aud-1\n"
+                                             "[claim]\n"
+                                             "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     init_config_defaults(&cfg);
     f = open_config_stream(audience_only);
     assert_non_null(f);
@@ -1767,7 +2261,9 @@ static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
                                     "userinfo_endpoint = https://idp.example.com/userinfo\n"
                                     "verify_jwt_claims = true\n"
                                     "issuer = https://idp.example.com\n"
-                                    "audience = aud-1\n";
+                                    "audience = aud-1\n"
+                                    "[claim]\n"
+                                    "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
     init_config_defaults(&cfg);
     f = open_config_stream(both);
     assert_non_null(f);
@@ -1776,6 +2272,47 @@ static void test_parse_config_file_jwt_claims_requires_binding(void **state) {
     assert_int_equal(cfg.verify_jwt_claims, 1);
     assert_string_equal(cfg.issuer, "https://idp.example.com");
     assert_string_equal(cfg.audience, "aud-1");
+}
+
+/**
+ * @brief Unit test verifying parse_config_file rejects an invalid system-UID range.
+ *
+ * Covers the cross-field check (system_uid_min must not exceed system_uid_max) and the
+ * per-key bounds check (values outside 0..INT_MAX are rejected).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_system_uid_range_invalid(void **state) {
+    (void)state;
+    static const char *const inverted = "[oauth]\n"
+                                        "client_id = ci\n"
+                                        "device_authorization_endpoint = https://idp.example.com/device\n"
+                                        "token_endpoint = https://idp.example.com/token\n"
+                                        "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                        "[access]\n"
+                                        "system_uid_min = 100\n"
+                                        "system_uid_max = 50\n";
+    config_t cfg;
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(inverted);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+    /* All parsed content is securely zeroed on failure. */
+    assert_string_equal(cfg.client_id, "");
+
+    static const char *const out_of_bounds = "[oauth]\n"
+                                             "client_id = ci\n"
+                                             "device_authorization_endpoint = https://idp.example.com/device\n"
+                                             "token_endpoint = https://idp.example.com/token\n"
+                                             "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                             "[access]\n"
+                                             "system_uid_max = 5000000000\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(out_of_bounds);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
 }
 
 /**
@@ -1890,7 +2427,9 @@ static void test_discovery_json_advertises_s256(void **state) {
     "client_id = ci\n"                                                                                                 \
     "device_authorization_endpoint = https://idp.example.com/device\n"                                                 \
     "token_endpoint = https://idp.example.com/token\n"                                                                 \
-    "userinfo_endpoint = https://idp.example.com/userinfo\n"
+    "userinfo_endpoint = https://idp.example.com/userinfo\n"                                                           \
+    "[claim]\n"                                                                                                        \
+    "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
 
 /**
  * @brief Unit test for [qr] section configuration parsing (valid values, rejections, duplicates).
@@ -2400,6 +2939,7 @@ int main(void) {
         cmocka_unit_test(test_jwt_unconfigured_binding_fail_closed),
         cmocka_unit_test(test_jwt_audience_array),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),
+        cmocka_unit_test(test_jwt_non_finite_claims_rejected),
         cmocka_unit_test(test_jwt_malformed_structure),
         cmocka_unit_test(test_jwt_base64url_strict_alphabet),
         cmocka_unit_test(test_jwt_extract_claim_string),
@@ -2409,7 +2949,9 @@ int main(void) {
         cmocka_unit_test(test_pkce_s256_challenge),
         cmocka_unit_test(test_verify_user_access),
         cmocka_unit_test(test_verify_group_membership_lists),
+        cmocka_unit_test(test_verify_group_membership_deny_only_fail_closed),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
+        cmocka_unit_test(test_parse_config_file_claim_regex_required),
         cmocka_unit_test(test_parse_config_file_full_sections),
         cmocka_unit_test(test_parse_config_file_missing_required),
         cmocka_unit_test(test_parse_config_file_duplicate_key),
@@ -2428,6 +2970,7 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_pkce_auto),
         cmocka_unit_test(test_parse_config_file_pkce_auto_requires_discovery),
         cmocka_unit_test(test_parse_config_file_jwt_claims_requires_binding),
+        cmocka_unit_test(test_parse_config_file_system_uid_range_invalid),
         cmocka_unit_test(test_parse_config_file_invalid_discovery_endpoint),
         cmocka_unit_test(test_parse_config_file_duplicate_discovery_endpoint),
         cmocka_unit_test(test_discovery_json_advertises_s256),

@@ -44,7 +44,10 @@ jobs:
             install: |
               dnf install -y dnf-utils
               dnf config-manager --set-enabled powertools
-              dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+              dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3 \
+                || { echo ">>> retrying with --nobest (mirrors may publish a newer gcc without its matching libgcc/libgomp)"
+                     dnf install -y --nobest gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+                   }
             verify: |
               set -euo pipefail
               MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm" | head -1)

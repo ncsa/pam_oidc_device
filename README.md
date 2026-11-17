@@ -103,7 +103,7 @@ max_poll_seconds = 120
 
 [prompt]
 # Optional custom prompt template (printable ASCII; use \n for newlines).
-# init_message = Sign in at {url} with code {code}   # placeholders: {url}, {url_complete}, {code}
+# init_message = Sign in at {url} with code {code}   # placeholders: {host}, {url}, {url_complete}, {code}
 
 [qr]
 # Optional: render the sign-in URL as a scannable QR code on TTY logins (phone-camera friendly).

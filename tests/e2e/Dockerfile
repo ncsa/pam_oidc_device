@@ -63,4 +63,8 @@ RUN set -eux; \
 RUN useradd --no-create-home --shell /usr/sbin/nologin alice && \
     useradd --no-create-home --shell /usr/sbin/nologin bob
 
+# Second uid-0 account ("toor") to pin the allow_root guard: it must refuse ANY
+# uid-0 account name, not just "root" (e2e scenario uid0-alias-denied).
+RUN useradd --no-create-home --shell /usr/sbin/nologin -o -u 0 toor
+
 CMD ["bash"]

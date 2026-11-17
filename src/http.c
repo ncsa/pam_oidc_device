@@ -23,11 +23,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/** @brief Maximum formatted length of a single syslog line emitted by pam_oauth_log(). */
+#define PAM_OAUTH_LOG_LINE_LEN 8192U
+
 /**
  * @brief Central level-filtered logging wrapper for PAM syslog messages.
  *
- * Emits log output via `pam_vsyslog` only if `cfg_level` is not `LOGLEVEL_NONE` and `cfg_level` is
- * greater than or equal to the required `msg_level`.
+ * Emits log output via the PAM syslog API only if `cfg_level` is not `LOGLEVEL_NONE` and
+ * `cfg_level` is greater than or equal to the required `msg_level`.
+ *
+ * The formatted line is escaped before it reaches syslog: every byte outside printable
+ * ASCII is replaced with a C-style escape ("\n", "\r", "\t" or "\xHH"). Callers embed
+ * untrusted values in log lines (PAM usernames, provider-supplied claim values, error
+ * strings); without escaping, control characters in those values could forge or garble
+ * syslog records.
  *
  * @param[in] pamh      PAM framework handle context.
  * @param[in] cfg_level Configured runtime log level threshold.
@@ -41,11 +50,49 @@ void pam_oauth_log(pam_handle_t *pamh, loglevel_t cfg_level, loglevel_t msg_leve
     }
     va_list args;
     va_start(args, fmt);
+    char line[PAM_OAUTH_LOG_LINE_LEN];
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
-    pam_vsyslog(pamh, priority, fmt, args);
+    /* `fmt` is a compile-time literal at every call site; untrusted bytes flow only via
+     * the argument values, and vsnprintf enforces the length bound. */
+    int n = vsnprintf(line, sizeof(line), fmt, args); // flawfinder: ignore
 #pragma GCC diagnostic pop
     va_end(args);
+    if (n < 0) {
+        return;
+    }
+    size_t len = (n >= (int)sizeof(line)) ? sizeof(line) - 1U : (size_t)n;
+    /* Worst case: every byte becomes a 4-character "\xHH" escape. */
+    char *escaped = malloc((len * 4U) + 1U);
+    if (!escaped) {
+        return;
+    }
+    size_t pos = 0U;
+    for (size_t i = 0U; i < len; i++) {
+        unsigned char c = (unsigned char)line[i];
+        if (c >= 0x20U && c <= 0x7EU) {
+            escaped[pos++] = (char)c;
+        } else if (c == '\n') {
+            escaped[pos++] = '\\';
+            escaped[pos++] = 'n';
+        } else if (c == '\r') {
+            escaped[pos++] = '\\';
+            escaped[pos++] = 'r';
+        } else if (c == '\t') {
+            escaped[pos++] = '\\';
+            escaped[pos++] = 't';
+        } else {
+            (void)snprintf(escaped + pos, 5U, "\\x%02X", (int)c);
+            pos += 4U;
+        }
+    }
+    escaped[pos] = '\0';
+    /* The escaped message was rendered from (potentially) untrusted values; log it via a
+     * literal "%s" so no attacker-supplied byte is ever re-interpreted as a format. */
+    pam_syslog(pamh, priority, "%s", escaped);
+    secure_memzero(line, sizeof(line));
+    secure_memzero(escaped, (len * 4U) + 1U);
+    free(escaped);
 }
 
 /** @brief POSIX thread once control primitive for atomic cURL initialization. */
@@ -226,6 +273,10 @@ int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, p
     free_http_response(&resp);
     if (!doc || json_object_get_type(doc) != json_type_object) {
         if (doc) {
+            /* Scrub the provider-supplied tree (array or scalar, possibly with provider-controlled
+             * string elements) before release, matching the module-wide scrub-before-put
+             * discipline. */
+            secure_zero_json_tree(doc);
             json_object_put(doc);
         }
         pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
@@ -257,8 +308,33 @@ int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, p
                       "examples/README.md), set use_pkce = true to enable it");
     }
 
+    /* Scrub the provider-supplied discovery tree before release, matching the
+     * module-wide scrub-before-put discipline. */
+    secure_zero_json_tree(doc);
     json_object_put(doc);
     return 0;
+}
+
+/**
+ * @brief Scrubs then frees a request-header list, zeroing libcurl's private copies.
+ *
+ * `curl_slist_append()` keeps its own copy of each header string, and
+ * `curl_slist_free_all()` frees those copies without zeroing them. The Bearer
+ * Authorization header is the one that must not survive in process memory, so every
+ * entry's bytes are securely zeroed before the list is released.
+ *
+ * @param[in] headers Header list (may be NULL).
+ */
+static void scrub_and_free_slist(struct curl_slist *headers) {
+    struct curl_slist *it = headers;
+    while (it != NULL) {
+        struct curl_slist *const next = it->next;
+        if (it->data != NULL) {
+            secure_memzero(it->data, strlen(it->data));
+        }
+        it = next;
+    }
+    curl_slist_free_all(headers);
 }
 
 /**
@@ -330,7 +406,7 @@ int http_request(const char *method, const char *url, const char *postfields, co
     if (strcmp(method, "POST") == 0) {
         struct curl_slist *tmp = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
         if (!tmp) {
-            curl_slist_free_all(headers);
+            scrub_and_free_slist(headers);
             curl_easy_cleanup(curl);
             return -1;
         }
@@ -338,7 +414,7 @@ int http_request(const char *method, const char *url, const char *postfields, co
     } else {
         struct curl_slist *tmp = curl_slist_append(headers, "Accept: application/json");
         if (!tmp) {
-            curl_slist_free_all(headers);
+            scrub_and_free_slist(headers);
             curl_easy_cleanup(curl);
             return -1;
         }
@@ -355,14 +431,14 @@ int http_request(const char *method, const char *url, const char *postfields, co
             if (pamh) {
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Bearer token header exceeds buffer capacity");
             }
-            curl_slist_free_all(headers);
+            scrub_and_free_slist(headers);
             curl_easy_cleanup(curl);
             return -1;
         }
         struct curl_slist *tmp = curl_slist_append(headers, auth_hdr);
         secure_memzero(auth_hdr, sizeof(auth_hdr));
         if (!tmp) {
-            curl_slist_free_all(headers);
+            scrub_and_free_slist(headers);
             curl_easy_cleanup(curl);
             return -1;
         }
@@ -378,7 +454,7 @@ int http_request(const char *method, const char *url, const char *postfields, co
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "curl_easy_setopt error: %s",                   \
                               curl_easy_strerror(err));                                                                \
             }                                                                                                          \
-            curl_slist_free_all(headers);                                                                              \
+            scrub_and_free_slist(headers);                                                                             \
             curl_easy_cleanup(curl);                                                                                   \
             return -1;                                                                                                 \
         }                                                                                                              \
@@ -399,6 +475,12 @@ int http_request(const char *method, const char *url, const char *postfields, co
     CHECK_SETOPT(CURLOPT_USERAGENT, MODULE_USER_AGENT);
     CHECK_SETOPT(CURLOPT_NOSIGNAL, 1L);
     CHECK_SETOPT(CURLOPT_FOLLOWLOCATION, 0L);
+    /* Explicitly clear the proxy (an empty string overrides libcurl's fallback to the
+     * *_proxy environment variables). A PAM module runs in the calling user's
+     * environment under setuid, so those variables are user-controlled: honoring them
+     * would let the caller steer this module's HTTPS traffic. No proxy support is
+     * provided by design. */
+    CHECK_SETOPT(CURLOPT_PROXY, "");
 
 #if LIBCURL_VERSION_NUM >= 0x075500
     CHECK_SETOPT(CURLOPT_PROTOCOLS_STR, "https");
@@ -431,7 +513,7 @@ int http_request(const char *method, const char *url, const char *postfields, co
         }
     }
 
-    curl_slist_free_all(headers);
+    scrub_and_free_slist(headers);
     curl_easy_cleanup(curl);
 
     return (resp->curl_code == CURLE_OK) ? 0 : -1;

@@ -43,7 +43,7 @@ a green CI job.
 ## 2. One-command sandbox (`make sandbox`)
 
 ```bash
-make sandbox         # build + run: 7 device-flow scenarios, headless
+make sandbox         # build + run: 9 device-flow scenarios, headless
 make sandbox-shell   # same image, interactive shell to explore
 ```
 
@@ -65,6 +65,8 @@ IdP):
 | `provider-denied` | user code denied (`access_denied`) | `PAM_AUTH_ERR` (7) |
 | `slowdown-backoff` | `slow_down` once, then approves (RFC 8628 §3.5 +5 s) | `PAM_SUCCESS` (0) |
 | `root-denied` | (never contacted) local allow/deny lists refuse `root` | `PAM_PERM_DENIED` (6) |
+| `uid0-alias-denied` | (never contacted) the uid-0 alias account `toor` is refused like `root` | `PAM_PERM_DENIED` (6) |
+| `system-uid-denied` | (never contacted) the system account `sync` (uid 4) is refused by the default 0-999 system-UID range guard | `PAM_PERM_DENIED` (6) |
 | `code-expired` | code still pending when `expires_in` deadline lapses | `PAM_AUTH_ERR` (7) |
 | `bad-config-perms` | config mode `0644` instead of `0600`/`0640` | `PAM_SERVICE_ERR` (3) — fails closed before any provider contact |
 
@@ -181,7 +183,7 @@ for you):
 | --- | --- | --- |
 | 0 | `PAM_SUCCESS` | Device flow completed; claim mapped to PAM user |
 | 3 | `PAM_SERVICE_ERR` | Config missing / not `0600`–`0640` root:root / invalid key — **fails closed** |
-| 6 | `PAM_PERM_DENIED` | `root` denied, `deny_users`/`deny_groups` match, group policy unsatisfied |
+| 6 | `PAM_PERM_DENIED` | uid-0 account (`root` or alias) denied, system-UID-range account denied, `deny_users`/`deny_groups` match, group policy unsatisfied |
 | 7 | `PAM_AUTH_ERR` | Claim does not match PAM user, provider denied the code, polling deadline expired, JWT claims check failed |
 | 9 | `PAM_AUTHINFO_UNAVAIL` | UserInfo endpoint unreachable / non-200 |
 | 10 | `PAM_USER_UNKNOWN` | PAM could not resolve the user at all |
@@ -253,8 +255,11 @@ Checklist:
 - [ ] Set `issuer` to the provider's exact `iss` and `audience` to the
       audience your tokens carry; enable `verify_jwt_claims = true`.
 - [ ] Map the claim: pick `claim_field` (e.g., `preferred_username` or `sub`)
-      and write `claim_regex` so only *your* domain/tenant can map to local
-      accounts (the sample's `@example.edu` pinning pattern).
+      and write `claim_regex` — it is *required* (there is no default; config
+      loading fails without it) — so only *your* accounts can map to local
+      users: for a domain-pinned e-mail claim use the sample's
+      `@example.edu` pinning pattern; for a bare `preferred_username`, an
+      anchored POSIX-username character set (`^([a-zA-Z0-9._-]+)$`).
 - [ ] If the provider exposes group claims, configure `allow_groups` /
       `deny_groups` and `enforce_groups`, then test a user in and out of an
       allowed group.
@@ -300,8 +305,11 @@ Run on a **staging host that mirrors production** (same distro, PAM version,
 
 - [ ] `pam_succeed_if.so uid >= 1000 quiet` (or equivalent) sits *before*
       the module, so system accounts never reach the OIDC flow.
-- [ ] `root` login is refused (default; only `allow_root = true`
-      overrides).
+- [ ] uid-0 logins are refused (default; `root` and any alternative uid-0
+      account name; only `allow_root = true` overrides).
+- [ ] system-account UIDs are refused (default `deny_system_uids = true` for
+      UIDs 0-999; adjust `system_uid_min`/`system_uid_max` to match your
+      `pam_succeed_if` range).
 - [ ] `allow_users` / `deny_users` lists reflect the pilot group.
 
 **Transport**

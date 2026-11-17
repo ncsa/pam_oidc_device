@@ -101,9 +101,13 @@ userinfo_endpoint = https://auth.example.com/oauth2/v2.0/userinfo
 scopes = openid profile email
 
 [claim]
-# Map UserInfo field 'preferred_username' (e.g., 'jdoe@example.com') to local system user 'jdoe'
+# Map UserInfo field 'preferred_username' (e.g., 'jdoe') to local system user 'jdoe'.
+# claim_regex is REQUIRED (there is no default): config loading fails without it.
+# 'preferred_username' is normally a bare local username, so anchor a username charset:
 claim_field = preferred_username
-claim_regex = ^([^@]+)@example\.com$
+claim_regex = ^([a-zA-Z0-9._-]+)$
+# If your chosen claim is a domain-pinned e-mail (e.g., 'jdoe@example.com'), pin your
+# domain instead:  claim_regex = ^([^@]+)@example\.com$
 claim_capture_group = 1
 case_sensitive = false
 
@@ -113,9 +117,26 @@ max_poll_seconds = 120
 
 [prompt]
 # Optional custom prompt template (printable ASCII; use \n for newlines).
-# Placeholders: {url} (verification URL), {url_complete} (direct-link URL with
-# the code embedded, if the IdP provides one), {code} (user code).
+# Placeholders: {host} (target host's hostname — the approving user's cross-check
+# against device-code phishing; expands to an empty string when show_host = false),
+# {url} (verification URL),
+# {url_complete} (direct-link URL with the code embedded, if the IdP provides
+# one), {code} (user code),
+# {expiry} (how long the user has to complete the approval, in human units such as
+# "15 minutes"; the provider's expires_in clamped by max_poll_seconds; expands to
+# an empty string when the provider does not advertise expires_in).
 # init_message = Sign in at {url} with code {code}
+# Show the target host's hostname in the prompt (default: true). With the built-in
+# default template the host is named in the trailing status line ("Waiting for
+# your approval to sign in to <host>; ..."); in custom templates the {host} token expands to
+# the hostname. Set to false to hide the host entirely.
+# show_host = true
+# Show the device-code approval window in the prompt (default: true). With the built-in
+# default template it is named in the trailing status line ("Waiting for
+# your approval to sign in to <host> (expires in 15 minutes); ..."); in custom
+# templates use the {expiry} token, which works regardless of this key. Set to false to
+# hide the approval window.
+# show_expiry = false
 
 [qr]
 # Optional: render the sign-in URL as a scannable QR code on TTY logins (phone-camera friendly).
@@ -142,8 +163,9 @@ Sections and where their full option references live:
 > **Pin the claim regex to your own domain.** `claim_regex` decides which
 > identity may become which local account — a loose pattern is the most
 > common way an identity from a foreign tenant or personal account maps onto
-> a local user. All three templates in `examples/` pin a specific domain in
-> the regex for this reason.
+> a local user. There is no default: the key is required, and config loading
+> fails closed if it is missing. All three templates in `examples/` pin a
+> specific domain in the regex for this reason.
 
 ---
 
@@ -202,6 +224,44 @@ sudo sshd -t && sudo systemctl reload sshd
 > default 120 s, floor 10 s). Time spent sitting idle at the confirmation prompt
 > consumes the code's remaining lifetime; approve the code on your second device
 > promptly after it is displayed.
+
+### Protecting the Provider from Connection Bursts
+
+Every SSH connection for a username the module's allow/deny rules permit
+requests a fresh device code from the identity provider **before** the user
+enters anything (the request is what carries the sign-in prompt). A source
+that opens connections in rapid succession — an SSH scanner, a credential
+brute-forcer, or a misbehaving client retry loop — can exhaust the
+provider-side rate limit for your OAuth client and lock *legitimate* users
+out of their sign-ins. The module's allow/deny lists are enforced before any
+provider contact, and the PAM API exposes no peer-address API, so the module
+cannot throttle *per source*; enforce that in the SSH layer:
+
+```sshd_config
+# OpenSSH >= 9.7: progressively penalize repeated pre-auth connections
+# from the same source address
+PerSourcePenalties yes
+
+# Bound unauthenticated *concurrent* sessions: keep slots up to 5,
+# probabilistically drop new connections above 30, hard stop at 100
+MaxStartups 5:30:100
+
+# Cap authentication rounds per connection (each round for an allowed
+# username is one potential device-code request)
+MaxAuthTries 3
+
+# Idle pre-auth connection timeout; also bounds hung device flows
+LoginGraceTime 120
+```
+
+Apply with `sudo sshd -t && sudo systemctl reload sshd`, then verify the
+effective values: `sudo sshd -T | grep -Ei 'maxstartups|persourcepenalties|maxauthtries|logingracetime'`.
+The device-code request is cheap and disposable (unused codes expire), so the
+risk is rate-limit exhaustion, not user data — but keep `allow_users`
+(and sshd's `AllowUsers`) as narrow as your access model allows: usernames
+rejected by the pre-flight check never reach the provider. See
+[Threat Model §9](threat-model.md#9-provider-rate-limit-exhaustion--operational-hardening)
+for the full threat analysis.
 
 ---
 
@@ -326,9 +386,13 @@ device promptly after it is displayed.
 ### User-Visible Failure Notices
 
 In addition to syslog, a failed sign-in attempt shows a plain-text, actionable
-notice in the login terminal (delivered through the PAM conversation): the
-identity provider service is unavailable, the sign-in code expired before
-approval, or the account was denied. The wording is intentionally generic —
+notice in the login terminal (delivered through the PAM conversation). During
+the token-polling phase the notice matches the outcome: the sign-in code
+expired before approval, the sign-in request was not approved (declined), or
+the identity provider service is unavailable (network failure, unexpected or
+malformed response); a later claim or group-policy check failing shows the
+account-denied notice. User-initiated cancellation (Ctrl-C) shows no notice.
+The wording is intentionally generic —
 which specific control rejected the attempt remains in the syslog entries
 above. Delivery is best-effort: local console logins always display the
 notice; some SSH clients buffer informational messages until the next prompt

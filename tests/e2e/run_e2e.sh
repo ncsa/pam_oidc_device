@@ -21,6 +21,8 @@
 #   provider-denied    denied              7  PAM_AUTH_ERR   (access_denied)
 #   slowdown-backoff   slowdown-approve    0  PAM_SUCCESS    (RFC 8628 +5s)
 #   root-denied        approve-alice       6  PAM_PERM_DENIED (local allow/deny)
+#   uid0-alias-denied  approve-alice       6  PAM_PERM_DENIED (uid-0 alias account "toor")
+#   system-uid-denied  approve-alice       6  PAM_PERM_DENIED (system account "sync" uid 4 in default 0-999 range)
 #   code-expired       expired             7  PAM_AUTH_ERR   (polling deadline)
 #   bad-config-perms   approve-alice       3  PAM_SERVICE_ERR (fail-closed 0644)
 #
@@ -73,6 +75,8 @@ install -d -m 0700 "$WORKDIR"
 for user in alice bob; do
     id "$user" >/dev/null 2>&1 || $SUDO useradd --no-create-home --shell /usr/sbin/nologin "$user"
 done
+# uid-0 alias account for the allow_root guard (e2e scenario uid0-alias-denied).
+id toor >/dev/null 2>&1 || $SUDO useradd --no-create-home --shell /usr/sbin/nologin -o -u 0 toor
 
 # The module hard-requires a root:root 0600/0640 config; install the fixture
 # only when absent so a live host's real config is never clobbered.
@@ -124,7 +128,10 @@ python3 "$E2E_DIR/mock_oidc.py" --port "$PORT" \
     --cert "$WORKDIR/tls.crt" --key "$WORKDIR/tls.key" \
     --scenario-file "$SCENARIO_FILE" > "$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
-trap 'kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true' EXIT
+# The conf back-up/scratch files may mirror a live config (client credentials);
+# remove them on exit even when a scenario aborts mid-flight.
+trap 'kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true;
+      rm -f "$WORKDIR/conf.uid0.orig" "$WORKDIR/conf.uid0.tmp"' EXIT
 
 for _ in $(seq 1 50); do
     if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
@@ -145,8 +152,8 @@ log "mock OIDC provider listening on https://127.0.0.1:${PORT}"
 FAILURES=0
 CASES=0
 
-run_case() { # name expected_rc user scenario
-    local name="$1" expected="$2" user="$3" scenario="$4"
+run_case() { # name expected_rc user scenario [expected_notice_substring]
+    local name="$1" expected="$2" user="$3" scenario="$4" notice="${5:-}"
     echo "$scenario" > "$SCENARIO_FILE"
     CASES=$((CASES + 1))
     local rc=0
@@ -158,27 +165,67 @@ run_case() { # name expected_rc user scenario
         sed -n '1,30p' "$WORKDIR/${name}.out" >&2 || true
         FAILURES=$((FAILURES + 1))
     fi
+    # Optional user-visible notice assertion: pam_driver prints every PAM_TEXT_INFO
+    # message to stdout, so the exact notice shown to the user lands in the .out file.
+    if [ -n "$notice" ]; then
+        if grep -qF "$notice" "$WORKDIR/${name}.out"; then
+            :
+        else
+            log "FAIL ${name}: PAM rc ok but expected user notice not found: ${notice}"
+            sed -n '1,30p' "$WORKDIR/${name}.out" >&2 || true
+            FAILURES=$((FAILURES + 1))
+        fi
+    fi
 }
 
-log "scenario 1/7: provider approves; claim maps to PAM user (expect PAM_SUCCESS)"
+log "scenario 1/9: provider approves; claim maps to PAM user (expect PAM_SUCCESS)"
 run_case success-alice 0 alice approve-alice
 
-log "scenario 2/7: provider claims a different identity than PAM_USER (expect PAM_AUTH_ERR)"
+log "scenario 2/9: provider claims a different identity than PAM_USER (expect PAM_AUTH_ERR)"
 run_case claim-mismatch 7 alice approve-bob
 
-log "scenario 3/7: provider denies the user code (expect PAM_AUTH_ERR)"
-run_case provider-denied 7 alice denied
+log "scenario 3/9: provider denies the user code (expect PAM_AUTH_ERR + declined notice)"
+run_case provider-denied 7 alice denied "Sign-in was declined"
 
-log "scenario 4/7: provider rate-limits with slow_down, then approves (expect PAM_SUCCESS after +5s backoff)"
+log "scenario 4/9: provider rate-limits with slow_down, then approves (expect PAM_SUCCESS after +5s backoff)"
 run_case slowdown-backoff 0 alice slowdown-approve
 
-log "scenario 5/7: root is refused before any provider contact (expect PAM_PERM_DENIED)"
+log "scenario 5/9: root is refused before any provider contact (expect PAM_PERM_DENIED)"
 run_case root-denied 6 root approve-alice
 
-log "scenario 6/7: device code expires while still pending (expect PAM_AUTH_ERR)"
-run_case code-expired 7 alice expired
+log "scenario 6/9: uid-0 alias account 'toor' is refused like root (expect PAM_PERM_DENIED)"
+# Run with a config that has NO allow_users so that only the uid-0 gate can
+# block 'toor': the fixture's allow_users = alice,bob would otherwise refuse
+# it for a different reason, and the scenario could not distinguish the
+# uid-0-alias fix from a simple allow-list miss.
+# Note: the backup below must be written through a shell redirection
+# (non-root when the suite runs with $SUDO), NOT `$SUDO cp` — cp run as root
+# would copy the source's 0600 root:root mode, and the later
+# `< conf.uid0.orig` redirection is opened by the non-root shell (EACCES).
+$SUDO cat "$CONF" > "$WORKDIR/conf.uid0.orig"
+chmod 600 "$WORKDIR/conf.uid0.orig"   # live configs may hold client credentials
+$SUDO grep -v '^allow_users' "$CONF" > "$WORKDIR/conf.uid0.tmp"
+$SUDO tee "$CONF" < "$WORKDIR/conf.uid0.tmp" > /dev/null
+run_case uid0-alias-denied 6 toor approve-alice
+$SUDO tee "$CONF" < "$WORKDIR/conf.uid0.orig" > /dev/null
 
-log "scenario 7/7: mis-permissioned config (0644) must fail closed (expect PAM_SERVICE_ERR)"
+log "scenario 7/9: system account 'sync' (uid 4) is refused by the default system-uid range guard (expect PAM_PERM_DENIED)"
+# Run with a config that has NO allow_users so that only the uid-range gate can
+# block 'sync' (mirror of the uid-0-alias scenario above): the fixture's
+# allow_users = alice,bob would otherwise refuse it for a different reason, and
+# the scenario could not distinguish the uid-range guard from a simple
+# allow-list miss.
+$SUDO cat "$CONF" > "$WORKDIR/conf.uidrange.orig"
+chmod 600 "$WORKDIR/conf.uidrange.orig"   # live configs may hold client credentials
+$SUDO grep -v '^allow_users' "$CONF" > "$WORKDIR/conf.uidrange.tmp"
+$SUDO tee "$CONF" < "$WORKDIR/conf.uidrange.tmp" > /dev/null
+run_case system-uid-denied 6 sync approve-alice
+$SUDO tee "$CONF" < "$WORKDIR/conf.uidrange.orig" > /dev/null
+
+log "scenario 8/9: device code expires while still pending (expect PAM_AUTH_ERR + expired notice)"
+run_case code-expired 7 alice expired "Sign-in was not approved in time"
+
+log "scenario 9/9: mis-permissioned config (0644) must fail closed (expect PAM_SERVICE_ERR)"
 $SUDO chmod 0644 "$CONF"
 run_case bad-config-perms 3 alice approve-alice
 $SUDO chmod 0600 "$CONF"
