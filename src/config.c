@@ -21,58 +21,76 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 /**
- * @struct config_seen_t
- * @brief Bitfield structure tracking seen configuration keys to reject duplicate key definitions.
+ * @enum config_key_id_t
+ * @brief Stable index of every recognized configuration key.
+ *
+ * One constant per key in the CONFIG_KEYS[] table, in declaration order. The
+ * value doubles as the duplicate-tracking bit position in the
+ * parse_config_kv() `seen` bitmask, so CK_KEY_COUNT must stay <= 63.
  */
-typedef struct {
-    unsigned int client_id : 1;                     /**< Flag set when client_id key is parsed. */
-    unsigned int client_secret : 1;                 /**< Flag set when client_secret key is parsed. */
-    unsigned int device_authorization_endpoint : 1; /**< Flag set when device_authorization_endpoint key is parsed. */
-    unsigned int token_endpoint : 1;                /**< Flag set when token_endpoint key is parsed. */
-    unsigned int userinfo_endpoint : 1;             /**< Flag set when userinfo_endpoint key is parsed. */
-    unsigned int scopes : 1;                        /**< Flag set when scopes key is parsed. */
-    unsigned int claim_field : 1;                   /**< Flag set when claim_field key is parsed. */
-    unsigned int claim_regex : 1;                   /**< Flag set when claim_regex key is parsed. */
-    unsigned int claim_capture_group : 1;           /**< Flag set when claim_capture_group key is parsed. */
-    unsigned int max_poll_seconds : 1;              /**< Flag set when max_poll_seconds key is parsed. */
-    unsigned int init_message : 1;                  /**< Flag set when init_message key is parsed. */
-    unsigned int show_host : 1;                     /**< Flag set when show_host key is parsed. */
-    unsigned int show_expiry : 1;                   /**< Flag set when show_expiry key is parsed. */
-    unsigned int case_sensitive : 1;                /**< Flag set when case_sensitive key is parsed. */
-    unsigned int loglevel : 1;                      /**< Flag set when loglevel key is parsed. */
-    unsigned int issuer : 1;                        /**< Flag set when issuer key is parsed. */
-    unsigned int audience : 1;                      /**< Flag set when audience key is parsed. */
-    unsigned int jwks_url : 1;                      /**< Flag set when jwks_url key is parsed. */
-    unsigned int introspection_endpoint : 1;        /**< Flag set when introspection_endpoint key is parsed. */
-    unsigned int verify_jwt_claims : 1;             /**< Flag set when verify_jwt_claims key is parsed. */
-    unsigned int clock_skew_leeway : 1;             /**< Flag set when clock_skew_leeway key is parsed. */
-    unsigned int require_exp_claim : 1;             /**< Flag set when require_exp_claim key is parsed. */
-    unsigned int allow_users : 1;                   /**< Flag set when allow_users key is parsed. */
-    unsigned int deny_users : 1;                    /**< Flag set when deny_users key is parsed. */
-    unsigned int allow_root : 1;                    /**< Flag set when allow_root key is parsed. */
-    unsigned int deny_system_uids : 1;              /**< Flag set when deny_system_uids key is parsed. */
-    unsigned int system_uid_min : 1;                /**< Flag set when system_uid_min key is parsed. */
-    unsigned int system_uid_max : 1;                /**< Flag set when system_uid_max key is parsed. */
-    unsigned int allow_groups : 1;                  /**< Flag set when allow_groups key is parsed. */
-    unsigned int deny_groups : 1;                   /**< Flag set when deny_groups key is parsed. */
-    unsigned int enforce_groups : 1;                /**< Flag set when enforce_groups key is parsed. */
-    unsigned int group_claim_field : 1;             /**< Flag set when group_claim_field key is parsed. */
-    unsigned int use_pkce : 1;                      /**< Flag set when use_pkce key is parsed. */
-    unsigned int discovery_endpoint : 1;            /**< Flag set when discovery_endpoint key is parsed. */
-    unsigned int qr_enabled : 1;                    /**< Flag set when qr `enabled` key is parsed. */
-    unsigned int qr_style : 1;                      /**< Flag set when qr `style` key is parsed. */
-    unsigned int qr_block_char : 1;                 /**< Flag set when qr `block_char` key is parsed. */
-    unsigned int qr_scale : 1;                      /**< Flag set when qr `scale` key is parsed. */
-    unsigned int qr_ec_level : 1;                   /**< Flag set when qr `ec_level` key is parsed. */
-    unsigned int qr_uri : 1;                        /**< Flag set when qr `uri` key is parsed. */
-    unsigned int qr_vquiet : 1;                     /**< Flag set when qr `vertical_quiet_zone` key is parsed. */
-} config_seen_t;
+typedef enum {
+    CK_CLIENT_ID,                     /**< [oauth] client_id */
+    CK_CLIENT_SECRET,                 /**< [oauth] client_secret */
+    CK_DEVICE_AUTHORIZATION_ENDPOINT, /**< [oauth] device_authorization_endpoint */
+    CK_TOKEN_ENDPOINT,                /**< [oauth] token_endpoint */
+    CK_USERINFO_ENDPOINT,             /**< [oauth] userinfo_endpoint */
+    CK_SCOPES,                        /**< [oauth] scopes */
+    CK_ISSUER,                        /**< [oauth] issuer */
+    CK_AUDIENCE,                      /**< [oauth] audience */
+    CK_JWKS_URL,                      /**< [oauth] jwks_url */
+    CK_INTROSPECTION_ENDPOINT,        /**< [oauth] introspection_endpoint */
+    CK_VERIFY_JWT_CLAIMS,             /**< [oauth] verify_jwt_claims */
+    CK_CLOCK_SKEW_LEEWAY,             /**< [oauth] clock_skew_leeway */
+    CK_REQUIRE_EXP_CLAIM,             /**< [oauth] require_exp_claim */
+    CK_USE_PKCE,                      /**< [oauth] use_pkce */
+    CK_DISCOVERY_ENDPOINT,            /**< [oauth] discovery_endpoint */
+    CK_PROXY,                         /**< [oauth] proxy */
+    CK_CLAIM_FIELD,                   /**< [claim] claim_field */
+    CK_CLAIM_REGEX,                   /**< [claim] claim_regex */
+    CK_CLAIM_CAPTURE_GROUP,           /**< [claim] claim_capture_group */
+    CK_CASE_SENSITIVE,                /**< [claim] case_sensitive */
+    CK_ALLOW_USERS,                   /**< [access] allow_users */
+    CK_DENY_USERS,                    /**< [access] deny_users */
+    CK_ALLOW_ROOT,                    /**< [access] allow_root */
+    CK_DENY_SYSTEM_UIDS,              /**< [access] deny_system_uids */
+    CK_SYSTEM_UID_MIN,                /**< [access] system_uid_min */
+    CK_SYSTEM_UID_MAX,                /**< [access] system_uid_max */
+    CK_ALLOW_GROUPS,                  /**< [access] allow_groups */
+    CK_DENY_GROUPS,                   /**< [access] deny_groups */
+    CK_ENFORCE_GROUPS,                /**< [access] enforce_groups */
+    CK_GROUP_CLAIM_FIELD,             /**< [access] group_claim_field */
+    CK_INIT_MESSAGE,                  /**< [prompt] init_message */
+    CK_SHOW_EXPIRY,                   /**< [prompt] show_expiry */
+    CK_MAX_POLL_SECONDS,              /**< [runtime] max_poll_seconds */
+    CK_LOGLEVEL,                      /**< [runtime] loglevel */
+    CK_QR_ENABLED,                    /**< [qr] enabled */
+    CK_QR_STYLE,                      /**< [qr] style */
+    CK_QR_BLOCK_CHAR,                 /**< [qr] block_char */
+    CK_QR_SCALE,                      /**< [qr] scale */
+    CK_QR_VQUIET,                     /**< [qr] vertical_quiet_zone */
+    CK_QR_EC_LEVEL,                   /**< [qr] ec_level */
+    CK_QR_URI,                        /**< [qr] uri */
+    CK_KEY_COUNT                      /**< Sentinel: number of recognized keys. */
+} config_key_id_t;
+
+/** Duplicate-tracking bit for one config_key_id_t (see config_seen_t). */
+#define CFG_SEEN_BIT(id) (1ULL << (id))
+
+/**
+ * @typedef config_seen_t
+ * @brief Bitmask tracking seen configuration keys to reject duplicate key definitions.
+ *
+ * One CFG_SEEN_BIT(config_key_id_t) per recognized key: a key set twice in the
+ * same file is rejected as a duplicate by parse_config_kv().
+ */
+typedef unsigned long long config_seen_t;
 
 /**
  * @brief Erases memory buffer contents using volatile pointer access.
@@ -408,13 +426,161 @@ static int parse_qr_uri(const char *val, int *out) {
 }
 
 /**
+ * @enum cfg_val_kind_t
+ * @brief Value-handler kind for one table-driven configuration key.
+ */
+typedef enum {
+    CFG_VAL_STRING,        /**< copy_checked() into the member's fixed-size buffer. */
+    CFG_VAL_HTTPS_URL,     /**< is_valid_https_url() gate, then copy_checked(). */
+    CFG_VAL_PROXY,         /**< CFG_VAL_HTTPS_URL where an empty value means "no proxy". */
+    CFG_VAL_BOOL,          /**< parse_bool() into the int member. */
+    CFG_VAL_INT_RANGE,     /**< parse_int_range() within [min_val, max_val]. */
+    CFG_VAL_LOGLEVEL,      /**< parse_loglevel() into the loglevel_t member. */
+    CFG_VAL_PKCE_MODE,     /**< parse_pkce_mode() into the int member. */
+    CFG_VAL_QR_STYLE,      /**< parse_qr_style() into the qr_style_t member. */
+    CFG_VAL_QR_BLOCK_CHAR, /**< parse_qr_block_char() into the 2-byte member. */
+    CFG_VAL_QR_EC_LEVEL,   /**< parse_qr_ec_level() into the qr_ec_t member. */
+    CFG_VAL_QR_URI         /**< parse_qr_uri() into the int member. */
+} cfg_val_kind_t;
+
+/**
+ * @struct config_key_spec_t
+ * @brief Declarative specification of one configuration key.
+ *
+ * The offset/size pair locates the destination member inside config_t, so the
+ * parse_config_kv() dispatcher can apply every value kind uniformly, without
+ * per-key code.
+ */
+typedef struct {
+    const char *key;           /**< Case-insensitive key name (strcasecmp). */
+    config_section_t sec;      /**< Section the key belongs to. */
+    cfg_val_kind_t kind;       /**< Value handler kind. */
+    config_seen_t seen_bit;    /**< Duplicate-tracking bit (CFG_SEEN_BIT()). */
+    size_t offset;             /**< offsetof(config_t, destination member). */
+    size_t size;               /**< Destination buffer size (string kinds). */
+    int min_val;               /**< Inclusive lower bound (CFG_VAL_INT_RANGE). */
+    int max_val;               /**< Inclusive upper bound (CFG_VAL_INT_RANGE). */
+    const char *reserved_note; /**< "Accepted but unused" INFO note, or NULL. */
+} config_key_spec_t;
+
+/** Size of one config_t member, keeping CONFIG_KEYS[] entries in sync with the struct. */
+#define CFG_MEMBER_SIZE(member) (sizeof(((config_t *)0)->member))
+
+/**
+ * @brief The complete key/section/handler table driving parse_config_kv().
+ *
+ * Every recognized key is declared here exactly once. The dispatcher rejects
+ * anything not in this table — unknown key or right key in the wrong section —
+ * and flags repeats via the per-key seen bit. Keep the entries grouped by
+ * section, mirroring the documented configuration schema, and keep every
+ * config_key_id_t constant paired with exactly one entry.
+ */
+static const config_key_spec_t CONFIG_KEYS[] = {
+    /* [oauth] — Identity provider client credentials, endpoints, and verification. */
+    {"client_id", SEC_OAUTH, CFG_VAL_STRING, CFG_SEEN_BIT(CK_CLIENT_ID), offsetof(config_t, client_id),
+     CFG_MEMBER_SIZE(client_id), 0, 0, NULL},
+    {"client_secret", SEC_OAUTH, CFG_VAL_STRING, CFG_SEEN_BIT(CK_CLIENT_SECRET), offsetof(config_t, client_secret),
+     CFG_MEMBER_SIZE(client_secret), 0, 0, NULL},
+    {"device_authorization_endpoint", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_DEVICE_AUTHORIZATION_ENDPOINT),
+     offsetof(config_t, device_authorization_endpoint), CFG_MEMBER_SIZE(device_authorization_endpoint), 0, 0, NULL},
+    {"token_endpoint", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_TOKEN_ENDPOINT),
+     offsetof(config_t, token_endpoint), CFG_MEMBER_SIZE(token_endpoint), 0, 0, NULL},
+    {"userinfo_endpoint", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_USERINFO_ENDPOINT),
+     offsetof(config_t, userinfo_endpoint), CFG_MEMBER_SIZE(userinfo_endpoint), 0, 0, NULL},
+    {"scopes", SEC_OAUTH, CFG_VAL_STRING, CFG_SEEN_BIT(CK_SCOPES), offsetof(config_t, scopes), CFG_MEMBER_SIZE(scopes),
+     0, 0, NULL},
+    {"issuer", SEC_OAUTH, CFG_VAL_STRING, CFG_SEEN_BIT(CK_ISSUER), offsetof(config_t, issuer), CFG_MEMBER_SIZE(issuer),
+     0, 0, NULL},
+    {"audience", SEC_OAUTH, CFG_VAL_STRING, CFG_SEEN_BIT(CK_AUDIENCE), offsetof(config_t, audience),
+     CFG_MEMBER_SIZE(audience), 0, 0, NULL},
+    {"jwks_url", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_JWKS_URL), offsetof(config_t, jwks_url),
+     CFG_MEMBER_SIZE(jwks_url), 0, 0,
+     "jwks_url is accepted but unused: JWKS-based JWT signature verification is not currently performed; token "
+     "validity is enforced by the UserInfo endpoint"},
+    {"introspection_endpoint", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_INTROSPECTION_ENDPOINT),
+     offsetof(config_t, introspection_endpoint), CFG_MEMBER_SIZE(introspection_endpoint), 0, 0,
+     "introspection_endpoint is accepted but unused: RFC 7662 token introspection is not currently performed; "
+     "token validity is enforced by the UserInfo endpoint"},
+    {"verify_jwt_claims", SEC_OAUTH, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_VERIFY_JWT_CLAIMS),
+     offsetof(config_t, verify_jwt_claims), 0, 0, 0, NULL},
+    {"clock_skew_leeway", SEC_OAUTH, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_CLOCK_SKEW_LEEWAY),
+     offsetof(config_t, clock_skew_leeway), 0, 0, 300, NULL},
+    {"require_exp_claim", SEC_OAUTH, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_REQUIRE_EXP_CLAIM),
+     offsetof(config_t, require_exp_claim), 0, 0, 0, NULL},
+    {"use_pkce", SEC_OAUTH, CFG_VAL_PKCE_MODE, CFG_SEEN_BIT(CK_USE_PKCE), offsetof(config_t, use_pkce), 0, 0, 0, NULL},
+    {"discovery_endpoint", SEC_OAUTH, CFG_VAL_HTTPS_URL, CFG_SEEN_BIT(CK_DISCOVERY_ENDPOINT),
+     offsetof(config_t, discovery_endpoint), CFG_MEMBER_SIZE(discovery_endpoint), 0, 0, NULL},
+    {"proxy", SEC_OAUTH, CFG_VAL_PROXY, CFG_SEEN_BIT(CK_PROXY), offsetof(config_t, proxy), CFG_MEMBER_SIZE(proxy), 0, 0,
+     NULL},
+
+    /* [claim] — Identity claim extraction and matching. */
+    {"claim_field", SEC_CLAIM, CFG_VAL_STRING, CFG_SEEN_BIT(CK_CLAIM_FIELD), offsetof(config_t, claim_field),
+     CFG_MEMBER_SIZE(claim_field), 0, 0, NULL},
+    {"claim_regex", SEC_CLAIM, CFG_VAL_STRING, CFG_SEEN_BIT(CK_CLAIM_REGEX), offsetof(config_t, claim_regex),
+     CFG_MEMBER_SIZE(claim_regex), 0, 0, NULL},
+    {"claim_capture_group", SEC_CLAIM, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_CLAIM_CAPTURE_GROUP),
+     offsetof(config_t, claim_capture_group), 0, 0, 32, NULL},
+    {"case_sensitive", SEC_CLAIM, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_CASE_SENSITIVE), offsetof(config_t, case_sensitive), 0,
+     0, 0, NULL},
+
+    /* [access] — Login authorization policy (user/group allowlists and system-UID denial). */
+    {"allow_users", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_ALLOW_USERS), offsetof(config_t, allow_users),
+     CFG_MEMBER_SIZE(allow_users), 0, 0, NULL},
+    {"deny_users", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_DENY_USERS), offsetof(config_t, deny_users),
+     CFG_MEMBER_SIZE(deny_users), 0, 0, NULL},
+    {"allow_root", SEC_ACCESS, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_ALLOW_ROOT), offsetof(config_t, allow_root), 0, 0, 0,
+     NULL},
+    {"deny_system_uids", SEC_ACCESS, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_DENY_SYSTEM_UIDS),
+     offsetof(config_t, deny_system_uids), 0, 0, 0, NULL},
+    {"system_uid_min", SEC_ACCESS, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_SYSTEM_UID_MIN),
+     offsetof(config_t, system_uid_min), 0, 0, INT_MAX, NULL},
+    {"system_uid_max", SEC_ACCESS, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_SYSTEM_UID_MAX),
+     offsetof(config_t, system_uid_max), 0, 0, INT_MAX, NULL},
+    {"allow_groups", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_ALLOW_GROUPS), offsetof(config_t, allow_groups),
+     CFG_MEMBER_SIZE(allow_groups), 0, 0, NULL},
+    {"deny_groups", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_DENY_GROUPS), offsetof(config_t, deny_groups),
+     CFG_MEMBER_SIZE(deny_groups), 0, 0, NULL},
+    {"enforce_groups", SEC_ACCESS, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_ENFORCE_GROUPS), offsetof(config_t, enforce_groups), 0,
+     0, 0, NULL},
+    {"group_claim_field", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_GROUP_CLAIM_FIELD),
+     offsetof(config_t, group_claim_field), CFG_MEMBER_SIZE(group_claim_field), 0, 0, NULL},
+
+    /* [prompt] — User-facing prompting presentation. */
+    {"init_message", SEC_PROMPT, CFG_VAL_STRING, CFG_SEEN_BIT(CK_INIT_MESSAGE), offsetof(config_t, init_message),
+     CFG_MEMBER_SIZE(init_message), 0, 0, NULL},
+    {"show_expiry", SEC_PROMPT, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_SHOW_EXPIRY), offsetof(config_t, show_expiry), 0, 0, 0,
+     NULL},
+
+    /* [runtime] — Polling and logging behavior. */
+    {"max_poll_seconds", SEC_RUNTIME, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_MAX_POLL_SECONDS),
+     offsetof(config_t, max_poll_seconds), 0, 10, 3600, NULL},
+    {"loglevel", SEC_RUNTIME, CFG_VAL_LOGLEVEL, CFG_SEEN_BIT(CK_LOGLEVEL), offsetof(config_t, loglevel), 0, 0, 0, NULL},
+
+    /* [qr] — Optional QR-code rendering of the verification URI. */
+    {"enabled", SEC_QR, CFG_VAL_BOOL, CFG_SEEN_BIT(CK_QR_ENABLED), offsetof(config_t, qr_enabled), 0, 0, 0, NULL},
+    {"style", SEC_QR, CFG_VAL_QR_STYLE, CFG_SEEN_BIT(CK_QR_STYLE), offsetof(config_t, qr_style), 0, 0, 0, NULL},
+    {"block_char", SEC_QR, CFG_VAL_QR_BLOCK_CHAR, CFG_SEEN_BIT(CK_QR_BLOCK_CHAR), offsetof(config_t, qr_block_char),
+     CFG_MEMBER_SIZE(qr_block_char), 0, 0, NULL},
+    {"scale", SEC_QR, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_QR_SCALE), offsetof(config_t, qr_scale), 0, 1, 3, NULL},
+    {"vertical_quiet_zone", SEC_QR, CFG_VAL_INT_RANGE, CFG_SEEN_BIT(CK_QR_VQUIET),
+     offsetof(config_t, qr_vertical_quiet_zone), 0, 0, QR_QUIET_ZONE, NULL},
+    {"ec_level", SEC_QR, CFG_VAL_QR_EC_LEVEL, CFG_SEEN_BIT(CK_QR_EC_LEVEL), offsetof(config_t, qr_ec_level), 0, 0, 0,
+     NULL},
+    {"uri", SEC_QR, CFG_VAL_QR_URI, CFG_SEEN_BIT(CK_QR_URI), offsetof(config_t, qr_uri_complete), 0, 0, 0, NULL},
+};
+
+/**
  * @brief Processes a single key-value configuration pair for a given section.
  *
- * Enforces key uniqueness via duplicate detection bitfield flags (`seen`).
+ * Table-driven: looks the (section, key) pair up in CONFIG_KEYS[], then applies
+ * the entry's value kind to the destination member located by the table's
+ * offset/size pair. Key uniqueness is enforced via the per-key duplicate bit in
+ * `seen`; anything not in the table — unknown key, or a known key in the wrong
+ * section — is rejected.
  *
  * @param[in,out] cfg  Configuration structure receiving option value.
  * @param[in]     sec  Current configuration section being parsed.
- * @param[in,out] seen Key occurrence tracking structure.
+ * @param[in,out] seen Key occurrence tracking bitmask.
  * @param[in]     key  Configuration option name string.
  * @param[in]     val  Configuration option value string.
  * @param[in]     pamh PAM context handle for syslog reporting.
@@ -422,327 +588,74 @@ static int parse_qr_uri(const char *val, int *out) {
  */
 static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *seen, const char *key, const char *val,
                            pam_handle_t *pamh) {
-    if (sec == SEC_OAUTH) {
-        if (strcasecmp(key, "client_id") == 0) {
-            if (seen->client_id) {
-                goto duplicate_key;
-            }
-            seen->client_id = 1;
-            return copy_checked(cfg->client_id, sizeof(cfg->client_id), val);
-        } else if (strcasecmp(key, "client_secret") == 0) {
-            if (seen->client_secret) {
-                goto duplicate_key;
-            }
-            seen->client_secret = 1;
-            return copy_checked(cfg->client_secret, sizeof(cfg->client_secret), val);
-        } else if (strcasecmp(key, "device_authorization_endpoint") == 0) {
-            if (seen->device_authorization_endpoint) {
-                goto duplicate_key;
-            }
-            seen->device_authorization_endpoint = 1;
-            if (!is_valid_https_url(val)) {
-                if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "device_authorization_endpoint must be a valid https:// URL");
-                }
-                return -1;
-            }
-            return copy_checked(cfg->device_authorization_endpoint, sizeof(cfg->device_authorization_endpoint), val);
-        } else if (strcasecmp(key, "token_endpoint") == 0) {
-            if (seen->token_endpoint) {
-                goto duplicate_key;
-            }
-            seen->token_endpoint = 1;
-            if (!is_valid_https_url(val)) {
-                if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "token_endpoint must be a valid https:// URL");
-                }
-                return -1;
-            }
-            return copy_checked(cfg->token_endpoint, sizeof(cfg->token_endpoint), val);
-        } else if (strcasecmp(key, "userinfo_endpoint") == 0) {
-            if (seen->userinfo_endpoint) {
-                goto duplicate_key;
-            }
-            seen->userinfo_endpoint = 1;
-            if (!is_valid_https_url(val)) {
-                if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "userinfo_endpoint must be a valid https:// URL");
-                }
-                return -1;
-            }
-            return copy_checked(cfg->userinfo_endpoint, sizeof(cfg->userinfo_endpoint), val);
-        } else if (strcasecmp(key, "scopes") == 0) {
-            if (seen->scopes) {
-                goto duplicate_key;
-            }
-            seen->scopes = 1;
-            return copy_checked(cfg->scopes, sizeof(cfg->scopes), val);
-        } else if (strcasecmp(key, "issuer") == 0) {
-            if (seen->issuer) {
-                goto duplicate_key;
-            }
-            seen->issuer = 1;
-            return copy_checked(cfg->issuer, sizeof(cfg->issuer), val);
-        } else if (strcasecmp(key, "audience") == 0) {
-            if (seen->audience) {
-                goto duplicate_key;
-            }
-            seen->audience = 1;
-            return copy_checked(cfg->audience, sizeof(cfg->audience), val);
-        } else if (strcasecmp(key, "jwks_url") == 0) {
-            if (seen->jwks_url) {
-                goto duplicate_key;
-            }
-            seen->jwks_url = 1;
-            if (!is_valid_https_url(val)) {
-                if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "jwks_url must be a valid https:// URL");
-                }
-                return -1;
-            }
+    for (size_t i = 0; i < (sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0])); i++) {
+        const config_key_spec_t *spec = &CONFIG_KEYS[i];
+        if (spec->sec != sec || strcasecmp(key, spec->key) != 0) {
+            continue;
+        }
+
+        if ((*seen & spec->seen_bit) != 0) {
             if (pamh) {
-                pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_INFO, LOG_INFO,
-                              "jwks_url is accepted but unused: JWKS-based JWT signature verification is not currently "
-                              "performed; token validity is enforced by the UserInfo endpoint");
+                pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "Duplicate key '%s' in configuration file",
+                              key);
             }
-            return copy_checked(cfg->jwks_url, sizeof(cfg->jwks_url), val);
-        } else if (strcasecmp(key, "introspection_endpoint") == 0) {
-            if (seen->introspection_endpoint) {
-                goto duplicate_key;
+            return -1;
+        }
+        *seen |= spec->seen_bit;
+
+        /* Destination member inside cfg, located by the table's offset. */
+        void *dest = (char *)cfg + spec->offset;
+
+        switch (spec->kind) {
+        case CFG_VAL_STRING:
+            return copy_checked((char *)dest, spec->size, val);
+        case CFG_VAL_HTTPS_URL:
+        case CFG_VAL_PROXY:
+            /* An empty proxy value means "no proxy" (direct routing): accept it
+             * without copying; the destination keeps its default empty value. */
+            if (spec->kind == CFG_VAL_PROXY && val[0] == '\0') {
+                return 0;
             }
-            seen->introspection_endpoint = 1;
             if (!is_valid_https_url(val)) {
                 if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "introspection_endpoint must be a valid https:// URL");
+                    if (spec->kind == CFG_VAL_PROXY) {
+                        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
+                                      "proxy must be a valid https:// URL (plain-HTTP proxies are not supported)");
+                    } else {
+                        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "%s must be a valid https:// URL",
+                                      spec->key);
+                    }
                 }
                 return -1;
             }
-            if (pamh) {
-                pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_INFO, LOG_INFO,
-                              "introspection_endpoint is accepted but unused: RFC 7662 token introspection is not "
-                              "currently performed; token validity is enforced by the UserInfo endpoint");
+            if (spec->reserved_note != NULL && pamh) {
+                pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_INFO, LOG_INFO, "%s", spec->reserved_note);
             }
-            return copy_checked(cfg->introspection_endpoint, sizeof(cfg->introspection_endpoint), val);
-        } else if (strcasecmp(key, "verify_jwt_claims") == 0) {
-            if (seen->verify_jwt_claims) {
-                goto duplicate_key;
-            }
-            seen->verify_jwt_claims = 1;
-            return parse_bool(val, &cfg->verify_jwt_claims);
-        } else if (strcasecmp(key, "clock_skew_leeway") == 0) {
-            if (seen->clock_skew_leeway) {
-                goto duplicate_key;
-            }
-            seen->clock_skew_leeway = 1;
-            return parse_int_range(val, 0, 300, &cfg->clock_skew_leeway);
-        } else if (strcasecmp(key, "require_exp_claim") == 0) {
-            if (seen->require_exp_claim) {
-                goto duplicate_key;
-            }
-            seen->require_exp_claim = 1;
-            return parse_bool(val, &cfg->require_exp_claim);
-        } else if (strcasecmp(key, "use_pkce") == 0) {
-            if (seen->use_pkce) {
-                goto duplicate_key;
-            }
-            seen->use_pkce = 1;
-            return parse_pkce_mode(val, &cfg->use_pkce);
-        } else if (strcasecmp(key, "discovery_endpoint") == 0) {
-            if (seen->discovery_endpoint) {
-                goto duplicate_key;
-            }
-            seen->discovery_endpoint = 1;
-            if (!is_valid_https_url(val)) {
-                if (pamh) {
-                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "discovery_endpoint must be a valid https:// URL");
-                }
-                return -1;
-            }
-            return copy_checked(cfg->discovery_endpoint, sizeof(cfg->discovery_endpoint), val);
+            return copy_checked((char *)dest, spec->size, val);
+        case CFG_VAL_BOOL:
+            return parse_bool(val, (int *)dest);
+        case CFG_VAL_INT_RANGE:
+            return parse_int_range(val, spec->min_val, spec->max_val, (int *)dest);
+        case CFG_VAL_LOGLEVEL:
+            return parse_loglevel(val, (loglevel_t *)dest);
+        case CFG_VAL_PKCE_MODE:
+            return parse_pkce_mode(val, (int *)dest);
+        case CFG_VAL_QR_STYLE:
+            return parse_qr_style(val, (qr_style_t *)dest);
+        case CFG_VAL_QR_BLOCK_CHAR:
+            return parse_qr_block_char(val, (char *)dest);
+        case CFG_VAL_QR_EC_LEVEL:
+            return parse_qr_ec_level(val, (qr_ec_t *)dest);
+        case CFG_VAL_QR_URI:
+            return parse_qr_uri(val, (int *)dest);
         }
-    } else if (sec == SEC_CLAIM) {
-        if (strcasecmp(key, "claim_field") == 0) {
-            if (seen->claim_field) {
-                goto duplicate_key;
-            }
-            seen->claim_field = 1;
-            return copy_checked(cfg->claim_field, sizeof(cfg->claim_field), val);
-        } else if (strcasecmp(key, "claim_regex") == 0) {
-            if (seen->claim_regex) {
-                goto duplicate_key;
-            }
-            seen->claim_regex = 1;
-            return copy_checked(cfg->claim_regex, sizeof(cfg->claim_regex), val);
-        } else if (strcasecmp(key, "claim_capture_group") == 0) {
-            if (seen->claim_capture_group) {
-                goto duplicate_key;
-            }
-            seen->claim_capture_group = 1;
-            return parse_int_range(val, 0, 32, &cfg->claim_capture_group);
-        } else if (strcasecmp(key, "case_sensitive") == 0) {
-            if (seen->case_sensitive) {
-                goto duplicate_key;
-            }
-            seen->case_sensitive = 1;
-            return parse_bool(val, &cfg->case_sensitive);
-        }
-    } else if (sec == SEC_ACCESS) {
-        if (strcasecmp(key, "allow_users") == 0) {
-            if (seen->allow_users) {
-                goto duplicate_key;
-            }
-            seen->allow_users = 1;
-            return copy_checked(cfg->allow_users, sizeof(cfg->allow_users), val);
-        } else if (strcasecmp(key, "deny_users") == 0) {
-            if (seen->deny_users) {
-                goto duplicate_key;
-            }
-            seen->deny_users = 1;
-            return copy_checked(cfg->deny_users, sizeof(cfg->deny_users), val);
-        } else if (strcasecmp(key, "allow_root") == 0) {
-            if (seen->allow_root) {
-                goto duplicate_key;
-            }
-            seen->allow_root = 1;
-            return parse_bool(val, &cfg->allow_root);
-        } else if (strcasecmp(key, "deny_system_uids") == 0) {
-            if (seen->deny_system_uids) {
-                goto duplicate_key;
-            }
-            seen->deny_system_uids = 1;
-            return parse_bool(val, &cfg->deny_system_uids);
-        } else if (strcasecmp(key, "system_uid_min") == 0) {
-            if (seen->system_uid_min) {
-                goto duplicate_key;
-            }
-            seen->system_uid_min = 1;
-            return parse_int_range(val, 0, INT_MAX, &cfg->system_uid_min);
-        } else if (strcasecmp(key, "system_uid_max") == 0) {
-            if (seen->system_uid_max) {
-                goto duplicate_key;
-            }
-            seen->system_uid_max = 1;
-            return parse_int_range(val, 0, INT_MAX, &cfg->system_uid_max);
-        } else if (strcasecmp(key, "allow_groups") == 0) {
-            if (seen->allow_groups) {
-                goto duplicate_key;
-            }
-            seen->allow_groups = 1;
-            return copy_checked(cfg->allow_groups, sizeof(cfg->allow_groups), val);
-        } else if (strcasecmp(key, "deny_groups") == 0) {
-            if (seen->deny_groups) {
-                goto duplicate_key;
-            }
-            seen->deny_groups = 1;
-            return copy_checked(cfg->deny_groups, sizeof(cfg->deny_groups), val);
-        } else if (strcasecmp(key, "enforce_groups") == 0) {
-            if (seen->enforce_groups) {
-                goto duplicate_key;
-            }
-            seen->enforce_groups = 1;
-            return parse_bool(val, &cfg->enforce_groups);
-        } else if (strcasecmp(key, "group_claim_field") == 0) {
-            if (seen->group_claim_field) {
-                goto duplicate_key;
-            }
-            seen->group_claim_field = 1;
-            return copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), val);
-        }
-    } else if (sec == SEC_PROMPT) {
-        if (strcasecmp(key, "init_message") == 0) {
-            if (seen->init_message) {
-                goto duplicate_key;
-            }
-            seen->init_message = 1;
-            return copy_checked(cfg->init_message, sizeof(cfg->init_message), val);
-        } else if (strcasecmp(key, "show_host") == 0) {
-            if (seen->show_host) {
-                goto duplicate_key;
-            }
-            seen->show_host = 1;
-            return parse_bool(val, &cfg->show_host);
-        } else if (strcasecmp(key, "show_expiry") == 0) {
-            if (seen->show_expiry) {
-                goto duplicate_key;
-            }
-            seen->show_expiry = 1;
-            return parse_bool(val, &cfg->show_expiry);
-        }
-    } else if (sec == SEC_RUNTIME) {
-        if (strcasecmp(key, "max_poll_seconds") == 0) {
-            if (seen->max_poll_seconds) {
-                goto duplicate_key;
-            }
-            seen->max_poll_seconds = 1;
-            return parse_int_range(val, 10, 3600, &cfg->max_poll_seconds);
-        } else if (strcasecmp(key, "loglevel") == 0) {
-            if (seen->loglevel) {
-                goto duplicate_key;
-            }
-            seen->loglevel = 1;
-            return parse_loglevel(val, &cfg->loglevel);
-        }
-    } else if (sec == SEC_QR) {
-        if (strcasecmp(key, "enabled") == 0) {
-            if (seen->qr_enabled) {
-                goto duplicate_key;
-            }
-            seen->qr_enabled = 1;
-            return parse_bool(val, &cfg->qr_enabled);
-        } else if (strcasecmp(key, "style") == 0) {
-            if (seen->qr_style) {
-                goto duplicate_key;
-            }
-            seen->qr_style = 1;
-            return parse_qr_style(val, &cfg->qr_style);
-        } else if (strcasecmp(key, "block_char") == 0) {
-            if (seen->qr_block_char) {
-                goto duplicate_key;
-            }
-            seen->qr_block_char = 1;
-            return parse_qr_block_char(val, cfg->qr_block_char);
-        } else if (strcasecmp(key, "scale") == 0) {
-            if (seen->qr_scale) {
-                goto duplicate_key;
-            }
-            seen->qr_scale = 1;
-            return parse_int_range(val, 1, 3, &cfg->qr_scale);
-        } else if (strcasecmp(key, "vertical_quiet_zone") == 0) {
-            if (seen->qr_vquiet) {
-                goto duplicate_key;
-            }
-            seen->qr_vquiet = 1;
-            return parse_int_range(val, 0, QR_QUIET_ZONE, &cfg->qr_vertical_quiet_zone);
-        } else if (strcasecmp(key, "ec_level") == 0) {
-            if (seen->qr_ec_level) {
-                goto duplicate_key;
-            }
-            seen->qr_ec_level = 1;
-            return parse_qr_ec_level(val, &cfg->qr_ec_level);
-        } else if (strcasecmp(key, "uri") == 0) {
-            if (seen->qr_uri) {
-                goto duplicate_key;
-            }
-            seen->qr_uri = 1;
-            return parse_qr_uri(val, &cfg->qr_uri_complete);
-        }
+        /* Unreachable: every table entry names exactly one handled kind. */
+        return -1;
     }
 
     if (pamh) {
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Key '%s' is invalid or not allowed in current section", key);
-    }
-    return -1;
-
-duplicate_key:
-    if (pamh) {
-        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR, "Duplicate key '%s' in configuration file", key);
     }
     return -1;
 }
@@ -771,8 +684,7 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh) {
         return -1;
     }
 
-    config_seen_t seen;
-    memset(&seen, 0, sizeof(seen));
+    config_seen_t seen = 0;
     config_section_t current_sec = SEC_NONE;
 
     /* The read buffer must comfortably hold the longest legal config line. The largest
@@ -1001,10 +913,6 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
      * lifetimes; the operator may still raise it explicitly up to 3600). */
     cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
-    /* Device-code phishing cross-check: the sign-in prompt names the target host's
-     * hostname (built-in default template and the `{host}` template token) by
-     * default; [prompt] show_host = false hides it. */
-    cfg->show_host = 1;
     /* The device-code approval window (provider expires_in, clamped by max_poll_seconds)
      * is shown by default: the built-in default template's trailing status line carries
      * it so the user knows how long they have to complete the approval;

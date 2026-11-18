@@ -18,13 +18,13 @@
  */
 
 #include "../include/pam_oidc_device.h"
+#include "device_flow.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 /**
  * @brief Determines whether one POSIX `timespec` is strictly before another.
@@ -67,8 +67,8 @@ static int timespec_before(const struct timespec *a, const struct timespec *b) {
  * @param[in]  val       Field value.
  * @return 0 on success, -1 if the table is already full.
  */
-static int form_field_append(const char **keys, const char **vals, size_t *count, size_t capacity, const char *key,
-                             const char *val) {
+int form_field_append(const char **keys, const char **vals, size_t *count, size_t capacity, const char *key,
+                      const char *val) {
     if (*count >= capacity) {
         return -1;
     }
@@ -208,315 +208,6 @@ void secure_zero_json_tree(struct json_object *obj) { // NOLINT(misc-no-recursio
 }
 
 /**
- * @brief Validates that a fully rendered multi-line terminal prompt is display-safe.
- *
- * Rendered prompts legitimately contain newline characters, which `is_safe_terminal_string()`
- * rejects outright; this helper splits the prompt on newlines and requires every line to pass
- * the printable-ASCII terminal-safety check, so C0/C1 control bytes and non-printable bytes
- * (e.g. ANSI escape sequences) cannot reach the user's terminal whether they originate from
- * the custom template, the provider URL(s), or the user code.
- *
- * @param[in] str NUL-terminated rendered prompt text.
- * @return 1 if every line is terminal-safe, 0 otherwise (including lines longer than
- *         MAX_INIT_MSG_LEN, which fail closed).
- */
-static int is_safe_rendered_prompt(const char *str) {
-    if (!str) {
-        return 0;
-    }
-    char line[MAX_INIT_MSG_LEN];
-    size_t line_len = 0;
-    const char *line_start = str;
-    for (size_t i = 0;; i++) {
-        unsigned char c = (unsigned char)str[i];
-        if (c != '\n' && c != '\0') {
-            line_len++;
-            continue;
-        }
-        if (line_len >= sizeof(line)) {
-            return 0; /* Fail closed if a single line exceeds the scratch buffer */
-        }
-        memcpy(line, line_start, line_len);
-        line[line_len] = '\0';
-        if (!is_safe_terminal_string(line)) {
-            return 0;
-        }
-        if (c == '\0') {
-            return 1;
-        }
-        line_start = str + i + 1;
-        line_len = 0;
-    }
-}
-
-/**
- * @brief Formats a device-code approval window (seconds) as a compact human-readable duration.
- *
- * Renders the RFC 8628 `expires_in` value for the prompt's `{expiry}` template token and the
- * `[prompt] show_expiry` status-line clause: whole seconds under a minute, whole minutes
- * (rounded up) up to an hour, and "N hour(s) [M minute(s)]" at or above it. The duration text
- * is static-ASCII-derived (only digits, spaces, and the fixed unit words), so it requires no
- * separate terminal-safety check.
- *
- * @param[in]  expires_in Approval window in seconds (0 or negative = unknown).
- * @param[out] out        Buffer receiving the NUL-terminated duration text.
- * @param[in]  out_len    Output buffer byte capacity.
- * @return 0 on success, -1 when the window is unknown or the output buffer is too small.
- */
-static int format_expiry_seconds(int expires_in, char *out, size_t out_len) {
-    if (out == NULL || out_len == 0) {
-        return -1;
-    }
-    if (expires_in <= 0) {
-        out[0] = '\0';
-        return -1;
-    }
-    int w = 0;
-    if (expires_in < 60) {
-        w = snprintf(out, out_len, "%d second%s", expires_in, (expires_in == 1) ? "" : "s");
-    } else if (expires_in < 3600) {
-        int minutes = (expires_in + 59) / 60;
-        w = snprintf(out, out_len, "%d minute%s", minutes, (minutes == 1) ? "" : "s");
-    } else {
-        int total_minutes = (expires_in + 59) / 60;
-        int hours = total_minutes / 60;
-        int minutes = total_minutes % 60;
-        if (minutes == 0) {
-            w = snprintf(out, out_len, "%d hour%s", hours, (hours == 1) ? "" : "s");
-        } else {
-            w = snprintf(out, out_len, "%d hour%s %d minute%s", hours, (hours == 1) ? "" : "s", minutes,
-                         (minutes == 1) ? "" : "s");
-        }
-    }
-    return (w >= 0 && (size_t)w < out_len) ? 0 : -1;
-}
-
-/**
- * @brief Renders the user prompt message presented during SSH / PAM interactive authentication.
- *
- * Replaces placeholders `{host}`, `{url}`, `{url_complete}`, `{code}`, `{expiry}`, and newline
- * escape sequences `\\n`. The `{host}` token expands to the target host's hostname when
- * `cfg->show_host` is set and to an empty string when it is not. The `{expiry}` token expands to
- * the human-readable device-code approval window (`expires_in` seconds, via
- * `format_expiry_seconds()`; e.g. "15 minutes") and to an empty string when the window is
- * unknown. If no custom template is configured, generates a clean default prompt message: when
- * `cfg->show_host` is set, the target host (the `{host}` value) is named in the trailing status
- * line; when it is not, the prompt carries no host. When `cfg->show_expiry` is set (set by
- * default) and the window is known, the trailing status line additionally carries the
- * "(expires in ...)" clause. The fully rendered result is validated line-by-line for
- * terminal-injection safety (newline-tolerant `is_safe_terminal_string`); unsafe output fails
- * the call.
- *
- * @param[in]  cfg          Module configuration options.
- * @param[in]  host         Target host's hostname (device-code phishing mitigation: shown so the
- *                          approving user can tell which machine this sign-in belongs to); used
- *                          only when `cfg->show_host` is set.
- * @param[in]  url          OAuth verification URI string.
- * @param[in]  url_complete Complete verification URI containing embedded user code (optional).
- * @param[in]  code         User verification code string.
- * @param[in]  expires_in   Device-code approval window in seconds (provider `expires_in`,
- *                          clamped to `[runtime] max_poll_seconds`); 0 or negative = unknown.
- * @param[out] out          Buffer receiving rendered text output.
- * @param[in]  out_len      Output buffer byte capacity.
- * @return 0 on success, -1 on buffer overflow, rendering error, or terminal-safety rejection.
- */
-int render_prompt_message(const config_t *cfg, const char *host, const char *url, const char *url_complete,
-                          const char *code, int expires_in, char *out, size_t out_len) {
-    if (!cfg || !host || !url || !code || !out || out_len == 0) {
-        return -1;
-    }
-
-    const char *tpl = cfg->init_message;
-    if (tpl[0] == '\0') {
-        /* Compact default: no leading blank line. When the QR code is shown, its bottom vertical
-         * quiet zone already separates the prompt from the rendered art; when it is not, the
-         * prompt follows the preceding terminal output directly, saving a blank line. When
-         * show_host is set, the target host is named in the trailing status line as the user's
-         * cross-check against device-code phishing (an attacker phishing a code initiated from a
-         * *different* machine should not be claiming this one); [prompt] show_host = false
-         * hides it and reverts to the host-free wording. When the
-         * provider advertised an expiry, the same trailing line carries the approval window
-         * ("(expires in ...)") by default; [prompt] show_expiry = false omits it. Both
-         * clauses are optional strings, so disabling a clause renders exactly the same
-         * wording as before the option existed. */
-        char host_clause[280];
-        host_clause[0] = '\0';
-        if (cfg->show_host) {
-            int hlen = snprintf(host_clause, sizeof(host_clause), " to sign in to %s", host);
-            if (hlen < 0 || (size_t)hlen >= sizeof(host_clause)) {
-                return -1;
-            }
-        }
-        char expiry_clause[48];
-        expiry_clause[0] = '\0';
-        if (cfg->show_expiry) {
-            char expiry_text[32];
-            if (format_expiry_seconds(expires_in, expiry_text, sizeof(expiry_text)) == 0) {
-                int elen = snprintf(expiry_clause, sizeof(expiry_clause), " (expires in %s)", expiry_text);
-                if (elen < 0 || (size_t)elen >= sizeof(expiry_clause)) {
-                    return -1;
-                }
-            }
-        }
-        int w = 0;
-        if (url_complete && strcmp(url, url_complete) != 0) {
-            w = snprintf(out, out_len,
-                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n"
-                         "  (Direct: %s)\n"
-                         "Waiting for your approval%s%s; this session completes automatically once you sign in.\n",
-                         url, code, url_complete, host_clause, expiry_clause);
-        } else {
-            w = snprintf(out, out_len,
-                         "Complete authentication in your browser:\n  URL:  %s\n  Code: %s\n"
-                         "Waiting for your approval%s%s; this session completes automatically once you sign in.\n",
-                         url, code, host_clause, expiry_clause);
-        }
-        if (w < 0 || (size_t)w >= out_len) {
-            return -1;
-        }
-        return is_safe_rendered_prompt(out) ? 0 : -1;
-    }
-
-    size_t out_pos = 0;
-    out[0] = '\0';
-
-    for (size_t i = 0; tpl[i] != '\0'; i++) {
-        if (tpl[i] == '\\' && tpl[i + 1] == 'n') {
-            if (out_pos + 1 >= out_len) {
-                return -1;
-            }
-            out[out_pos++] = '\n';
-            i++;
-        } else if (strncmp(tpl + i, "{url_complete}", 14) == 0) {
-            const char *val = url_complete ? url_complete : url;
-            size_t vlen = strlen(val);
-            if (out_pos + vlen >= out_len) {
-                return -1;
-            }
-            memcpy(out + out_pos, val, vlen);
-            out_pos += vlen;
-            i += 13;
-        } else if (strncmp(tpl + i, "{url}", 5) == 0) {
-            size_t vlen = strlen(url);
-            if (out_pos + vlen >= out_len) {
-                return -1;
-            }
-            memcpy(out + out_pos, url, vlen);
-            out_pos += vlen;
-            i += 4;
-        } else if (strncmp(tpl + i, "{host}", 6) == 0) {
-            /* show_host gates the hostname display (device-code phishing cross-check): when the
-             * flag is not set the token expands to an empty string, so a template can carry
-             * {host} without the hostname appearing. */
-            if (cfg->show_host) {
-                size_t vlen = strlen(host);
-                if (out_pos + vlen >= out_len) {
-                    return -1;
-                }
-                memcpy(out + out_pos, host, vlen);
-                out_pos += vlen;
-            }
-            i += 5;
-        } else if (strncmp(tpl + i, "{code}", 6) == 0) {
-            size_t vlen = strlen(code);
-            if (out_pos + vlen >= out_len) {
-                return -1;
-            }
-            memcpy(out + out_pos, code, vlen);
-            out_pos += vlen;
-            i += 5;
-        } else if (strncmp(tpl + i, "{expiry}", 8) == 0) {
-            /* {expiry} expands to the human-readable device-code approval window (provider
-             * expires_in, clamped by max_poll_seconds); when the window is unknown the token
-             * expands to an empty string (same convention as {host} with show_host off). */
-            char expiry_text[32];
-            if (format_expiry_seconds(expires_in, expiry_text, sizeof(expiry_text)) == 0) {
-                size_t vlen = strlen(expiry_text);
-                if (out_pos + vlen >= out_len) {
-                    return -1;
-                }
-                memcpy(out + out_pos, expiry_text, vlen);
-                out_pos += vlen;
-            }
-            i += 7;
-        } else {
-            if (out_pos + 1 >= out_len) {
-                return -1;
-            }
-            out[out_pos++] = tpl[i];
-        }
-    }
-    out[out_pos] = '\0';
-    return is_safe_rendered_prompt(out) ? 0 : -1;
-}
-
-/*
- * Plain-text, user-facing failure notices delivered through the PAM conversation
- * (`PAM_TEXT_INFO`) so a failed attempt never ends in an unexplained
- * "permission denied" (accessibility: clear, actionable error feedback).
- *
- * Wording is deliberately generic: it identifies the class of failure and the
- * next action without revealing *which* security control rejected the attempt
- * (deny-list membership, claim-mismatch detail, group-policy specifics, ...) —
- * those details remain in the audit log only. The strings are static,
- * compile-time constants and contain only printable ASCII.
- *
- * Delivery is best-effort (a `pam_prompt` failure is intentionally ignored):
- * on a degraded conversation the notice is simply not shown, and it must never
- * change the authentication outcome. OpenSSH keyboard-interactive clients may
- * additionally buffer `PAM_TEXT_INFO` until a prompt round-trip, so SSH clients
- * are not guaranteed to display it; local console logins are.
- */
-static const char *const USER_NOTICE_SERVICE =
-    "Sign-in could not be completed: the identity provider service is unavailable.\n"
-    "Please try again, or contact your system administrator if the problem persists.\n";
-static const char *const USER_NOTICE_DENIED =
-    "Authentication was denied for this account.\n"
-    "Please contact your system administrator if you believe this is an error.\n";
-static const char *const USER_NOTICE_EXPIRED =
-    "Sign-in was not approved in time: the sign-in code expired or the identity provider\n"
-    "service became unavailable. Please sign in again to start a new session.\n";
-static const char *const USER_NOTICE_NOT_APPROVED =
-    "Sign-in was declined: the sign-in request was not approved at the identity provider.\n"
-    "Please sign in again to start a new session.\n";
-
-static void notify_user_failure(pam_handle_t *pamh, const char *msg) {
-    if (pamh && msg != NULL) {
-        (void)pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", msg);
-    }
-}
-
-/*
- * Maximum length (bytes, including the terminating NUL) of the provider-issued
- * RFC 8628 device_code.
- */
-#define DEVICE_CODE_MAX_LEN 2048
-
-/*
- * Capacity (bytes, including the terminating NUL) of the stack buffer holding
- * the JWT 'sub' claim for the JWT-sub vs UserInfo-sub consistency check.
- * OIDC Core caps 'sub' at 255 ASCII characters, so 256 = 255 + NUL.
- */
-#define JWT_SUB_CLAIM_MAX 256
-
-/*
- * Result of a successful device-authorization request (RFC 8628 s3.1/s3.2).
- * The verification_uri / verification_uri_complete / user_code members are
- * BORROWED from the *dev_json tree parsed by request_device_authorization()
- * and stay valid only until the caller releases that tree; device_code is
- * owned (copied) by this struct.
- */
-typedef struct {
-    char device_code[DEVICE_CODE_MAX_LEN];
-    const char *verification_uri;
-    const char *verification_uri_complete; /* NULL when the provider omits it */
-    const char *user_code;
-    int poll_interval;        /* seconds, clamped to [MIN_POLL_INTERVAL, MAX_SUPPORTED_POLL_INTERVAL] */
-    int expires_in;           /* seconds, clamped to (0, cfg->max_poll_seconds] */
-    struct timespec deadline; /* monotonic polling expiration deadline */
-} device_auth_t;
-
-/**
  * @brief RFC 8628 s3.5 `slow_down` poll-interval adjustment.
  *
  * The provider asks for polling 5 s less frequently: bump the interval by 5 s,
@@ -546,6 +237,69 @@ int poll_interval_after_transient(int interval) {
 }
 
 /**
+ * @brief Pure scheduling decision for one token-poll loop iteration (RFC 8628 s3.5).
+ *
+ * The clock is injected (`now`) instead of read here so the timing rules — the first
+ * poll issued immediately with no leading sleep, subsequent polls spaced by the
+ * (possibly backed-off) interval, and a next poll that would land at or after the
+ * device deadline ending the wait — are unit-testable without any real sleeping.
+ * Declared in src/device_flow.h (internal) so tests/test_suite.c can pin these
+ * rules; not part of the public API (include/pam_oidc_device.h).
+ *
+ * @param[in]  first_poll 1 for the loop's first iteration (no leading sleep).
+ * @param[in]  interval   Current poll interval in seconds (already clamped/backed off).
+ * @param[in]  now        Current CLOCK_MONOTONIC reading (ignored when first_poll).
+ * @param[in]  deadline   Device-authorization expiration deadline (monotonic).
+ * @param[out] next_poll  Absolute monotonic wake time for the next request
+ *                       (POLL_SCHED_SLEEP only; untouched otherwise).
+ * @return POLL_SCHED_RUN_NOW, POLL_SCHED_SLEEP, or POLL_SCHED_EXPIRED.
+ */
+poll_sched_action_t poll_loop_schedule(int first_poll, int interval, const struct timespec *now,
+                                       const struct timespec *deadline, struct timespec *next_poll) {
+    if (first_poll) {
+        return POLL_SCHED_RUN_NOW;
+    }
+    struct timespec t = *now;
+    t.tv_sec += interval;
+    *next_poll = t;
+    return timespec_before(&t, deadline) ? POLL_SCHED_SLEEP : POLL_SCHED_EXPIRED;
+}
+
+/**
+ * @brief Pure per-request deadline budget for one token poll (RFC 8628 s3.5).
+ *
+ * Decides, from an injected clock reading, whether another token request still
+ * fits before the device-authorization deadline and returns the bounded cURL
+ * timeout for it. cURL treats a zero (or negative) CURLOPT_TIMEOUT_MS as "no
+ * timeout", so a request whose whole-second remainder has hit zero is refused
+ * rather than fired with an unbounded lifetime. Declared in src/device_flow.h
+ * (internal) so tests/test_suite.c can pin the budget rules; not part of the
+ * public API (include/pam_oidc_device.h).
+ *
+ * @param[in]  now        Current CLOCK_MONOTONIC reading.
+ * @param[in]  deadline   Device-authorization expiration deadline (monotonic).
+ * @param[out] timeout_ms Bounded per-request cURL timeout in milliseconds
+ *                        (1..10000, the same request-time cap the device request
+ *                        uses) when returning 1.
+ * @return 1 if a request may still be issued (`*timeout_ms` set), 0 if the
+ *         deadline leaves no room for another request.
+ */
+int poll_request_budget(const struct timespec *now, const struct timespec *deadline, long *timeout_ms) {
+    if (!timespec_before(now, deadline)) {
+        return 0;
+    }
+    long remain_ms = (long)((deadline->tv_sec - now->tv_sec) * 1000);
+    if (remain_ms <= 0L) {
+        /* The monotonic check above guarantees `now` is before the deadline at
+         * nanosecond precision, but the whole-second difference can still be zero
+         * at the deadline boundary. */
+        return 0;
+    }
+    *timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
+    return 1;
+}
+
+/**
  * @brief RFC 8628 s3.1/s3.2 device-authorization request phase.
  *
  * Builds and POSTs the device-authorization request, then parses and validates
@@ -570,10 +324,13 @@ int poll_interval_after_transient(int interval) {
  *                           members borrow from it).
  * @param[out] postfields    cURL-escaped request body (caller scrubs and frees).
  * @return `PAM_SUCCESS`, or the PAM error code of the failing sub-step.
+ *
+ * Declared in src/device_flow.h (internal) so tests/test_suite.c can drive it
+ * through the fake cURL transport; not part of the public API.
  */
-static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, int pkce_active,
-                                        const char *code_challenge, CURL *curl, device_auth_t *dev,
-                                        http_response_t *resp, struct json_object **dev_json, char **postfields) {
+int request_device_authorization(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, int pkce_active,
+                                 const char *code_challenge, CURL *curl, device_auth_t *dev, http_response_t *resp,
+                                 struct json_object **dev_json, char **postfields) {
     pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Requesting device code from endpoint: %s",
                   cfg->device_authorization_endpoint);
 
@@ -617,8 +374,8 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
         return PAM_BUF_ERR;
     }
 
-    if (http_request("POST", cfg->device_authorization_endpoint, *postfields, NULL, 10000L, resp, loglevel, pamh) !=
-            0 ||
+    if (http_request("POST", cfg->device_authorization_endpoint, *postfields, NULL, cfg->proxy, 10000L, resp, loglevel,
+                     pamh) != 0 ||
         resp->status_code != 200 || !resp->body) {
         pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Device authorization request failed (HTTP status code: %ld)", resp->status_code);
@@ -686,9 +443,16 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
     }
 
     if (interval > MAX_SUPPORTED_POLL_INTERVAL) {
-        /* RFC 8628 §3.5 only forbids polling FASTER than the advertised interval;
-         * an unusually long interval is safe to honor, so clamp to the supported
-         * maximum instead of failing the authentication attempt. */
+        /* Documented, logged deviation from RFC 8628 §3.5: the spec forbids polling
+         * more frequently than the advertised interval, so an unusually long interval
+         * could simply be honored verbatim. It is clamped downward to the supported
+         * maximum instead so the attempt keeps polling within the module's supported
+         * window (the total wait stays bounded by `expires_in`, which `max_poll_seconds`
+         * caps); honored verbatim, an interval this large would push every subsequent
+         * poll past the device deadline and end the attempt without another request.
+         * The trade-off is polling faster than the provider asked for — a bounded,
+         * provider-visible deviation that is preferable to a guaranteed timeout.
+         * Raising the cap is a public-interface change (include/pam_oidc_device.h). */
         if (pamh) {
             pam_oauth_log(pamh, loglevel, LOGLEVEL_INFO, LOG_WARNING,
                           "Provider poll interval %ds exceeds supported maximum; clamping to %ds", interval,
@@ -719,20 +483,6 @@ static int request_device_authorization(pam_handle_t *pamh, const config_t *cfg,
     dev->expires_in = expires_in;
     return PAM_SUCCESS;
 }
-
-/*
- * Classification of a FAILED token-polling outcome (poll_for_access_token()),
- * mapped to the user-visible notice in pam_sm_authenticate(). The PAM status
- * code alone cannot carry this distinction — token-phase failures collapse
- * into PAM_AUTH_ERR, so without it the user would see the same notice for an
- * expired code, a declined sign-in, and a broken network path.
- */
-typedef enum {
-    TOKEN_PHASE_EXPIRED = 0, /* Poll deadline reached, or the provider reported expired_token. */
-    TOKEN_PHASE_DENIED,      /* The provider reported access_denied (sign-in not approved). */
-    TOKEN_PHASE_UNAVAILABLE  /* Everything else: network failure, malformed/oversized token,
-                               unexpected status, allocation error. */
-} token_phase_t;
 
 /**
  * @brief RFC 8628 s3.4/s3.5 token-polling phase.
@@ -765,11 +515,14 @@ typedef enum {
  *                              / TOKEN_PHASE_UNAVAILABLE; TOKEN_PHASE_UNAVAILABLE default).
  * @return `PAM_SUCCESS` when an access token was acquired, `PAM_ABORT` on user
  *         cancellation, or the PAM error code of the failing sub-step.
+ *
+ * Declared in src/device_flow.h (internal) so tests/test_suite.c can drive it
+ * through the fake cURL transport; not part of the public API.
  */
-static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, const char *pam_user,
-                                 const device_auth_t *dev, const char *code_verifier, int pkce_active, CURL *curl,
-                                 http_response_t *token_resp, struct json_object **tok_json, char **access_token,
-                                 char **token_postfields, token_phase_t *phase) {
+int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, const char *pam_user,
+                          const device_auth_t *dev, const char *code_verifier, int pkce_active, CURL *curl,
+                          http_response_t *token_resp, struct json_object **tok_json, char **access_token,
+                          char **token_postfields, token_phase_t *phase) {
     /* Default notice classification for every failure path below; the sites that
      * correspond to an expired code or a declined sign-in overwrite it. */
     *phase = TOKEN_PHASE_UNAVAILABLE;
@@ -819,22 +572,25 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
     int interval = dev->poll_interval;
     int first_poll = 1;
     while (1) {
-        if (!first_poll) {
-            struct timespec now;
-            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-                pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
-                return PAM_SYSTEM_ERR;
-            }
-            struct timespec next_poll = now;
-            next_poll.tv_sec += interval;
+        /* Scheduling decision for this iteration, from the pure (clock-injected)
+         * helper: first poll runs now, later polls sleep until next_poll, and a
+         * next poll past the device deadline ends the wait. */
+        struct timespec now;
+        struct timespec next_poll;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to read monotonic clock");
+            return PAM_SYSTEM_ERR;
+        }
+        poll_sched_action_t sched = poll_loop_schedule(first_poll, interval, &now, &dev->deadline, &next_poll);
 
-            if (!timespec_before(&next_poll, &dev->deadline)) {
-                pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "Polling reached device authorization expiration deadline");
-                *phase = TOKEN_PHASE_EXPIRED;
-                break;
-            }
+        if (sched == POLL_SCHED_EXPIRED) {
+            pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                          "Polling reached device authorization expiration deadline");
+            *phase = TOKEN_PHASE_EXPIRED;
+            break;
+        }
 
+        if (sched == POLL_SCHED_SLEEP) {
             /* Sleep until the next poll deadline: a single uninterrupted sleep of the full
              * interval, so the token endpoint is never polled more frequently than the
              * provider's `interval` allows. */
@@ -857,33 +613,33 @@ static int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglev
         }
         first_poll = 0;
 
-        struct timespec now;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || !timespec_before(&now, &dev->deadline)) {
+        /* Deadline budget for this request, from the pure (clock-injected) helper.
+         * A clock-read failure is folded into "deadline reached", matching the
+         * original combined condition. The clock is re-read here so the budget
+         * reflects the post-sleep time, not the scheduling decision's snapshot. */
+        long req_timeout_ms = 0;
+        int budget_ok = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            budget_ok = poll_request_budget(&now, &dev->deadline, &req_timeout_ms);
+        }
+        if (!budget_ok) {
+            /*
+             * No room left for another request: at or past the device deadline
+             * (possibly exactly at the whole-second boundary — cURL treats a zero
+             * or negative CURLOPT_TIMEOUT_MS as "no timeout", so stop polling
+             * instead of firing a request with an unbounded lifetime).
+             */
             pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling authorization deadline reached");
             *phase = TOKEN_PHASE_EXPIRED;
             break;
         }
 
-        long remain_ms = (long)((dev->deadline.tv_sec - now.tv_sec) * 1000);
-        if (remain_ms <= 0L) {
-            /*
-             * The monotonic check above guarantees `now` is before the deadline
-             * at nanosecond precision, but the whole-second difference can still
-             * be zero at the deadline boundary. cURL treats a zero (or negative)
-             * CURLOPT_TIMEOUT_MS as "no timeout", so stop polling instead of
-             * firing a request with an unbounded lifetime.
-             */
-            *phase = TOKEN_PHASE_EXPIRED;
-            break;
-        }
-        long req_timeout_ms = (remain_ms < 10000L) ? remain_ms : 10000L;
-
         pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Polling token endpoint (timeout: %ldms)",
                       req_timeout_ms);
 
         free_http_response(token_resp);
-        int req_rc = http_request("POST", cfg->token_endpoint, *token_postfields, NULL, req_timeout_ms, token_resp,
-                                  loglevel, pamh);
+        int req_rc = http_request("POST", cfg->token_endpoint, *token_postfields, NULL, cfg->proxy, req_timeout_ms,
+                                  token_resp, loglevel, pamh);
 
         if (req_rc == 0) {
             if (is_retryable_token_http_status(token_resp->status_code)) {
@@ -1100,11 +856,6 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     char code_challenge[PKCE_S256_CHALLENGE_LEN + 1];
     memset(code_challenge, 0, sizeof(code_challenge));
 
-    /* JWT 'sub' claim for the JWT-sub vs UserInfo-sub consistency check
-     * (Step 7b); scrubbed unconditionally at `cleanup` below. */
-    char jwt_sub[JWT_SUB_CLAIM_MAX];
-    memset(jwt_sub, 0, sizeof(jwt_sub));
-
     http_response_t resp;
     memset(&resp, 0, sizeof(resp));
 
@@ -1184,7 +935,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     int pkce_active = cfg.use_pkce;
     if (cfg.use_pkce == 2) {
         int supported = 0;
-        (void)discovery_probe_pkce(cfg.discovery_endpoint, &supported, active_loglevel, pamh);
+        (void)discovery_probe_pkce(cfg.discovery_endpoint, cfg.proxy, &supported, active_loglevel, pamh);
         pkce_active = supported;
     }
 
@@ -1224,94 +975,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
-    /* Step 4: Display instructions and verification code to client terminal. The
-     * rendered prompt embeds the user code and verification URIs; the stack buffer
-     * is scrubbed unconditionally at `cleanup` like the other sensitive material. */
-    /* The target host's hostname is named in the trailing prompt status line as the user's
-     * cross-check against device-code phishing (docs/threat-model.md §8; [prompt] show_host,
-     * on by default): an attacker who social-engineers an approval for a code initiated from
-     * a different machine should not be claiming this host. PAM exposes no peer-address API,
-     * so the connecting client's IP is not (and cannot reliably be) displayed here. The
-     * rendered-prompt safety check below still fail-closes on any hostname containing
-     * non-printable bytes. When show_host is off, the prompt carries no host, the {host}
-     * template token expands to an empty string, and gethostname() is not called at all. The
-     * device-code approval window (provider expires_in, clamped by [runtime] max_poll_seconds —
-     * the module's effective wait limit) reaches the prompt as dev.expires_in: by default it
-     * appears in the built-in default template's trailing status line,
-     * [prompt] show_expiry = false omits it, and any {expiry} template token expands it
-     * regardless. */
-    char host_buf[256];
-    const char *host_disp = "";
-    if (cfg.show_host) {
-        if (gethostname(host_buf, sizeof(host_buf)) == 0) {
-            host_buf[sizeof(host_buf) - 1] = '\0';
-            host_disp = host_buf;
-        } else {
-            host_disp = "(unknown)";
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "gethostname() failed (%s); prompt will show an unknown host", strerror(errno));
-        }
-    }
-    char prompt_buf[MAX_INIT_MSG_LEN];
-    if (render_prompt_message(&cfg, host_disp, dev.verification_uri, dev.verification_uri_complete, dev.user_code,
-                              dev.expires_in, prompt_buf, sizeof(prompt_buf)) != 0) {
-        if (pamh) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "Failed to render prompt message");
-        }
-        retval = PAM_SERVICE_ERR;
-        notify_user_failure(pamh, USER_NOTICE_SERVICE);
+    /* Step 4: Display instructions and verification code to client terminal. Renders and
+     * presents the sign-in prompt (templated text + optional QR block + Enter-to-begin
+     * flush for keyboard-interactive clients) in one reviewable unit; the function owns
+     * and scrubs its prompt buffer. See present_signin_prompt() in src/message.c. */
+    retval = present_signin_prompt(pamh, &cfg, active_loglevel, &dev);
+    if (retval != PAM_SUCCESS) {
         goto cleanup;
-    }
-
-    /* Step 4b: Optionally present the verification URI as a scannable terminal QR code so the
-     * user can open the page with a phone camera instead of typing. The block is informational
-     * (PAM_TEXT_INFO); any rendering failure is logged at debug level and non-fatal, because the
-     * text prompt below always carries the URL and user code. */
-    if (cfg.qr_enabled) {
-        char qr_buf[QR_RENDER_BUF_MAX];
-        if (qr_render_verification_code(&cfg, active_loglevel, dev.verification_uri, dev.verification_uri_complete,
-                                        qr_buf, sizeof(qr_buf), pamh) == 0) {
-            int qr_res = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", qr_buf);
-            if (qr_res != PAM_SUCCESS) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "QR code prompt not displayed (conversation returned %d); text prompt follows", qr_res);
-            }
-        }
-    }
-
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                  "Prompting user with verification code instructions");
-
-    /* Deliver the instructions as an informational message (PAM_TEXT_INFO), the same primitive
-     * used for the QR code. OpenSSH (keyboard-interactive) buffers PAM_TEXT_INFO and flushes it
-     * only when a subsequent prompt triggers a USERINFO round-trip; the mandatory PAM_PROMPT_ECHO_ON
-     * "Press [Enter] to begin..." confirmation (Step 4c) forces that flush so the URL / user code
-     * are reliably visible before polling begins. */
-    int prompt_res = pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", prompt_buf);
-    if (prompt_res != PAM_SUCCESS) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "User prompt delivery failed or was cancelled");
-        retval = prompt_res;
-        goto cleanup;
-    }
-
-    /* Step 4c: Sign-in confirmation. Wait for a single Enter before polling begins. This
-     * reliably flushes the PAM_TEXT_INFO sign-in prompt (URL / QR / user code) to OpenSSH
-     * keyboard-interactive clients, which otherwise buffer it until a prompt triggers a
-     * USERINFO round-trip. The keystroke is intentionally ignored — the device-code flow
-     * is already in progress. */
-    if (pamh) {
-        int flush_rc = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, NULL, "Press [Enter] to begin... ");
-        if (flush_rc == PAM_ABORT) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO, "Authentication aborted by user");
-            retval = PAM_ABORT;
-            goto cleanup;
-        }
-        if (flush_rc != PAM_SUCCESS) {
-            /* Best-effort: the URL / user code above were already sent as PAM_TEXT_INFO. Log and
-             * continue polling rather than hard-failing on a degraded conversation. */
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                          "Key-press prompt returned %d; proceeding to polling", flush_rc);
-        }
     }
 
     /* Step 5/6: Build the token request and poll the Token Endpoint (first poll immediate,
@@ -1354,8 +1024,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Querying UserInfo endpoint: %s",
                   cfg.userinfo_endpoint);
 
-    if (http_request("GET", cfg.userinfo_endpoint, NULL, access_token, 10000L, &userinfo_resp, active_loglevel, pamh) !=
-            0 ||
+    if (http_request("GET", cfg.userinfo_endpoint, NULL, access_token, cfg.proxy, 10000L, &userinfo_resp,
+                     active_loglevel, pamh) != 0 ||
         userinfo_resp.status_code != 200 || !userinfo_resp.body) {
         pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR, "UserInfo query failed (HTTP status %ld)",
                       userinfo_resp.status_code);
@@ -1372,124 +1042,17 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         goto cleanup;
     }
 
-    /* PII-safe UserInfo audit logging: the raw claim payload contains personal
-     * data (emails, phone numbers, group memberships) and must never be
-     * persisted to the system log. Routine logging (DEBUG) records only the
-     * payload size and the configured claim field; the troubleshooting level
-     * (VERBOSE) additionally lists the claim NAMES returned by the provider —
-     * enough to debug claim-field configuration — without logging any claim
-     * VALUES. */
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                  "UserInfo claim payload received: %zu bytes, claim field '%s' present", userinfo_resp.size,
-                  cfg.claim_field);
-    {
-        struct json_object_iter it;
-        /* Cap the claim-name listing; larger payloads get a summary line
-         * instead. json_object_object_length() returns int on older json-c
-         * (EL8/EL9) and size_t on newer releases, so capture through an
-         * explicit long and range-check it; both the total and the remaining
-         * budget stay opaque runtime values, so the budget check below is
-         * not statically foldable. */
-        const long claims_raw = (long)json_object_object_length(uinfo_json);
-        const size_t total_claims = (claims_raw > 0) ? (size_t)claims_raw : 0;
-        size_t names_left = (total_claims < 32) ? total_claims : 32;
-        json_object_object_foreachC(uinfo_json, it) {
-            if (names_left == 0) {
-                break;
-            }
-            int name_safe = 1;
-            for (const char *p = it.key; p && *p != '\0'; p++) {
-                if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
-                    name_safe = 0;
-                    break;
-                }
-            }
-            if (name_safe) {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim present: '%s'",
-                              it.key);
-            } else {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
-                              "UserInfo claim present: (name contains non-printable bytes; withheld)");
-            }
-            names_left--;
-        }
-        if (total_claims > 32) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
-                          "UserInfo claim list truncated: 32 of %zu claim names shown", total_claims);
-        }
-    }
-
-    struct json_object *j_claim = NULL;
-    if (!json_object_object_get_ex(uinfo_json, cfg.claim_field, &j_claim) || !j_claim ||
-        !json_object_is_type(j_claim, json_type_string)) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "UserInfo response missing string claim field '%s'", cfg.claim_field);
-        retval = PAM_AUTH_ERR;
+    /* Step 7b-9: Post-UserInfo identity verification in one reviewable unit: PII-safe
+     * UserInfo audit logging, configured claim-field extraction, JWT-sub vs UserInfo-sub
+     * token-substitution check, claim verification against the requesting PAM user, and
+     * group/role allow/deny authorization. Each failure is logged, a plain-text notice is
+     * delivered, and a distinct PAM status returned. See verify_userinfo_identity() in
+     * src/identity.c. */
+    retval =
+        verify_userinfo_identity(pamh, &cfg, active_loglevel, pam_user, uinfo_json, userinfo_resp.size, access_token);
+    if (retval != PAM_SUCCESS) {
         goto cleanup;
     }
-
-    /* Step 7b: JWT-sub vs UserInfo-sub consistency check (token-substitution
-     * defense). When local JWT claim inspection is enabled and the access
-     * token carries a 'sub' claim, it must match the UserInfo 'sub': the
-     * UserInfo exchange is the module's only authoritative token
-     * validity/signature check, and on multi-audience IdPs a token minted
-     * for a different client could otherwise authorize the wrong subject. A
-     * missing 'sub' on either side is skipped (logged; providers differ),
-     * while a present-but-mismatched or malformed 'sub' fails closed. */
-    if (cfg.verify_jwt_claims) {
-        int sub_rc = jwt_extract_claim_string(access_token, "sub", jwt_sub, sizeof(jwt_sub));
-        if (sub_rc == 0) {
-            struct json_object *j_uinfo_sub = NULL;
-            if (json_object_object_get_ex(uinfo_json, "sub", &j_uinfo_sub) && j_uinfo_sub &&
-                json_object_is_type(j_uinfo_sub, json_type_string)) {
-                if (strcmp(jwt_sub, json_object_get_string(j_uinfo_sub)) != 0) {
-                    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                                  "JWT subject does not match UserInfo subject for user '%s' "
-                                  "(token substitution suspected)",
-                                  pam_user);
-                    notify_user_failure(pamh, USER_NOTICE_DENIED);
-                    retval = PAM_AUTH_ERR;
-                    goto cleanup;
-                }
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                              "JWT subject matches UserInfo subject for user '%s'", pam_user);
-            } else {
-                pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_WARNING,
-                              "UserInfo response carries no string 'sub' claim; JWT subject consistency check skipped");
-            }
-        } else if (sub_rc == 1) {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
-                          "Access token carries no 'sub' claim; JWT subject consistency check skipped");
-        } else {
-            pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                          "Malformed 'sub' claim in access token for user '%s'", pam_user);
-            retval = PAM_AUTH_ERR;
-            notify_user_failure(pamh, USER_NOTICE_DENIED);
-            goto cleanup;
-        }
-    }
-
-    /* Step 8: Verify identity claim against requesting PAM user */
-    const char *raw_claim = json_object_get_string(j_claim);
-    int valid = verify_claim(pam_user, raw_claim, &cfg, pamh);
-    if (!valid) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Authentication failed for user '%s': claim verification failed", pam_user);
-        retval = PAM_AUTH_ERR;
-        notify_user_failure(pamh, USER_NOTICE_DENIED);
-        goto cleanup;
-    }
-
-    /* Step 9: Enforce Group / Role Authorization (allow/deny group lists) */
-    if (!verify_group_membership(uinfo_json, &cfg, pamh)) {
-        pam_oauth_log(pamh, active_loglevel, LOGLEVEL_ERROR, LOG_ERR,
-                      "Group authorization denied for user '%s': group/role allow/deny lists not satisfied", pam_user);
-        retval = PAM_PERM_DENIED;
-        notify_user_failure(pamh, USER_NOTICE_DENIED);
-        goto cleanup;
-    }
-    pam_oauth_log(pamh, active_loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "Group authorization succeeded for user '%s'",
-                  pam_user);
 
     pam_oauth_log(pamh, active_loglevel, LOGLEVEL_INFO, LOG_INFO, "Authentication successful for user '%s'", pam_user);
     retval = PAM_SUCCESS;
@@ -1539,11 +1102,6 @@ cleanup:
     secure_memzero(&dev, sizeof(dev));
     secure_memzero(code_verifier, sizeof(code_verifier));
     secure_memzero(code_challenge, sizeof(code_challenge));
-    /* prompt_buf embeds the user code and verification URIs; jwt_sub holds the
-     * JWT subject identifier. Both are sensitive display/identity material and
-     * are scrubbed unconditionally, like every other secret above. */
-    secure_memzero(prompt_buf, sizeof(prompt_buf));
-    secure_memzero(jwt_sub, sizeof(jwt_sub));
     secure_memzero(&cfg, sizeof(cfg));
 
     if (curl) {

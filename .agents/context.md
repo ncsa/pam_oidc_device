@@ -35,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.3, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.4, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).
@@ -517,7 +517,7 @@ AI-assisted work on this repo — **not** a user-facing changelog (that is `CHAN
   strictly supplemental), fully keyboard-driven (**Enter** to begin,
   **Ctrl-C** → `PAM_ABORT`), with no user-uncancellable time limits, and failed
   attempts must deliver a user-visible, plain-text, actionable notice through
-  the PAM conversation (`notify_user_failure()` in `src/pam_module.c` —
+  the PAM conversation (`notify_user_failure()` in `src/message.c` —
   best-effort, deliberately generic wording; detailed causes stay in the audit
   log only). Never leave a new failure path log-only.
 - **Guide navigation & link labels (WCAG 2.4.4 / 2.4.5):** every long guide
