@@ -42,7 +42,7 @@
  * @param[in]  input   Base64URL encoded input string.
  * @param[out] out_len Pointer receiving decoded byte count.
  * @return Heap-allocated decoded null-terminated string, or NULL on decoding error
- *         (invalid input alphabet, embedded padding, or BIO failure).
+ *         (invalid input alphabet, embedded padding, excess padding, or BIO failure).
  */
 static char *base64url_decode(const char *input, size_t *out_len) {
     if (!input) {
@@ -71,6 +71,19 @@ static char *base64url_decode(const char *input, size_t *out_len) {
     }
 
     size_t padded_len = (in_len + 3) / 4 * 4;
+
+    /* Base64 encodes six bits per character, so a legal stream's total padding
+     * (the existing trailing '=' plus whatever the 4-character group alignment
+     * would append) never exceeds two '=' characters (RFC 4648 §3.5). A longer
+     * pad — e.g. an unpadded length that is 1 (mod 4), which would need three —
+     * is not valid Base64: OpenSSL's lenient BIO_f_base64 would nevertheless
+     * "decode" it into short binary garbage, so reject up front instead of
+     * relying on the JSON parse layer to catch it. */
+    size_t total_pad = (in_len - pad_start) + (padded_len - in_len);
+    if (total_pad > 2) {
+        return NULL;
+    }
+
     char *buf = calloc(1, padded_len + 1);
     if (!buf) {
         return NULL;

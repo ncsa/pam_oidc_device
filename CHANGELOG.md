@@ -5,6 +5,245 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-11-18
+
+### Fixed
+- **`pam_oauth_log()` no longer drops log lines silently**: when the line cannot be
+  rendered (`vsnprintf` failure) or the escape buffer cannot be allocated, a static
+  "log line dropped (...)" marker is emitted to syslog instead, and the unrendered
+  (potentially untrusted) bytes are scrubbed before return — the audit trail records
+  that a log line was attempted.
+- **E2E suite workdir no longer retains credential-bearing config copies**: the
+  `tests/e2e/run_e2e.sh` EXIT trap now removes the `conf.uidrange.{orig,tmp}` config
+  copies it leaves in the 0700 workdir alongside the existing `conf.uid0.{orig,tmp}`
+  entries — they may mirror a live config holding client credentials.
+- **Invalid Base64URL padding is now rejected at decode time (`src/jwt.c`)**:
+  `base64url_decode()` previously deferred to OpenSSL's lenient `BIO_f_base64`,
+  which would "decode" segments whose total padding exceeds two `=` characters
+  (e.g. an unpadded segment whose length is 1 mod 4, which would need three)
+  into short binary garbage. The decoder now computes the total pad (existing
+  trailing `=` plus the 4-character alignment pad) and rejects anything above
+  the RFC 4648 §3.5 maximum of two, failing closed before the JSON parse layer
+  is involved.
+- **Bearer Authorization header stack buffer is scrubbed on the overflow error
+  path (`src/http.c`):** when the Authorization header exceeds the buffer
+  capacity, `snprintf` has already copied a (truncated) prefix of the token into
+  the stack temporary; that buffer is now `secure_memzero`'d before the error
+  return so no partial token survives in process memory. The successfully
+  appended (untruncated) `curl_slist` copy was already scrubbed via
+  `scrub_and_free_slist()` on every path.
+
+### Removed
+
+- **Target-host display in the sign-in prompt (v0.3.3 device-code phishing mitigation,
+  independent-review finding F1):** the prompt is delivered to the party that *ran ssh*
+  — the attacker in the phishing attack — while the victim only sees the IdP's approval
+  page, so host display there cannot reach the approver and was removed in full:
+  the `[prompt] show_host` key (configs that still contain it now fail to load,
+  fail-closed, as an unknown key), the `{host}` `init_message` template token
+  (templates that reference it now render the literal `{host}` text — drop it),
+  the host clause in the built-in default prompt, and the `host` parameter of
+  `render_prompt_message()` (the rendered-prompt terminal-safety check is unchanged).
+  **Upgrade:** remove `show_host` from `/etc/pam_oidc_device.conf` and drop the
+  `to sign in to {host}` clause from any custom `init_message`.
+  **Replacement mitigations** (the only surfaces the victim actually reads are the IdP's
+  approval page and the victim's own device): register one descriptive OAuth client per
+  host or cluster (e.g. "ssh:db-prod-3") so the approval page names the requesting
+  machine, and limit device-flow sign-ins by source network. See `docs/threat-model.md` §8.
+
+### Added
+
+- **Outbound HTTPS proxy configuration (`[oauth] proxy`, `src/config.c`, `src/http.c`):**
+  provider traffic (device authorization, token polling, UserInfo, and the PKCE
+  auto-detection discovery probe) can now be routed through an admin-configured
+  proxy via the new `proxy` key. The value must be an `https://` URL validated with
+  the same strict rules as the provider endpoints: plain-HTTP proxies are rejected
+  (they would carry device codes and tokens in cleartext through a third party),
+  authority userinfo is rejected (proxies requiring authentication are not
+  supported), and a duplicated key is rejected. The default (absent or empty value)
+  routes directly, and the `*_proxy` environment variables remain deliberately
+  ignored: when no proxy is configured, `CURLOPT_PROXY` is explicitly set to the
+  empty string so libcurl never falls back to the user-controlled environment of a
+  setuid PAM caller. Strict TLS validation (certificate + hostname) applies to the
+  proxy connection as well.
+- **Four new unit tests (`tests/test_suite.c`)**:
+  `test_jwt_base64url_excess_padding_rejected` (pins the padding rejection
+  end-to-end through `verify_token_metadata()`),
+  `test_http_request_proxy_routing` (pins `CURLOPT_PROXY` behavior: empty-string
+  proxy clearing so libcurl never honors caller-controlled `*_proxy`
+  environment variables, and verbatim routing of a configured proxy),
+  `test_http_request_response_size_cap` (pins the 256 KiB
+  `MAX_HTTP_RESPONSE_SIZE` cap in `write_callback()`: exactly-at-cap accepted,
+  one byte over rejected), and
+  `test_pam_oauth_log_line_dropped_marker` (exercises `pam_oauth_log()`'s
+  vsnprintf-failure "log line dropped" marker branch and the 8192-byte line
+  truncation path; the escape-buffer malloc-failure branch requires a failing
+  malloc and remains untested by design).
+- **Seven new unit tests for the device-flow scheduling helpers and the log
+  escaper (`tests/test_suite.c`; the suite grows 66 → 73):**
+  `test_poll_loop_schedule_rules` pins the pure poll-scheduling decision
+  (immediate first poll, subsequent polls at now + interval, and expiry once
+  the next poll would land at/after the device deadline),
+  `test_poll_request_budget_rules` pins the per-request cURL timeout budget
+  (whole-second truncation, the 10 s per-request cap, and no request — never
+  a zero cURL timeout — once the whole-second remainder runs out),
+  `test_request_device_authorization_parses_provider_response` pins the
+  RFC 8628 §3.2 response parsing with both clamps observable (a 999 s poll
+  interval clamped to `MAX_SUPPORTED_POLL_INTERVAL`, a 99999 s `expires_in`
+  clamped to `max_poll_seconds`) and the monotonic deadline computed from the
+  clamped window, `test_poll_loop_immediate_token_success`,
+  `test_poll_loop_pending_then_deadline_expiry`, and
+  `test_poll_loop_maps_provider_error_phases` drive the complete poll loop
+  through the fake cURL transport (a token already approved on the first
+  poll, `authorization_pending` until the monotonic deadline expires, and
+  the expired/denied/unavailable mapping onto the user-visible notices), and
+  `test_pam_oauth_log_escapes_untrusted_bytes` pins the escaper itself
+  (printable ASCII passes through byte-for-byte with the syslog priority
+  intact, while control and high-bit bytes in an untrusted value render as C
+  escapes so no raw LF/CR/TAB or C0/C1 byte can forge or garble the syslog
+  record).
+
+### Changed
+
+- **Fail-closed uid-0 and system-UID guards on lookup error (`src/identity.c`):**
+  `verify_user_access()` now distinguishes three local-account lookup outcomes —
+  found, not found, and lookup error (three-state `getpwnam_r()` handling) — instead
+  of conflating an error with "no such account". Previously, when the lookup itself
+  failed (e.g. `ERANGE`, an NSS/DB outage), the uid-0 gate and the
+  `deny_system_uids` range gate were silently skipped, so a broken account database
+  could have let an unknown uid (potentially uid 0) through. Not-found semantics are
+  unchanged: a name with no local account entry cannot hold a local uid, so the
+  guards skip and the `allow_users`/`deny_users` lists still decide. A lookup error
+  is now refused fail-closed by each active gate, with a log message that names the
+  errno and the config key (`allow_root` / `deny_system_uids`) that would disable the
+  gate.
+- **User-friendlier sign-in prompt, rebased default wording and layout
+  (`src/pam_module.c`):** the built-in default prompt now begins with a leading
+  blank line separating it from the terminal banner that shares its first line
+  (omitted when `[qr] enabled = true`, where the QR block's quiet zone already
+  provides the separation), then the direct link when the provider supplies a
+  `verification_uri_complete`, with the plain URL and user code as a one-line
+  `Manual entry:` fallback, and a single blank line before the status line:
+
+  ```
+  Sign in via browser:
+    https://auth.example.edu/oauth2/device/code?user_code=TNQ-7CQ-7QC
+
+  Manual entry: https://auth.example.edu/oauth2/device/code  |  Code: TNQ-7CQ-7QC
+  Waiting for approval (expires in 2m; auto-completes on sign-in).
+  ```
+
+  When no direct link is available the URL + code are shown as a compact labeled
+  block instead of the manual-entry line. The trailing status line is now
+  "Waiting for approval …; auto-completes on sign-in." (previously "Waiting for your
+  approval …; this session completes automatically once you sign in."), and the
+  approval window renders in compact units (`45s`, `15m`, `1h 5m`) instead of spelled
+  out ("45 seconds", "15 minutes", "1 hour 5 minutes") — the compact format also
+  applies to the `{expiry}` template token. `show_expiry` semantics are unchanged
+  (default `true`; off or unknown window drops only the expiry parenthetical). The
+  shipped `config/pam_oidc_device.conf` and all `examples/*.conf` now leave
+  `init_message` unset so every default installation shows the new layout; existing
+  installations keep their custom `init_message` untouched (existing deployments
+  adopt the new wording by removing the key or updating the template — the
+  placeholder set is unchanged: `{url}`, `{url_complete}`, `{code}`, `{expiry}`).
+- **`EXTRA_CFLAGS` is now a conditional assignment (`?=`) in the `Makefile`**,
+  so a developer-supplied `EXTRA_CFLAGS` (environment or command line) is
+  honored instead of being silently clobbered. CI behavior is unchanged: its
+  command-line `EXTRA_CFLAGS=-Werror` still takes precedence over the
+  Makefile default.
+- **Table-driven configuration parser (`src/config.c`):** the hand-rolled
+  per-key `if/else` chain in `parse_config_kv()` was replaced by a declarative
+  key-specification table (`config_key_spec_t`: key, section, value kind,
+  duplicate-tracking bit, destination offset/size, range bounds, and the
+  accepted-but-unused note) walked by a single dispatcher, so every key now
+  receives identical unknown-key, wrong-section, duplicate-key, and
+  type/range validation from one code path instead of per-key bespoke checks.
+  No behavior change: the accepted keys, validation outcomes, and log
+  messages are unchanged (and the table's column order is padding-optimal).
+- **Device-flow helpers extracted into an internal header (`src/device_flow.h`,
+  `src/pam_module.c`):** the per-attempt device-flow types (`device_auth_t`,
+  `token_phase_t`, `poll_sched_action_t`) and the prototypes of the RFC 8628
+  request/poll helpers (`request_device_authorization()`,
+  `poll_for_access_token()`, `poll_loop_schedule()`, `poll_request_budget()`,
+  `poll_interval_after_slow_down()`, `poll_interval_after_transient()`) moved
+  out of `src/pam_module.c` into a new internal header — the public
+  `include/pam_oidc_device.h` is unchanged, and the test suite drives the
+  helpers through this header instead of carrying its own test-only
+  prototypes. The poll loop was simplified around them:
+  `poll_loop_schedule()` is now called unconditionally every iteration (the
+  first-poll decision moved inside the helper) with a single monotonic clock
+  read at the top of each pass. No behavior change.
+- **Sign-in prompt and user-notice delivery extracted into `src/message.c` (review
+  finding M-2, modularity):** the templated prompt renderer (`render_prompt_message`),
+  the QR/Enter-begin presentation orchestrator (`present_signin_prompt`), the
+  plain-text `USER_NOTICE_*` failure strings, and `notify_user_failure()` were moved
+  out of `src/pam_module.c` into a focused translation unit (declarations kept in the
+  internal `src/device_flow.h`), and the JWT-sub vs UserInfo-sub consistency check
+  (`verify_userinfo_identity`) was added to `src/identity.c`. Pure code reorganization
+  with no behavior change — the existing unit suite (prompt-safety, expiry-formatting,
+  identity, poll-loop) is unchanged and passes under gcc, clang, and the sanitizers.
+
+### Documentation
+
+- **Corrected the "PAM exposes no peer-address API" claim**: sshd sets `PAM_RHOST`,
+  which a PAM module can read via `pam_get_item(PAM_RHOST)` (on console logins it
+  carries the local host name — identifying context, not a trusted input).
+  `docs/threat-model.md` §8–§9, the prompt code comment, and the v0.3.3 changelog
+  all relied on the opposite claim; the in-module scope boundary for per-source
+  rate limiting is now stated correctly (per-connection PAM invocations share no
+  state, so per-source limiting belongs in the SSH layer regardless of PAM_RHOST).
+  The device-code phishing guidance now recommends descriptive per-host (or
+  per-cluster) OAuth client registration and source-network limits, replacing the
+  removed in-prompt host identification.
+- **`docs/threat-model.md`** now carries a prominent warning that the JWT-sub
+  vs UserInfo-sub token-substitution consistency check runs only when
+  `verify_jwt_claims = true`, which is off by default, and recommends enabling
+  it (with `issuer`/`audience` configured) wherever token substitution is a
+  realistic threat.
+- `src/http.c`: documented why the `strlen()` → `int` cast in
+  `url_encode_param()` is safe (all inputs are config/response-bounded) and why
+  the `LIBCURL_VERSION_NUM >= 7.32` guard around the TLS-1.2 floor is a
+  no-op in practice (all supported distros ship libcurl ≥ 7.61).
+
+### Housekeeping
+
+- Removed the stale `REVIEW.md export-ignore` line from `.gitattributes`
+  (the file no longer exists).
+
+### Upgrade notes (from < 0.3.4)
+
+Four behavior changes, two shipped in 0.3.3 and two in this release,
+can each on its own break an existing deployment after an upgrade. Audit the on-disk
+`/etc/pam_oidc_device.conf` before rolling the new module out:
+
+- **`[prompt] show_host` and the `{host}` template token are removed (this
+  release).** Configs containing `show_host` fail to load (unknown key) until the
+  key is removed, and a custom `init_message` that references `{host}` renders the
+  literal `{host}` text. The in-prompt host display reached the ssh initiator, not
+  the approving user, so it was removed; replace it with a descriptive per-host
+  OAuth client name and source-network limits — see `docs/threat-model.md` §8.
+- **`[claim] claim_regex` is now required (0.3.3).** Config loading fails
+  closed when the key is missing or empty, so every login through the module
+  fails until it is set. Add an explicit `claim_regex`: an anchored username
+  character set for a bare `preferred_username` (e.g.
+  `claim_regex = ^([a-zA-Z0-9._-]+)$`), or a domain-pinned e-mail pattern
+  (e.g. `claim_regex = ^([^@]+)@your[.]domain$`). The historical implicit
+  default `^(.*)$` still works when set explicitly, but a loose pattern is
+  no longer the out-of-the-box behavior.
+- **Local UIDs 0–999 are denied by default (0.3.3).** `deny_system_uids`
+  defaults to `true` over the range `0-999`, and the guard applies even to
+  accounts listed in `allow_users`. A long-lived service or application
+  account whose uid falls in the range must either move the range above it
+  (`system_uid_min` / `system_uid_max`) or set `deny_system_uids = false`;
+  uid-0 authentication additionally requires `allow_root = true`.
+- **The `*_proxy` environment variables are no longer honored (0.3.3); the
+  new `[oauth] proxy` key (this release) is the supported replacement.** A
+  host that reaches the provider only through an outbound proxy must set
+  `proxy = https://...` in the config (HTTPS-only; embedded proxy
+  credentials are not supported). With the key absent or empty the module
+  connects directly, and the calling user's `*_proxy` environment is
+  deliberately never consulted.
+
 ## [0.3.3] - 2026-11-17
 
 ### Added

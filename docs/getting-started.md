@@ -117,23 +117,31 @@ max_poll_seconds = 120
 
 [prompt]
 # Optional custom prompt template (printable ASCII; use \n for newlines).
-# Placeholders: {host} (target host's hostname — the approving user's cross-check
-# against device-code phishing; expands to an empty string when show_host = false),
-# {url} (verification URL),
+# Leave init_message unset to use the built-in default, which renders (the
+# leading blank line separates the prompt from the terminal banner that shares
+# its first line; it is omitted when [qr] enabled = true, where the QR block's
+# quiet zone provides the separation):
+#
+#   Sign in via browser:
+#     https://auth.example.com/oauth2/device/code?user_code=XXXX-XXXX
+#
+#   Manual entry: https://auth.example.com/oauth2/device/code  |  Code: XXXX-XXXX
+#   Waiting for approval (expires in 2m; auto-completes on sign-in).
+# (the compact URL + code block is shown when the IdP does not provide a
+# direct-link URL). Placeholders: {url} (verification URL),
 # {url_complete} (direct-link URL with the code embedded, if the IdP provides
 # one), {code} (user code),
-# {expiry} (how long the user has to complete the approval, in human units such as
-# "15 minutes"; the provider's expires_in clamped by max_poll_seconds; expands to
-# an empty string when the provider does not advertise expires_in).
+# {expiry} (how long the user has to complete the approval, in compact units
+# such as "15m"; the provider's expires_in clamped by max_poll_seconds; expands
+# to an empty string when the provider does not advertise expires_in).
+# The prompt deliberately names no host: in a device-code phishing attack the
+# prompt reaches the user who ran ssh (the attacker), while the approving user
+# only sees the IdP's approval page — machine context belongs in the registered
+# OAuth client name shown on that approval page (docs/threat-model.md §8).
 # init_message = Sign in at {url} with code {code}
-# Show the target host's hostname in the prompt (default: true). With the built-in
-# default template the host is named in the trailing status line ("Waiting for
-# your approval to sign in to <host>; ..."); in custom templates the {host} token expands to
-# the hostname. Set to false to hide the host entirely.
-# show_host = true
 # Show the device-code approval window in the prompt (default: true). With the built-in
 # default template it is named in the trailing status line ("Waiting for
-# your approval to sign in to <host> (expires in 15 minutes); ..."); in custom
+# approval (expires in 15m; auto-completes on sign-in)."); in custom
 # templates use the {expiry} token, which works regardless of this key. Set to false to
 # hide the approval window.
 # show_expiry = false
@@ -153,7 +161,7 @@ Sections and where their full option references live:
 
 | Section | Purpose | Full reference |
 | --- | --- | --- |
-| `[oauth]` | Endpoints, client credentials, scopes, PKCE (`use_pkce`), local JWT claim inspection (`verify_jwt_claims`, `issuer`, `audience`) | [the local JWT claim inspection reference](jwt-validation.md) |
+| `[oauth]` | Endpoints, client credentials, scopes, PKCE (`use_pkce`), outbound HTTPS proxy (`proxy`), local JWT claim inspection (`verify_jwt_claims`, `issuer`, `audience`) | [the local JWT claim inspection reference](jwt-validation.md) |
 | `[claim]` | Which provider claim maps to the local POSIX username | [the access-control guide's claim-mapping section](access-control.md) |
 | `[access]` | Local user allow/deny + provider group/role allow/deny | [the access-control guide's user and group lists](access-control.md) |
 | `[runtime]` | `loglevel`, `max_poll_seconds` | [Logging & Auditing](#7-logging--auditing) |
@@ -234,8 +242,10 @@ that opens connections in rapid succession — an SSH scanner, a credential
 brute-forcer, or a misbehaving client retry loop — can exhaust the
 provider-side rate limit for your OAuth client and lock *legitimate* users
 out of their sign-ins. The module's allow/deny lists are enforced before any
-provider contact, and the PAM API exposes no peer-address API, so the module
-cannot throttle *per source*; enforce that in the SSH layer:
+provider contact, and the connecting source *is* identifiable inside the module —
+sshd sets `PAM_RHOST`, which a PAM module can read with `pam_get_item(PAM_RHOST)` —
+but per-source throttling would still need state shared by the concurrent `sshd`
+workers, so enforce it in the SSH layer:
 
 ```sshd_config
 # OpenSSH >= 9.7: progressively penalize repeated pre-auth connections

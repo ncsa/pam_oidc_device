@@ -15,6 +15,7 @@ The project's security architecture and threat analysis are documented in:
 
 * [Threat Model & Security Architecture](docs/threat-model.md) — trust boundaries, the threat matrix, and mitigation deep dives (terminal injection defense, process memory scrubbing, configuration hardening, PKCE device-flow binding, and more).
 * [Local JWT Claim Inspection](docs/jwt-validation.md) — pre-flight claims-only inspection (`verify_jwt_claims`), issuer pinning, and audience checks.
+* **JWT trust model** — the JWT signature is intentionally **NOT** verified. Token trust rests **entirely** on enforced TLS + the provider's UserInfo endpoint, and there is **no JWKS / `jwks_url` signature path** (`jwks_url`/`introspection_endpoint` are accepted-but-unused). Consuming ID-token claims directly (offline, without a fresh UserInfo call) would be **High severity** and require adding signature verification. See the [threat-model §5](docs/threat-model.md#5-local-jwt-claims-inspection-vs-downstream-signature-enforcement) operator callout.
 * [Account & Group Access Control](docs/access-control.md) — restricting access via `allow_users`, `deny_users`, and provider group/role claims (`allow_groups`/`deny_groups`).
 
 ---

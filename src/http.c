@@ -1,11 +1,12 @@
 /**
  * @file http.c
- * @brief cURL HTTP network client wrappers, level-filtered syslog reporting, and thread-safe global initialization
- * logic.
+ * @brief cURL HTTP network client wrappers, level-filtered syslog reporting, and
+ * thread-safe global initialization logic.
  *
  * Provides HTTP client execution for OAuth device authorization, token polling,
- * and OpenID UserInfo queries. Enforces TLS/HTTPS transport security, dynamic response memory management,
- * integer overflow protection, HTTP transport tracing, and thread-safe cURL global state initialization.
+ * and OpenID UserInfo queries. Enforces TLS/HTTPS transport security, dynamic response
+ * memory management, integer overflow protection, HTTP transport tracing, and
+ * thread-safe cURL global state initialization.
  *
  * @project     pam_oidc_device
  * @repository  https://github.com/ncsa/pam_oidc_device
@@ -38,6 +39,11 @@
  * strings); without escaping, control characters in those values could forge or garble
  * syslog records.
  *
+ * No log line is ever dropped silently: if the line cannot be rendered (vsnprintf
+ * failure) or its escape buffer cannot be allocated, a static marker naming the
+ * failure is emitted instead, and the unrendered (potentially untrusted) bytes are
+ * scrubbed before return.
+ *
  * @param[in] pamh      PAM framework handle context.
  * @param[in] cfg_level Configured runtime log level threshold.
  * @param[in] msg_level Minimum verbosity level required to emit this message.
@@ -59,12 +65,22 @@ void pam_oauth_log(pam_handle_t *pamh, loglevel_t cfg_level, loglevel_t msg_leve
 #pragma GCC diagnostic pop
     va_end(args);
     if (n < 0) {
+        /* vsnprintf failed: the rendered content is unreliable, but the audit trail
+         * must still record that a log line was attempted (never drop it silently).
+         * The unrendered bytes are scrubbed instead of being forwarded. */
+        secure_memzero(line, sizeof(line));
+        pam_syslog(pamh, priority, "%s", "pam_oidc_device: log line dropped (message rendering error)");
         return;
     }
     size_t len = (n >= (int)sizeof(line)) ? sizeof(line) - 1U : (size_t)n;
     /* Worst case: every byte becomes a 4-character "\xHH" escape. */
     char *escaped = malloc((len * 4U) + 1U);
     if (!escaped) {
+        /* Allocation failure: emit a static marker so operators can see that log
+         * output was attempted but could not be escaped; withhold the original
+         * (untrusted) content and scrub it. */
+        secure_memzero(line, sizeof(line));
+        pam_syslog(pamh, priority, "%s", "pam_oidc_device: log line dropped (escape-buffer allocation failure)");
         return;
     }
     size_t pos = 0U;
@@ -165,6 +181,9 @@ char *url_encode_param(CURL *curl, const char *str) {
     if (!curl || !str) {
         return NULL;
     }
+    /* The (int) cast is safe: every caller passes a config/JSON-bounded value
+     * (provider response payloads are capped at MAX_HTTP_RESPONSE_SIZE), far
+     * below INT_MAX, so no length can wrap the int length parameter. */
     return curl_easy_escape(curl, str, (int)strlen(str));
 }
 
@@ -251,15 +270,17 @@ int discovery_json_advertises_s256(const struct json_object *doc) {
  * Any transport, HTTP (non-200), or JSON parse failure returns -1 with *supported == 0;
  * callers MUST treat that as "no PKCE" (fail-safe) so a discovery outage never blocks
  * logins. The response body is scrubbed and freed via `free_http_response()`.
+ *
+ * @param[in]  proxy  Optional outbound HTTPS proxy URL; empty/NULL routes directly.
  */
-int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, pam_handle_t *pamh) {
+int discovery_probe_pkce(const char *url, const char *proxy, int *supported, loglevel_t loglevel, pam_handle_t *pamh) {
     if (!url || !supported) {
         return -1;
     }
     *supported = 0;
 
     http_response_t resp = {0};
-    if (http_request("GET", url, NULL, NULL, 5000L, &resp, loglevel, pamh) != 0 || resp.status_code != 200 ||
+    if (http_request("GET", url, NULL, NULL, proxy, 5000L, &resp, loglevel, pamh) != 0 || resp.status_code != 200 ||
         !resp.body) {
         pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_WARNING,
                       "PKCE auto-detection: discovery probe of %s failed (HTTP status %ld); continuing without "
@@ -350,6 +371,9 @@ static void scrub_and_free_slist(struct curl_slist *headers) {
  * @param[in]  url          Target URL endpoint.
  * @param[in]  postfields   URL-encoded request body (for POST requests).
  * @param[in]  bearer_token Access token for Authorization header (optional).
+ * @param[in]  proxy        Optional outbound HTTPS proxy URL (validated at config load);
+ *                          empty/NULL routes traffic directly. In either case the
+ *                          `*_proxy` environment variables are never honored.
  * @param[in]  timeout_ms   Request timeout limit in milliseconds.
  * @param[out] resp         Pointer to response object receiving result; zero-initialized by this
  *                          function before any return (success or error), so callers may always
@@ -358,8 +382,8 @@ static void scrub_and_free_slist(struct curl_slist *headers) {
  * @param[in]  pamh         PAM handle context for syslog reporting.
  * @return 0 on transport execution success, -1 on error.
  */
-int http_request(const char *method, const char *url, const char *postfields, const char *bearer_token, long timeout_ms,
-                 http_response_t *resp, loglevel_t loglevel, pam_handle_t *pamh) {
+int http_request(const char *method, const char *url, const char *postfields, const char *bearer_token,
+                 const char *proxy, long timeout_ms, http_response_t *resp, loglevel_t loglevel, pam_handle_t *pamh) {
     if (!url || !resp || !method) {
         return -1;
     }
@@ -431,6 +455,13 @@ int http_request(const char *method, const char *url, const char *postfields, co
             if (pamh) {
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_ERROR, LOG_ERR, "Bearer token header exceeds buffer capacity");
             }
+            /* Even on the overflow error path, snprintf has already copied a
+             * (truncated) prefix of the Bearer token into `auth_hdr`; scrub the
+             * stack buffer before returning so that no partial token survives in
+             * process memory. The curl slist copy (which only ever holds the
+             * successfully-appended, untruncated header) is scrubbed below via
+             * scrub_and_free_slist(). */
+            secure_memzero(auth_hdr, sizeof(auth_hdr));
             scrub_and_free_slist(headers);
             curl_easy_cleanup(curl);
             return -1;
@@ -475,12 +506,23 @@ int http_request(const char *method, const char *url, const char *postfields, co
     CHECK_SETOPT(CURLOPT_USERAGENT, MODULE_USER_AGENT);
     CHECK_SETOPT(CURLOPT_NOSIGNAL, 1L);
     CHECK_SETOPT(CURLOPT_FOLLOWLOCATION, 0L);
-    /* Explicitly clear the proxy (an empty string overrides libcurl's fallback to the
-     * *_proxy environment variables). A PAM module runs in the calling user's
-     * environment under setuid, so those variables are user-controlled: honoring them
-     * would let the caller steer this module's HTTPS traffic. No proxy support is
-     * provided by design. */
-    CHECK_SETOPT(CURLOPT_PROXY, "");
+    /*
+     * Proxy handling: when the admin has explicitly configured an [oauth] proxy
+     * (an https:// URL, validated at config load), route provider traffic through
+     * it; the strict TLS validation options below apply to the proxy connection
+     * as well. Otherwise the proxy is explicitly cleared: an empty string
+     * overrides libcurl's fallback to the *_proxy environment variables, and a
+     * PAM module runs in the calling user's environment under setuid, so those
+     * variables are user-controlled: honoring them would let the caller steer
+     * this module's HTTPS traffic. The proxy URL (which a third-party proxy can
+     * observe) is deliberately kept out of the request trace above.
+     */
+    const char *const proxy_url = (proxy != NULL && proxy[0] != '\0') ? proxy : "";
+    CHECK_SETOPT(CURLOPT_PROXY, proxy_url);
+    if (proxy_url[0] != '\0') {
+        pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
+                      "HTTPS traffic will be routed via the configured [oauth] proxy");
+    }
 
 #if LIBCURL_VERSION_NUM >= 0x075500
     CHECK_SETOPT(CURLOPT_PROTOCOLS_STR, "https");
@@ -495,6 +537,9 @@ int http_request(const char *method, const char *url, const char *postfields, co
     CHECK_SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
     CHECK_SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
 #if LIBCURL_VERSION_NUM >= 0x072000
+    /* The guard is a no-op in practice: every supported distro ships libcurl
+     * >= 7.61, which supports CURLOPT_SSLVERSION. It is retained for
+     * portability of the source to older libcurl releases. */
     CHECK_SETOPT(CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 #endif
 

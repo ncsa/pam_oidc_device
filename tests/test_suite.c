@@ -40,26 +40,30 @@
 #include <cmocka.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
+#include <security/pam_appl.h>
+#include <security/pam_ext.h>
 #include <unistd.h>
+#include <wchar.h>
 /* clang-format on */
 
 /*
- * Test-only prototypes: poll_interval_after_slow_down() / poll_interval_after_transient()
- * are exported from src/pam_module.c solely so this suite can pin the poll-loop backoff
- * arithmetic; they are intentionally NOT part of the public API in
- * include/pam_oidc_device.h.
+ * Internal device-flow contract (src/device_flow.h): device_auth_t,
+ * token_phase_t, poll_sched_action_t and the test-exported device-authorization
+ * / poll-loop helpers from src/pam_module.c. The header is internal (NOT part
+ * of the public API in include/pam_oidc_device.h) and exists so this suite and
+ * src/pam_module.c share one declaration of these symbols.
  */
-int poll_interval_after_slow_down(int interval);
-int poll_interval_after_transient(int interval);
+#include "../src/device_flow.h"
 
 /*
  * Weak overrides of libcurl's transport entry points, used exclusively by the
  * http_request()/discovery_probe_pkce tests. Defining these global symbols in
  * the test executable redirects the calls made by the module code here
  * instead of into libcurl (no real transfer is ever performed):
- *  - curl_easy_setopt() records the TLS options requested by http_request()
- *    and captures the WRITEFUNCTION/WRITEDATA pair so a fake response body can
- *    be "received" by the module's write callback;
+ *  - curl_easy_setopt() records the TLS options and the proxy URL requested
+ *    by http_request() and captures the WRITEFUNCTION/WRITEDATA pair so a
+ *    fake response body can be "received" by the module's write callback;
  *  - curl_easy_perform() returns `g_fake_curl_perform_rc` and, when a fake
  *    body is configured, invokes the captured write callback with it;
  *  - curl_easy_getinfo() reports `g_fake_curl_status_code` for
@@ -75,12 +79,28 @@ static int tls_opt_seen;
 static long tls_opt_ssl_verifypeer;
 static long tls_opt_ssl_verifyhost;
 static int tls_opt_ssl_version;
+/** Last CURLOPT_PROXY value requested ("" when the proxy is explicitly cleared). */
+static char g_fake_curl_proxy[512];
 
 static CURLcode g_fake_curl_perform_rc = CURLE_OK;
 static long g_fake_curl_status_code = 0;
 static const char *g_fake_curl_body = NULL;
 static test_write_cb g_fake_write_cb;
 static void *g_fake_write_data;
+
+/*
+ * Optional scripted response sequence for multi-round flows (the device-flow
+ * poll loop): when g_fake_steps_count > 0, each curl_easy_perform() call serves
+ * the next (body, status) pair in order; once the script is exhausted the last
+ * entry repeats. g_fake_perform_count counts every perform call so tests can
+ * assert exactly how many HTTP requests a flow issued.
+ */
+#define FAKE_TRANSPORT_MAX_STEPS 8
+static const char *g_fake_steps_bodies[FAKE_TRANSPORT_MAX_STEPS];
+static long g_fake_steps_codes[FAKE_TRANSPORT_MAX_STEPS];
+static int g_fake_steps_count;
+static int g_fake_step_index;
+static int g_fake_perform_count;
 
 /** Resets the fake-transport state so individual tests never leak into each other. */
 static void reset_fake_curl_transport(void) {
@@ -89,6 +109,30 @@ static void reset_fake_curl_transport(void) {
     g_fake_curl_body = NULL;
     g_fake_write_cb = NULL;
     g_fake_write_data = NULL;
+    g_fake_curl_proxy[0] = '\0';
+    for (int i = 0; i < FAKE_TRANSPORT_MAX_STEPS; i++) {
+        g_fake_steps_bodies[i] = NULL;
+        g_fake_steps_codes[i] = 0;
+    }
+    g_fake_steps_count = 0;
+    g_fake_step_index = 0;
+    g_fake_perform_count = 0;
+}
+
+/**
+ * @brief Installs a scripted sequence of fake HTTP responses.
+ *
+ * @param[in] bodies Response bodies served in order (final entry repeats once exhausted).
+ * @param[in] codes  HTTP status codes matching each body.
+ * @param[in] count  Number of scripted steps (clamped to FAKE_TRANSPORT_MAX_STEPS).
+ */
+static void script_fake_responses(const char *const bodies[], const long codes[], int count) {
+    g_fake_steps_count = (count > FAKE_TRANSPORT_MAX_STEPS) ? FAKE_TRANSPORT_MAX_STEPS : count;
+    for (int i = 0; i < g_fake_steps_count; i++) {
+        g_fake_steps_bodies[i] = bodies[i];
+        g_fake_steps_codes[i] = codes[i];
+    }
+    g_fake_step_index = 0;
 }
 
 __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
@@ -104,6 +148,9 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
     } else if (option == CURLOPT_SSLVERSION) {
         tls_opt_ssl_version = va_arg(args, int);
         tls_opt_seen++;
+    } else if (option == CURLOPT_PROXY) {
+        const char *p = va_arg(args, const char *);
+        snprintf(g_fake_curl_proxy, sizeof(g_fake_curl_proxy), "%s", (p != NULL) ? p : "");
     } else if (option == CURLOPT_WRITEFUNCTION) {
         g_fake_write_cb = va_arg(args, test_write_cb);
     } else if (option == CURLOPT_WRITEDATA) {
@@ -115,6 +162,18 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
 
 __attribute__((weak)) CURLcode curl_easy_perform(CURL *curl) {
     (void)curl;
+    g_fake_perform_count++;
+    if (g_fake_steps_count > 0) {
+        /* Scripted sequence: serve the next (body, status) pair; repeat the
+         * last entry once the script is exhausted. */
+        int idx = (g_fake_step_index < g_fake_steps_count) ? g_fake_step_index++ : g_fake_steps_count - 1;
+        g_fake_curl_status_code = g_fake_steps_codes[idx];
+        if (g_fake_curl_perform_rc == CURLE_OK && g_fake_steps_bodies[idx] && g_fake_write_cb) {
+            (void)g_fake_write_cb((void *)g_fake_steps_bodies[idx], strlen(g_fake_steps_bodies[idx]), 1,
+                                  g_fake_write_data);
+        }
+        return g_fake_curl_perform_rc;
+    }
     if (g_fake_curl_perform_rc == CURLE_OK && g_fake_curl_body && g_fake_write_cb) {
         (void)g_fake_write_cb((void *)g_fake_curl_body, strlen(g_fake_curl_body), 1, g_fake_write_data);
     }
@@ -133,6 +192,110 @@ __attribute__((weak)) CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
     }
     va_end(args);
     return CURLE_OK;
+}
+
+/*
+ * Weak overrides of libcurl's linked-list helpers, used ONLY by the
+ * scrub_and_free_slist() test (test_http_request_scrubs_bearer_header_nodes).
+ * When g_slist_scrub_check is on, curl_slist_append() records the data pointer
+ * and length of each freshly-created node, and curl_slist_free_all() asserts —
+ * immediately before freeing — that every one of those nodes had its header
+ * bytes securely zeroed. This lets the suite observe the scrub discipline that
+ * happens inside http_request()'s private scrub_and_free_slist() without any
+ * production-code changes. When g_slist_scrub_check is off (the default for
+ * every other test), both overrides behave exactly like libcurl's real
+ * implementations (link at the tail / free every node), so the transport
+ * plumbing they feed stays indistinguishable from the real thing.
+ */
+#define SLIST_SCRUB_CAPTURE_MAX 16
+static struct curl_slist *g_slist_scrub_nodes[SLIST_SCRUB_CAPTURE_MAX];
+static size_t g_slist_scrub_lens[SLIST_SCRUB_CAPTURE_MAX];
+static int g_slist_scrub_on;
+static int g_slist_scrub_count;
+
+__attribute__((weak)) struct curl_slist *curl_slist_append(struct curl_slist *list, const char *data) {
+    size_t len = strlen(data);
+    struct curl_slist *node = calloc(1, sizeof(*node));
+    if (!node) {
+        return NULL;
+    }
+    node->data = malloc(len + 1);
+    if (!node->data) {
+        free(node);
+        return NULL;
+    }
+    memcpy(node->data, data, len + 1);
+
+    if (g_slist_scrub_on && g_slist_scrub_count < SLIST_SCRUB_CAPTURE_MAX) {
+        g_slist_scrub_nodes[g_slist_scrub_count] = node;
+        g_slist_scrub_lens[g_slist_scrub_count] = len;
+        g_slist_scrub_count++;
+    }
+
+    if (list == NULL) {
+        return node;
+    }
+    struct curl_slist *it = list;
+    while (it->next != NULL) {
+        it = it->next;
+    }
+    it->next = node;
+    return list;
+}
+
+__attribute__((weak)) void curl_slist_free_all(struct curl_slist *head) {
+    if (g_slist_scrub_on) {
+        /* Verify each recorded node's header bytes were securely zeroed before
+         * releasing the list (scrub_and_free_slist() zeroes non-NUL bytes via
+         * secure_memzero(); the string length of an all-zero string is what was
+         * recorded at append time). */
+        int idx = 0;
+        struct curl_slist *it = head;
+        while (it != NULL) {
+            struct curl_slist *const next = it->next;
+            if (idx < g_slist_scrub_count && it == g_slist_scrub_nodes[idx]) {
+                for (size_t i = 0; i < g_slist_scrub_lens[idx]; i++) {
+                    assert_true(((const unsigned char *)it->data)[i] == 0U);
+                }
+                idx++;
+            }
+            free(it->data);
+            free(it);
+            it = next;
+        }
+        assert_int_equal(idx, g_slist_scrub_count);
+        g_slist_scrub_on = 0;
+        g_slist_scrub_count = 0;
+        return;
+    }
+    struct curl_slist *it = head;
+    while (it != NULL) {
+        struct curl_slist *const next = it->next;
+        free(it->data);
+        free(it);
+        it = next;
+    }
+}
+
+/* Weak override of libpam's pam_syslog() (prototype in <security/pam_ext.h>):
+ * captures the exact line pam_oauth_log() (src/http.c) forwards to syslog so
+ * its C-escaping rules can be asserted. pam_oauth_log() always invokes it as
+ * pam_syslog(pamh, priority, "%s", escaped), so the rendered (escaped) line is
+ * the sole vararg. Diagnostic calls libpam itself emits resolve inside
+ * libpam.so and do not reach this override.
+ */
+static char g_captured_syslog_line[8192 * 4 + 1];
+static int g_captured_syslog_calls;
+static int g_captured_syslog_priority;
+
+__attribute__((weak)) void pam_syslog(const pam_handle_t *pamh, int priority, const char *fmt, ...) {
+    (void)pamh;
+    va_list args;
+    va_start(args, fmt);
+    (void)vsnprintf(g_captured_syslog_line, sizeof(g_captured_syslog_line), fmt, args);
+    va_end(args);
+    g_captured_syslog_calls++;
+    g_captured_syslog_priority = priority;
 }
 
 /**
@@ -296,14 +459,18 @@ static void test_terminal_and_user_code_sanitizer(void **state) {
  * @brief Unit test verifying custom user prompt rendering, buffer overflow protection, and the
  *        rendered-prompt terminal-safety check (newline-tolerant `is_safe_terminal_string`)[cite: 7].
  *
- * Tests token substitution (`{host}`, `{url}`, `{code}`, `{url_complete}`, `{expiry}`, `\n`),
+ * Tests token substitution (`{url}`, `{code}`, `{url_complete}`, `{expiry}`, `\n`),
  * buffer capacity limits,
- * default-template rendering (the target host named in the trailing status line when `show_host`
- * is set, as the user's cross-check against device-code phishing; absent when `show_host` is
- * off; the device-code approval window named in the same line when `show_expiry` is set and the
- * window is known; absent when `show_expiry` is off or the window is unknown), and rejection of
+ * default-template rendering (the leading blank line present when the QR code is disabled
+ * and absent when it is enabled; the compact device-code approval window named in the
+ * trailing status line when `show_expiry` is set and the window is known; the parenthetical
+ * absent when `show_expiry` is off or the window is unknown — and no host identification at
+ * all: in a
+ * device-code phishing attack the
+ * prompt reaches the ssh initiator, not the approving user, docs/threat-model.md §8), and
+ * rejection of
  * C0 control characters (ANSI escapes, tabs)
- * introduced via the template, provider URL, user code, or hostname[cite: 7].
+ * introduced via the template, provider URL, or user code[cite: 7].
  *
  * @param[in,out] state CMocka test state context (unused)[cite: 7].
  */
@@ -314,187 +481,126 @@ static void test_prompt_rendering(void **state) {
     strncpy(cfg.init_message, "\\nURL: {url}\\nCode: {code}\\nDirect: {url_complete}\\n", sizeof(cfg.init_message) - 1);
 
     char out[256];
-    int res = render_prompt_message(&cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 0,
-                                    out, sizeof(out));
+    int res =
+        render_prompt_message(&cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 0, out, sizeof(out));
     assert_int_equal(res, 0);
     assert_string_equal(out, "\nURL: https://auth.edu/dev\nCode: BCD-123\nDirect: https://auth.edu/dev?c=1\n");
 
-    /* {host} placeholder substitutes the target hostname when show_host is set (device-code
-     * phishing mitigation) */
-    config_t host_cfg;
-    memset(&host_cfg, 0, sizeof(host_cfg));
-    host_cfg.show_host = 1;
-    strncpy(host_cfg.init_message, "Host {host} at {url} with code {code}\\n", sizeof(host_cfg.init_message) - 1);
-    char host_out[256];
-    assert_int_equal(render_prompt_message(&host_cfg, "db-prod-3", "https://auth.edu/dev", NULL, "BCD-123", 0, host_out,
-                                           sizeof(host_out)),
-                     0);
-    assert_string_equal(host_out, "Host db-prod-3 at https://auth.edu/dev with code BCD-123\n");
-
-    /* With show_host off the {host} token expands to an empty string (host display gate) */
-    config_t host_off_cfg;
-    memset(&host_off_cfg, 0, sizeof(host_off_cfg));
-    strncpy(host_off_cfg.init_message, "Host {host} at {url} with code {code}\\n",
-            sizeof(host_off_cfg.init_message) - 1);
-    char host_off_out[256];
-    assert_int_equal(render_prompt_message(&host_off_cfg, "db-prod-3", "https://auth.edu/dev", NULL, "BCD-123", 0,
-                                           host_off_out, sizeof(host_off_out)),
-                     0);
-    assert_string_equal(host_off_out, "Host  at https://auth.edu/dev with code BCD-123\n");
-
     /* Verify buffer overflow / truncation handling[cite: 7] */
     char small_out[20];
-    int trunc_res = render_prompt_message(&cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
-                                          "BCD-123", 0, small_out, sizeof(small_out));
+    int trunc_res = render_prompt_message(&cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 0,
+                                          small_out, sizeof(small_out));
     assert_int_equal(trunc_res, -1);
 
     /* Default template (empty init_message) must render and pass the terminal-safety check[cite: 7] */
     config_t def_cfg;
     memset(&def_cfg, 0, sizeof(def_cfg));
-    def_cfg.show_host = 1;
     char def_out[512];
-    int def_res = render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
-                                        "BCD-123", 0, def_out, sizeof(def_out));
+    int def_res = render_prompt_message(&def_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 0,
+                                        def_out, sizeof(def_out));
     assert_int_equal(def_res, 0);
-    /* The compact default template carries no leading blank line (the QR block's bottom quiet
-     * zone provides separation when the QR code is shown), no internal blank line, and names
-     * the target host in the trailing status line so the approving user can cross-check which
-     * machine the sign-in belongs to[cite: 7] */
-    assert_string_equal(
-        def_out,
-        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-        "  (Direct: https://auth.edu/dev?c=1)\n"
-        "Waiting for your approval to sign in to testhost; this session completes automatically once you sign in.\n");
+    /* The default template (QR disabled) carries a leading blank line separating the prompt
+     * from the terminal banner that shares its first line, separates the sign-in block from
+     * the status line with a single blank line, and carries no host identification: in a
+     * device-code phishing attack the prompt reaches the ssh initiator (the attacker), not the
+     * approving user, so machine context belongs on the IdP's approval page
+     * (docs/threat-model.md §8)[cite: 7] */
+    assert_string_equal(def_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
+                                 "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
+                                 "Waiting for approval; auto-completes on sign-in.\n");
     char def_plain_out[512];
-    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
-                                           def_plain_out, sizeof(def_plain_out)),
+    assert_int_equal(render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, def_plain_out,
+                                           sizeof(def_plain_out)),
                      0);
-    assert_string_equal(
-        def_plain_out,
-        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-        "Waiting for your approval to sign in to testhost; this session completes automatically once you sign in.\n");
+    assert_string_equal(def_plain_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
+                                       "Waiting for approval; auto-completes on sign-in.\n");
 
-    /* With show_host off the built-in default drops the host clause entirely */
-    config_t def_off_cfg;
-    memset(&def_off_cfg, 0, sizeof(def_off_cfg));
-    char def_off_out[512];
-    assert_int_equal(render_prompt_message(&def_off_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
-                                           "BCD-123", 0, def_off_out, sizeof(def_off_out)),
-                     0);
-    assert_string_equal(def_off_out,
-                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-                        "  (Direct: https://auth.edu/dev?c=1)\n"
-                        "Waiting for your approval; this session completes automatically once you sign in.\n");
-    char def_off_plain_out[512];
-    assert_int_equal(render_prompt_message(&def_off_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
-                                           def_off_plain_out, sizeof(def_off_plain_out)),
-                     0);
-    assert_string_equal(def_off_plain_out,
-                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-                        "Waiting for your approval; this session completes automatically once you sign in.\n");
-
-    /* With show_expiry on the built-in default carries the "(expires in ...)" clause in the
-     * trailing status line; the window is the provider's expires_in clamped by
-     * [runtime] max_poll_seconds, rendered in human units */
+    /* With show_expiry on the built-in default carries the compact "(expires in ...)" clause in
+     * the trailing status line; the window is the provider's expires_in clamped by
+     * [runtime] max_poll_seconds, rendered in compact units */
     config_t def_exp_cfg;
     memset(&def_exp_cfg, 0, sizeof(def_exp_cfg));
-    def_exp_cfg.show_host = 1;
     def_exp_cfg.show_expiry = 1;
     char def_exp_out[512];
-    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
-                                           "BCD-123", 900, def_exp_out, sizeof(def_exp_out)),
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123",
+                                           900, def_exp_out, sizeof(def_exp_out)),
                      0);
-    assert_string_equal(def_exp_out,
-                        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-                        "  (Direct: https://auth.edu/dev?c=1)\n"
-                        "Waiting for your approval to sign in to testhost (expires in 15 minutes); this session "
-                        "completes automatically "
-                        "once you sign in.\n");
-    /* Sub-minute windows render in seconds (plain-URL form, no Direct line) */
+    assert_string_equal(def_exp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
+                                     "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
+                                     "Waiting for approval (expires in 15m; auto-completes on sign-in).\n");
+    /* Sub-minute windows render in seconds (plain-URL form, no manual-entry line) */
     char def_exp_sec_out[512];
-    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 45,
-                                           def_exp_sec_out, sizeof(def_exp_sec_out)),
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 45, def_exp_sec_out,
+                                           sizeof(def_exp_sec_out)),
                      0);
-    assert_string_equal(
-        def_exp_sec_out,
-        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-        "Waiting for your approval to sign in to testhost (expires in 45 seconds); this session completes "
-        "automatically once you sign in.\n");
-    /* show_expiry on but the window unknown (0): the clause is omitted entirely */
+    assert_string_equal(def_exp_sec_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
+                                         "Waiting for approval (expires in 45s; auto-completes on sign-in).\n");
+    /* show_expiry on but the window unknown (0): the expiry parenthetical is omitted entirely */
     char def_exp_unknown_out[512];
-    assert_int_equal(render_prompt_message(&def_exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0,
+    assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0,
                                            def_exp_unknown_out, sizeof(def_exp_unknown_out)),
                      0);
-    assert_string_equal(
-        def_exp_unknown_out,
-        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-        "Waiting for your approval to sign in to testhost; this session completes automatically once you "
-        "sign in.\n");
+    assert_string_equal(def_exp_unknown_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
+                                             "Waiting for approval; auto-completes on sign-in.\n");
     /* show_expiry off with a known window: the approval window never appears in the
      * built-in default */
     char def_noexp_out[512];
-    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", "https://auth.edu/dev?c=1",
-                                           "BCD-123", 900, def_noexp_out, sizeof(def_noexp_out)),
+    assert_int_equal(render_prompt_message(&def_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123", 900,
+                                           def_noexp_out, sizeof(def_noexp_out)),
                      0);
-    assert_string_equal(
-        def_noexp_out,
-        "Complete authentication in your browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n"
-        "  (Direct: https://auth.edu/dev?c=1)\n"
-        "Waiting for your approval to sign in to testhost; this session completes automatically once you "
-        "sign in.\n");
+    assert_string_equal(def_noexp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
+                                       "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
+                                       "Waiting for approval; auto-completes on sign-in.\n");
 
-    /* {expiry} template token expands to the human-readable approval window in any template
+    /* [qr] enabled = true: the leading blank line is omitted — the QR block's bottom vertical
+     * quiet zone already separates the prompt from the rendered art */
+    config_t def_qr_cfg;
+    memset(&def_qr_cfg, 0, sizeof(def_qr_cfg));
+    def_qr_cfg.qr_enabled = 1;
+    char def_qr_out[512];
+    assert_int_equal(render_prompt_message(&def_qr_cfg, "https://auth.edu/dev", "https://auth.edu/dev?c=1", "BCD-123",
+                                           0, def_qr_out, sizeof(def_qr_out)),
+                     0);
+    assert_string_equal(def_qr_out, "Sign in via browser:\n  https://auth.edu/dev?c=1\n\n"
+                                    "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
+                                    "Waiting for approval; auto-completes on sign-in.\n");
+
+    /* {expiry} template token expands to the compact approval window in any template
      * (independent of show_expiry), or to an empty string when the window is unknown */
     config_t exp_cfg;
     memset(&exp_cfg, 0, sizeof(exp_cfg));
     strncpy(exp_cfg.init_message, "Approval window: {expiry}\\n", sizeof(exp_cfg.init_message) - 1);
     char exp_out[256];
-    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 900, exp_out,
-                                           sizeof(exp_out)),
-                     0);
-    assert_string_equal(exp_out, "Approval window: 15 minutes\n");
-    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 3600, exp_out,
-                                           sizeof(exp_out)),
-                     0);
-    assert_string_equal(exp_out, "Approval window: 1 hour\n");
-    assert_int_equal(render_prompt_message(&exp_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, exp_out,
-                                           sizeof(exp_out)),
-                     0);
+    assert_int_equal(
+        render_prompt_message(&exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 900, exp_out, sizeof(exp_out)), 0);
+    assert_string_equal(exp_out, "Approval window: 15m\n");
+    assert_int_equal(
+        render_prompt_message(&exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 3600, exp_out, sizeof(exp_out)), 0);
+    assert_string_equal(exp_out, "Approval window: 1h\n");
+    assert_int_equal(
+        render_prompt_message(&exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, exp_out, sizeof(exp_out)), 0);
     assert_string_equal(exp_out, "Approval window: \n");
 
     /* Rendered-prompt terminal-injection defense: ANSI escape bytes in the template,
-     * the provider URL, the user code, or the hostname must fail rendering[cite: 7] */
+     * the provider URL, or the user code must fail rendering[cite: 7] */
     config_t esc_cfg;
     memset(&esc_cfg, 0, sizeof(esc_cfg));
     strncpy(esc_cfg.init_message, "Code: \x1b[31m{code}\x1b[0m", sizeof(esc_cfg.init_message) - 1);
     char esc_out[512];
-    assert_int_equal(render_prompt_message(&esc_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
-                                           sizeof(esc_out)),
-                     -1);
-    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev\x1b[31m", NULL, "BCD-123", 0,
-                                           esc_out, sizeof(esc_out)),
-                     -1);
-    assert_int_equal(render_prompt_message(&def_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123\x1b[0m", 0,
-                                           esc_out, sizeof(esc_out)),
-                     -1);
-    /* A hostname containing a non-printable byte is rejected fail-closed (the rendered-prompt
-     * check applies to the whole output, host bytes included)[cite: 7] */
-    assert_int_equal(render_prompt_message(&def_cfg, "bad\x01host", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
-                                           sizeof(esc_out)),
-                     -1);
-    /* With show_host off the hostname never reaches the rendered output, so a non-printable
-     * hostname cannot fail the terminal-safety check */
-    assert_int_equal(render_prompt_message(&def_off_cfg, "bad\x01host", "https://auth.edu/dev", NULL, "BCD-123", 0,
-                                           esc_out, sizeof(esc_out)),
-                     0);
-
+    assert_int_equal(
+        render_prompt_message(&esc_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out, sizeof(esc_out)), -1);
+    assert_int_equal(
+        render_prompt_message(&def_cfg, "https://auth.edu/dev\x1b[31m", NULL, "BCD-123", 0, esc_out, sizeof(esc_out)),
+        -1);
+    assert_int_equal(
+        render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123\x1b[0m", 0, esc_out, sizeof(esc_out)),
+        -1);
     /* Tab (C0) characters in a custom template are also rejected[cite: 7] */
     config_t tab_cfg;
     memset(&tab_cfg, 0, sizeof(tab_cfg));
     strncpy(tab_cfg.init_message, "Code:\t{code}", sizeof(tab_cfg.init_message) - 1);
-    assert_int_equal(render_prompt_message(&tab_cfg, "testhost", "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out,
-                                           sizeof(esc_out)),
-                     -1);
+    assert_int_equal(
+        render_prompt_message(&tab_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, esc_out, sizeof(esc_out)), -1);
 }
 
 /**
@@ -814,6 +920,38 @@ static void test_jwt_base64url_strict_alphabet(void **state) {
 }
 
 /**
+ * @brief Unit test verifying rejection of Base64URL payload segments whose total
+ *        padding exceeds the two '=' characters a legal Base64 stream may carry.
+ *
+ * An unpadded segment whose length is 1 (mod 4) would need three trailing
+ * padding characters to reach a multiple of four, which is not valid Base64
+ * (RFC 4648 §3.5); the same holds for 2/3 (mod 4) segments that already carry
+ * trailing pads. OpenSSL's lenient BIO_f_base64 would nevertheless "decode"
+ * such input into short binary garbage, so base64url_decode() rejects it up
+ * front; this pins that rejection end-to-end through verify_token_metadata().
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_base64url_excess_padding_rejected(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Unpadded payload of length 1 (mod 4): three pads would be required. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.abcde.sig", &cfg, NULL), -1);
+    /* The 1-byte extreme of the same class. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.a.sig", &cfg, NULL), -1);
+    /* 2 (mod 4) segment with one trailing pad: alignment appends two more. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.abcde=.sig", &cfg, NULL), -1);
+    /* 3 (mod 4) segment with two trailing pads: alignment appends one more. */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.abcde==.sig", &cfg, NULL), -1);
+
+    /* Control: a legal two-pad segment still decodes ({"sub":"test_user"}). */
+    assert_int_equal(verify_token_metadata("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0X3VzZXIifQ==.sig", &cfg, NULL), 0);
+}
+
+/**
  * @brief Unit test verifying jwt_extract_claim_string() claim extraction semantics.
  *
  * Covers the found / absent / non-string claim trichotomy, malformed JWT
@@ -945,7 +1083,7 @@ static void test_http_request_enforces_tls_options(void **state) {
     http_response_t resp;
     memset(&resp, 0, sizeof(resp));
 
-    int rc = http_request("GET", "https://auth.example/token", NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
+    int rc = http_request("GET", "https://auth.example/token", NULL, NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
     assert_int_equal(rc, 0);
 
     assert_true(tls_opt_seen >= 2);
@@ -954,6 +1092,184 @@ static void test_http_request_enforces_tls_options(void **state) {
 #if LIBCURL_VERSION_NUM >= 0x072000
     assert_int_equal(tls_opt_ssl_version, (int)CURL_SSLVERSION_TLSv1_2);
 #endif
+}
+
+/**
+ * @brief Unit test verifying http_request() proxy routing (CURLOPT_PROXY).
+ *
+ * The weak curl_easy_setopt override captures the requested proxy value.
+ * When no proxy is configured, CURLOPT_PROXY must be set to the empty string
+ * so libcurl never falls back to the caller's *_proxy environment variables
+ * (user-controlled under a setuid PAM caller); a configured proxy must be
+ * routed through verbatim.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_http_request_proxy_routing(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    /* No proxy configured: CURLOPT_PROXY is explicitly empty (env override). */
+    int rc = http_request("GET", "https://auth.example/token", NULL, NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, 0);
+    assert_string_equal(g_fake_curl_proxy, "");
+    free_http_response(&resp);
+
+    /* Configured proxy: routed through verbatim. */
+    memset(&resp, 0, sizeof(resp));
+    rc = http_request("GET", "https://auth.example/token", NULL, NULL, "https://proxy.example:8443", 1000L, &resp,
+                      LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, 0);
+    assert_string_equal(g_fake_curl_proxy, "https://proxy.example:8443");
+    free_http_response(&resp);
+}
+
+/**
+ * @brief Unit test verifying the MAX_HTTP_RESPONSE_SIZE cap enforced by write_callback().
+ *
+ * The weak curl_easy_perform override feeds the fake body through the module's
+ * captured write callback, so the cap's accept/reject behavior is exercised
+ * without a network. A body of exactly 256 KiB is captured in full (realloc
+ * growth up to the cap); one byte over is rejected and nothing is captured —
+ * under real libcurl that short write aborts the transfer (CURLE_WRITE_ERROR),
+ * so http_request() would report a transport failure.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_http_request_response_size_cap(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+
+    size_t cap = MAX_HTTP_RESPONSE_SIZE;
+    char *body = malloc(cap + 2);
+    assert_non_null(body);
+    memset(body, 'A', cap + 1);
+
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    /* Exactly at the cap: captured in full. */
+    body[cap] = '\0';
+    g_fake_curl_body = body;
+    int rc = http_request("GET", "https://auth.example/token", NULL, NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, 0);
+    assert_non_null(resp.body);
+    assert_true(resp.size == cap);
+    free_http_response(&resp);
+
+    /* One byte over the cap: write callback rejects; nothing captured. */
+    memset(&resp, 0, sizeof(resp));
+    body[cap] = 'B';
+    body[cap + 1] = '\0';
+    (void)http_request("GET", "https://auth.example/token", NULL, NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
+    assert_null(resp.body);
+    assert_int_equal((int)resp.size, 0);
+    free_http_response(&resp);
+
+    free(body);
+    g_fake_curl_body = NULL;
+}
+
+/* PAM conversation function for the log-drop test below: never invoked (no
+ * converse is issued from pam_syslog); returns PAM_ABORT if it ever were. */
+static int test_pam_noop_conv(int num_messages, const struct pam_message **message, struct pam_response **response,
+                              void *appdata_ptr) {
+    (void)num_messages;
+    (void)message;
+    (void)response;
+    (void)appdata_ptr;
+    return PAM_ABORT;
+}
+
+/**
+ * @brief Unit test exercising pam_oauth_log()'s "log line dropped" marker branches.
+ *
+ * The wrapper emits a static "log line dropped (...)" syslog marker — instead of
+ * crashing or dropping the event silently — when (a) vsnprintf() cannot render
+ * the line, or (b) the escape buffer cannot be allocated. This test drives
+ * branch (a) deterministically: an unrenderable wide character ((wchar_t)-1)
+ * makes vsnprintf() report an encoding error (negative return) on glibc, every
+ * supported distro's libc. A separate over-length argument exercises the
+ * truncation path (the 8192-byte line cap clamps rather than fails), and a
+ * normal line keeps the success path clean. The sibling branch (b) (escape-
+ * buffer malloc failure) is deliberately not covered: it requires a failing
+ * malloc, which this suite cannot cheaply simulate. A live PAM handle is
+ * created because pam_oauth_log() early-returns on a null handle.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_pam_oauth_log_line_dropped_marker(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    /* Unrenderable wide character: vsnprintf encoding error -> static marker,
+     * no crash, untrusted bytes scrubbed. */
+    pam_oauth_log(pamh, LOGLEVEL_VERBOSE, LOGLEVEL_DEBUG, LOG_DEBUG, "%lc", (wchar_t)-1);
+
+    /* Over-length argument: vsnprintf succeeds but overflows the 8192-byte
+     * line buffer -> truncated to the cap, still logged (no marker). */
+    char *huge = malloc(9000);
+    assert_non_null(huge);
+    memset(huge, 'A', 8999);
+    huge[8999] = '\0';
+    pam_oauth_log(pamh, LOGLEVEL_VERBOSE, LOGLEVEL_DEBUG, LOG_DEBUG, "line: %s", huge);
+    free(huge);
+
+    /* Normal-length line on the same handle: success path stays clean. */
+    pam_oauth_log(pamh, LOGLEVEL_VERBOSE, LOGLEVEL_DEBUG, LOG_DEBUG, "probe: %s", "ok");
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
+ * @brief Pins pam_oauth_log()'s C-escaping rules via a weak pam_syslog()
+ *        override that captures the exact forwarded line.
+ *
+ * Complements test_pam_oauth_log_line_dropped_marker(): that test covers the
+ * vsnprintf-failure and over-length branches, while this one asserts the
+ * happy-path escaping itself — printable ASCII passes through byte-for-byte
+ * while control bytes (LF/CR/TAB and C0/C1/high-bit bytes) become C escapes
+ * (\\n, \\r, \\t, \\xHH) so no untrusted byte can forge a syslog record — plus
+ * the level filter and the syslog priority passthrough.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_pam_oauth_log_escapes_untrusted_bytes(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+    /* Baseline the capture AFTER pam_start so libpam chatter (if any) cannot
+     * perturb the counts asserted below. */
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+
+    /* Level filter: below the configured threshold nothing is emitted. */
+    pam_oauth_log(pamh, LOGLEVEL_NONE, LOGLEVEL_ERROR, LOG_ERR, "hidden");
+    assert_int_equal(g_captured_syslog_calls, 0);
+
+    /* Printable ASCII renders byte-for-byte; priority passes through. */
+    pam_oauth_log(pamh, LOGLEVEL_VERBOSE, LOGLEVEL_DEBUG, LOG_DEBUG, "user '%s' probe", "alice");
+    assert_int_equal(g_captured_syslog_calls, 1);
+    assert_string_equal(g_captured_syslog_line, "user 'alice' probe");
+    assert_int_equal(g_captured_syslog_priority, LOG_DEBUG);
+
+    /* Control and high-bit bytes in an untrusted value become C escapes; no
+     * raw LF/CR/TAB or C0/C1 byte can forge or garble the syslog record. */
+    pam_oauth_log(pamh, LOGLEVEL_VERBOSE, LOGLEVEL_DEBUG, LOG_ERR, "claim '%s'", "bad\nuser\rx\tv\x01\x7f\xff");
+    assert_int_equal(g_captured_syslog_calls, 2);
+    assert_string_equal(g_captured_syslog_line, "claim 'bad\\nuser\\rx\\tv\\x01\\x7F\\xFF'");
+    assert_int_equal(g_captured_syslog_priority, LOG_ERR);
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
 }
 
 /**
@@ -974,13 +1290,13 @@ static void test_discovery_probe_pkce_failsafe_non_200(void **state) {
     reset_fake_curl_transport();
     g_fake_curl_status_code = 500;
     int supported = 1; /* Sentinel: the probe must clear it */
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(supported, 0);
 
     /* Default fake status (0 == "no response") -> fail safe as well. */
     g_fake_curl_status_code = 0;
     supported = 1;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(supported, 0);
 }
 
@@ -995,9 +1311,9 @@ static void test_discovery_probe_pkce_failsafe_transport_error(void **state) {
     reset_fake_curl_transport();
     g_fake_curl_perform_rc = CURLE_COULDNT_CONNECT;
     int supported = 1;
-    assert_int_equal(
-        discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", &supported, LOGLEVEL_NONE, NULL),
-        -1);
+    assert_int_equal(discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", NULL, &supported,
+                                          LOGLEVEL_NONE, NULL),
+                     -1);
     assert_int_equal(supported, 0);
 }
 
@@ -1016,13 +1332,13 @@ static void test_discovery_probe_pkce_failsafe_malformed_document(void **state) 
 
     g_fake_curl_body = "this is not a JSON document";
     int supported = 1;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(supported, 0);
 
     /* A valid JSON scalar is still not a discovery document object. */
     g_fake_curl_body = "123";
     supported = 1;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(supported, 0);
 }
 
@@ -1043,19 +1359,19 @@ static void test_discovery_probe_pkce_support_matrix(void **state) {
     g_fake_curl_body = "{\"code_challenge_methods_supported\": [\"S256\"], "
                        "\"device_authorization_endpoint\": \"https://idp.example/device\"}";
     int supported = 0;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), 0);
     assert_int_equal(supported, 1);
 
     /* S256 advertised but no device_authorization_endpoint -> disable. */
     g_fake_curl_body = "{\"code_challenge_methods_supported\": [\"S256\"]}";
     supported = 1;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), 0);
     assert_int_equal(supported, 0);
 
     /* S256 not advertised -> disable. */
     g_fake_curl_body = "{\"issuer\": \"https://idp.example\"}";
     supported = 1;
-    assert_int_equal(discovery_probe_pkce(url, &supported, LOGLEVEL_NONE, NULL), 0);
+    assert_int_equal(discovery_probe_pkce(url, NULL, &supported, LOGLEVEL_NONE, NULL), 0);
     assert_int_equal(supported, 0);
 }
 
@@ -1067,9 +1383,10 @@ static void test_discovery_probe_pkce_support_matrix(void **state) {
 static void test_discovery_probe_pkce_null_args(void **state) {
     (void)state;
     int supported = 0;
-    assert_int_equal(discovery_probe_pkce(NULL, &supported, LOGLEVEL_NONE, NULL), -1);
+    assert_int_equal(discovery_probe_pkce(NULL, NULL, &supported, LOGLEVEL_NONE, NULL), -1);
     assert_int_equal(
-        discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", NULL, LOGLEVEL_NONE, NULL), -1);
+        discovery_probe_pkce("https://idp.example/.well-known/openid-configuration", NULL, NULL, LOGLEVEL_NONE, NULL),
+        -1);
 }
 
 /**
@@ -1130,6 +1447,524 @@ static void test_poll_interval_backoff_math(void **state) {
     assert_int_equal(poll_interval_after_transient(60), 120);
     assert_int_equal(poll_interval_after_transient(MAX_SUPPORTED_POLL_INTERVAL / 2 + 1), MAX_SUPPORTED_POLL_INTERVAL);
     assert_int_equal(poll_interval_after_transient(MAX_SUPPORTED_POLL_INTERVAL), MAX_SUPPORTED_POLL_INTERVAL);
+}
+
+/**
+ * @brief Pins the pure poll-loop scheduling rules extracted from
+ *        poll_for_access_token(): immediate first poll, absolute next-poll
+ *        time derived from an injected clock reading (nanoseconds carried),
+ *        and expiry once the next poll would land at/after the deadline.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_loop_schedule_rules(void **state) {
+    (void)state;
+    struct timespec now = {100, 500};
+    struct timespec deadline = {1000, 0};
+    struct timespec next_poll = {0, 0};
+
+    /* First poll: request immediately — no leading sleep, output untouched. */
+    assert_int_equal(poll_loop_schedule(1, MIN_POLL_INTERVAL, &now, &deadline, &next_poll), POLL_SCHED_RUN_NOW);
+    assert_int_equal(next_poll.tv_sec, 0);
+    assert_int_equal(next_poll.tv_nsec, 0);
+
+    /* Subsequent poll: next_poll = now + interval. */
+    assert_int_equal(poll_loop_schedule(0, 5, &now, &deadline, &next_poll), POLL_SCHED_SLEEP);
+    assert_int_equal(next_poll.tv_sec, 105);
+    assert_int_equal(next_poll.tv_nsec, 500);
+
+    /* A next poll landing exactly ON the deadline expires (strictly-before rule). */
+    now.tv_sec = 995;
+    now.tv_nsec = 0;
+    assert_int_equal(poll_loop_schedule(0, 5, &now, &deadline, &next_poll), POLL_SCHED_EXPIRED);
+    now.tv_sec = 996; /* Anything later, too. */
+    assert_int_equal(poll_loop_schedule(0, 5, &now, &deadline, &next_poll), POLL_SCHED_EXPIRED);
+}
+
+/**
+ * @brief Pins the per-request cURL timeout budget: capped at the 10 s request
+ *        cap, whole-second truncation, and no request once the whole-second
+ *        remainder hits zero (a zero CURLOPT_TIMEOUT_MS would mean "no
+ *        timeout" to cURL).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_request_budget_rules(void **state) {
+    (void)state;
+    struct timespec deadline = {1000, 0};
+    struct timespec now = {995, 123};
+    long timeout_ms = -1;
+
+    /* Five whole seconds left (nanoseconds truncate): budget 5000 ms. */
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 1);
+    assert_int_equal(timeout_ms, 5000);
+
+    /* Plenty of time: capped at the per-request maximum. */
+    now.tv_sec = 500;
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 1);
+    assert_int_equal(timeout_ms, 10000);
+
+    /* At / past the deadline: no request. */
+    now.tv_sec = 1000;
+    now.tv_nsec = 0;
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 0);
+    now.tv_sec = 1001;
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 0);
+
+    /* Sub-second remainder only: whole-second budget truncates to zero, and a
+     * zero timeout must not be handed to cURL. */
+    deadline.tv_nsec = 500000000;
+    now.tv_sec = 1000;
+    now.tv_nsec = 100000000;
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 0);
+}
+
+/**
+ * @brief Pins the exact whole-second-remainder-zero boundary of
+ *        poll_request_budget(): when @p now and @p deadline share the same
+ *        whole second (so `now` is still before `deadline` at nanosecond
+ *        precision) the request-timeout remainder truncates to exactly 0, and
+ *        the helper must refuse the request and leave the timeout untouched —
+ *        handing cURL a 0/absent CURLOPT_TIMEOUT_MS would mean "no timeout".
+ *
+ * Complement's test_poll_request_budget_rules()'s packed boundary checks with a
+ * dedicated, self-contained pin of the no-unbounded-timeout branch.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_request_budget_whole_second_zero(void **state) {
+    (void)state;
+    struct timespec deadline = {1000, 700000000};
+    struct timespec now = {1000, 100000000};
+    long timeout_ms = -12345; /* sentinel: must be left unmodified on refusal. */
+
+    /* Same tv_sec, now still ahead of deadline in ns: 600 ms of real headroom
+     * but zero WHOLE seconds -> the remainder is exactly 0 -> refuse. */
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 0);
+    assert_int_equal(timeout_ms, -12345);
+
+    /* One whole second of headroom -> exactly 1000 ms, no refusal. */
+    deadline.tv_sec = 1001;
+    assert_int_equal(poll_request_budget(&now, &deadline, &timeout_ms), 1);
+    assert_int_equal(timeout_ms, 1000);
+}
+
+/**
+ * @brief Verifies that http_request()'s private scrub_and_free_slist() securely
+ *        zeroes every request-header node (including the Bearer Authorization
+ *        header) before releasing libcurl's linked list.
+ *
+ * The weak curl_slist_append()/curl_slist_free_all() overrides (top of file)
+ * capture each freshly-allocated header node and assert, immediately before
+ * free, that all of its bytes were zeroed — so the scrub discipline happening
+ * inside the static scrub_and_free_slist() is observable end-to-end through
+ * http_request() with no production-code change.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_http_request_scrubs_bearer_header_nodes(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+    g_slist_scrub_on = 1;
+    g_slist_scrub_count = 0;
+
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    /* POST + Bearer token -> exactly two slist nodes (Content-Type and
+     * Authorization). Both must be zeroed before free; the override also
+     * asserts the recorded node count matches (no node skipped). */
+    int rc = http_request("POST", "https://idp.example/token", "grant_type=abc", "sekrit-bearer-token", NULL, 5000L,
+                          &resp, LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, 0);
+    assert_int_equal(g_slist_scrub_on, 0); /* capture mode consumed + reset */
+    free_http_response(&resp);
+}
+
+/**
+ * @brief Pins the fixed-capacity form-field table guard: form_field_append()
+ *        accepts exactly `capacity` pairs and then returns -1 on the next
+ *        append — the overflow that request_device_authorization() and
+ *        poll_for_access_token() map to PAM_BUF_ERR — without ever advancing
+ *        the count past capacity (no silent stack-array overflow).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_form_field_append_overflow_guard(void **state) {
+    (void)state;
+    const char *keys[5];
+    const char *vals[5];
+    size_t count = 0;
+    const size_t capacity = 5;
+
+    for (size_t i = 0; i < capacity; i++) {
+        assert_int_equal(form_field_append(keys, vals, &count, capacity, "k", "v"), 0);
+        assert_int_equal(count, i + 1);
+    }
+    /* The oversized append trips the guard (-1) and leaves the count untouched. */
+    assert_int_equal(form_field_append(keys, vals, &count, capacity, "overflow", "x"), -1);
+    assert_int_equal(count, capacity);
+}
+
+/**
+ * @brief Drives http_request()'s bearer-header truncation guard: a token longer
+ *        than MAX_ACCESS_TOKEN_LEN cannot fit the fixed
+ *        "Authorization: Bearer <token>" stack buffer, so snprintf() truncates
+ *        and the overflow check returns -1 with the response left
+ *        zero-initialized (and the truncated prefix of the token scrubbed).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_http_request_bearer_header_truncation(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+
+    size_t token_len = MAX_ACCESS_TOKEN_LEN + 8;
+    char *token = malloc(token_len + 1);
+    assert_non_null(token);
+    memset(token, 'A', token_len);
+    token[token_len] = '\0';
+
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int rc = http_request("GET", "https://idp.example/userinfo", NULL, token, NULL, 5000L, &resp, LOGLEVEL_NONE, NULL);
+    assert_int_equal(rc, -1);
+    assert_null(resp.body);
+    assert_int_equal(resp.size, 0);
+
+    free(token);
+}
+
+/* Forward declaration (the canonical one lives below with its doc block): this
+ * later-defined fixture helper is used by the tests ABOVE that declaration. */
+static void init_config_defaults(config_t *cfg);
+
+/**
+ * @brief Pins the definitive-abort fall-through for a malformed provider
+ *        response that a caller may misread as `authorization_pending`: a
+ *        non-429 4xx with a body that parses but lacks a usable `error` string
+ *        (JSON object without `error`, wrong JSON type, or not valid JSON at
+ *        all) must NOT be treated as a retryable pending sign-in. The poll
+ *        issues exactly one HTTP request, classifies the failure as
+ *        TOKEN_PHASE_UNAVAILABLE, and returns PAM_AUTH_ERR.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_loop_malformed_pending_definitive_abort(void **state) {
+    (void)state;
+    static const char *const malformed_bodies[] = {
+        "{\"message\":\"no error field\"}", /* JSON object but no `error` string */
+        "\"not an object\"",                /* valid JSON, wrong JSON type */
+        "plain-malformed-body",             /* not valid JSON at all */
+    };
+
+    for (int i = 0; i < 3; i++) {
+        reset_fake_curl_transport();
+        config_t cfg;
+        init_config_defaults(&cfg);
+        assert_int_equal(copy_checked(cfg.client_id, sizeof(cfg.client_id), "test-client"), 0);
+        assert_int_equal(copy_checked(cfg.token_endpoint, sizeof(cfg.token_endpoint), "https://idp.example/token"), 0);
+
+        struct timespec now;
+        assert_int_equal(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+        device_auth_t dev;
+        memset(&dev, 0, sizeof(dev));
+        assert_int_equal(copy_checked(dev.device_code, sizeof(dev.device_code), "DEV123"), 0);
+        dev.poll_interval = MIN_POLL_INTERVAL;
+        dev.expires_in = 60;
+        dev.deadline.tv_sec = now.tv_sec + dev.expires_in;
+        dev.deadline.tv_nsec = now.tv_nsec;
+
+        CURL *curl = curl_easy_init();
+        assert_non_null(curl);
+        http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        struct json_object *tok_json = NULL;
+        char *access_token = NULL;
+        char *postfields = NULL;
+        token_phase_t phase = TOKEN_PHASE_UNAVAILABLE;
+
+        const long code = 400;
+        script_fake_responses(&malformed_bodies[i], &code, 1);
+        assert_int_equal(poll_for_access_token(NULL, &cfg, LOGLEVEL_NONE, "probeuser", &dev, NULL, 0, curl, &resp,
+                                               &tok_json, &access_token, &postfields, &phase),
+                         PAM_AUTH_ERR);
+        assert_int_equal(phase, TOKEN_PHASE_UNAVAILABLE);
+        assert_null(access_token);
+        /* Not a retryable authorization_pending: exactly ONE HTTP request, then
+         * the definitive abort (no further poll is attempted). */
+        assert_int_equal(g_fake_perform_count, 1);
+
+        if (postfields) {
+            secure_memzero(postfields, strlen(postfields));
+            free(postfields);
+        }
+        secure_zero_json_tree(tok_json);
+        if (tok_json) {
+            json_object_put(tok_json);
+        }
+        free_http_response(&resp);
+        curl_easy_cleanup(curl);
+    }
+}
+
+/**
+ * @brief Forward declaration: the device-flow tests below call this fixture
+ *        helper, which is defined (with its doc block) further down this file.
+ */
+static void init_config_defaults(config_t *cfg);
+
+/**
+ * @brief Drives request_device_authorization() through the fake cURL
+ *        transport and pins the provider-response parsing and clamping
+ *        rules: field extraction, interval/expires_in clamping, and the
+ *        monotonic deadline computed from the clamped expires_in.
+ *
+ * The response's interval (999 s) and expires_in (99999 s) both exceed their
+ * supported maxima so both clamps are observable. Teardown mirrors the
+ * module's cleanup discipline (scrub the escaped postfields, scrub the JSON
+ * tree, free the response).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_request_device_authorization_parses_provider_response(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+    config_t cfg;
+    init_config_defaults(&cfg);
+    assert_int_equal(copy_checked(cfg.client_id, sizeof(cfg.client_id), "test-client"), 0);
+    assert_int_equal(copy_checked(cfg.device_authorization_endpoint, sizeof(cfg.device_authorization_endpoint),
+                                  "https://idp.example.com/device"),
+                     0);
+
+    CURL *curl = curl_easy_init();
+    assert_non_null(curl);
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    device_auth_t dev;
+    memset(&dev, 0, sizeof(dev));
+    struct json_object *dev_json = NULL;
+    char *postfields = NULL;
+
+    g_fake_curl_status_code = 200;
+    g_fake_curl_body = "{\"device_code\":\"DEV123\",\"user_code\":\"ABCD-EFGH\","
+                       "\"verification_uri\":\"https://idp.example.com/verify\","
+                       "\"verification_uri_complete\":\"https://idp.example.com/verify?uc=ABCD\","
+                       "\"interval\":999,\"expires_in\":99999}";
+    assert_int_equal(
+        request_device_authorization(NULL, &cfg, LOGLEVEL_NONE, 0, NULL, curl, &dev, &resp, &dev_json, &postfields),
+        PAM_SUCCESS);
+    assert_string_equal(dev.device_code, "DEV123");
+    assert_string_equal(dev.user_code, "ABCD-EFGH");
+    assert_string_equal(dev.verification_uri, "https://idp.example.com/verify");
+    assert_string_equal(dev.verification_uri_complete, "https://idp.example.com/verify?uc=ABCD");
+    assert_int_equal(dev.poll_interval, MAX_SUPPORTED_POLL_INTERVAL);
+    assert_int_equal(dev.expires_in, cfg.max_poll_seconds);
+
+    /* deadline = monotonic now + clamped expires_in (allow scheduler jitter). */
+    struct timespec now;
+    assert_int_equal(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+    long delta = dev.deadline.tv_sec - (now.tv_sec + dev.expires_in);
+    assert_true(delta >= -1 && delta <= 1);
+
+    /* Teardown mirrors pam_sm_authenticate()'s cleanup discipline. */
+    if (postfields) {
+        secure_memzero(postfields, strlen(postfields));
+        free(postfields);
+    }
+    secure_zero_json_tree(dev_json);
+    if (dev_json) {
+        json_object_put(dev_json);
+    }
+    free_http_response(&resp);
+    curl_easy_cleanup(curl);
+}
+
+/**
+ * @brief Drives poll_for_access_token() through the fake cURL transport with
+ *        an immediately-issued token: the first poll (RUN_NOW, no leading
+ *        sleep) parses the 2xx response, accepts the Bearer token, and
+ *        strdup()s the access token for the caller.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_loop_immediate_token_success(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+    config_t cfg;
+    init_config_defaults(&cfg);
+    assert_int_equal(copy_checked(cfg.client_id, sizeof(cfg.client_id), "test-client"), 0);
+    assert_int_equal(copy_checked(cfg.token_endpoint, sizeof(cfg.token_endpoint), "https://idp.example.com/token"), 0);
+
+    struct timespec now;
+    assert_int_equal(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+    device_auth_t dev;
+    memset(&dev, 0, sizeof(dev));
+    assert_int_equal(copy_checked(dev.device_code, sizeof(dev.device_code), "DEV123"), 0);
+    dev.poll_interval = MIN_POLL_INTERVAL;
+    dev.expires_in = 60;
+    dev.deadline.tv_sec = now.tv_sec + dev.expires_in;
+    dev.deadline.tv_nsec = now.tv_nsec;
+
+    CURL *curl = curl_easy_init();
+    assert_non_null(curl);
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    struct json_object *tok_json = NULL;
+    char *access_token = NULL;
+    char *postfields = NULL;
+    token_phase_t phase = TOKEN_PHASE_UNAVAILABLE;
+
+    g_fake_curl_status_code = 200;
+    g_fake_curl_body = "{\"access_token\":\"testtok123\",\"token_type\":\"Bearer\"}";
+    assert_int_equal(poll_for_access_token(NULL, &cfg, LOGLEVEL_NONE, "probeuser", &dev, NULL, 0, curl, &resp,
+                                           &tok_json, &access_token, &postfields, &phase),
+                     PAM_SUCCESS);
+    assert_string_equal(access_token, "testtok123");
+    assert_int_equal(g_fake_perform_count, 1);
+
+    secure_memzero(access_token, strlen(access_token));
+    free(access_token);
+    if (postfields) {
+        secure_memzero(postfields, strlen(postfields));
+        free(postfields);
+    }
+    secure_zero_json_tree(tok_json);
+    if (tok_json) {
+        json_object_put(tok_json);
+    }
+    free_http_response(&resp);
+    curl_easy_cleanup(curl);
+}
+
+/**
+ * @brief Drives the poll loop through one authorization_pending round and
+ *        pins the deadline enforcement: with the device deadline closer than
+ *        one poll interval, the second iteration must stop WITHOUT issuing
+ *        another request (exactly one HTTP round trip) and classify the
+ *        failure as TOKEN_PHASE_EXPIRED.
+ *
+ * The near deadline keeps the test sleep-free: the next poll lands at/after
+ * the deadline, so the loop exits before clock_nanosleep() runs.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_loop_pending_then_deadline_expiry(void **state) {
+    (void)state;
+    reset_fake_curl_transport();
+    config_t cfg;
+    init_config_defaults(&cfg);
+    assert_int_equal(copy_checked(cfg.client_id, sizeof(cfg.client_id), "test-client"), 0);
+    assert_int_equal(copy_checked(cfg.token_endpoint, sizeof(cfg.token_endpoint), "https://idp.example.com/token"), 0);
+
+    struct timespec now;
+    assert_int_equal(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+    device_auth_t dev;
+    memset(&dev, 0, sizeof(dev));
+    assert_int_equal(copy_checked(dev.device_code, sizeof(dev.device_code), "DEV123"), 0);
+    dev.poll_interval = MIN_POLL_INTERVAL;
+    dev.expires_in = 2; /* Shorter than one poll interval. */
+    dev.deadline.tv_sec = now.tv_sec + dev.expires_in;
+    dev.deadline.tv_nsec = now.tv_nsec;
+
+    CURL *curl = curl_easy_init();
+    assert_non_null(curl);
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    struct json_object *tok_json = NULL;
+    char *access_token = NULL;
+    char *postfields = NULL;
+    token_phase_t phase = TOKEN_PHASE_UNAVAILABLE;
+
+    const char *bodies[] = {"{\"error\":\"authorization_pending\"}"};
+    const long codes[] = {400};
+    script_fake_responses(bodies, codes, 1);
+    assert_int_equal(poll_for_access_token(NULL, &cfg, LOGLEVEL_NONE, "probeuser", &dev, NULL, 0, curl, &resp,
+                                           &tok_json, &access_token, &postfields, &phase),
+                     PAM_AUTH_ERR);
+    assert_int_equal(phase, TOKEN_PHASE_EXPIRED);
+    assert_null(access_token);
+    /* The pending round consumed the one scripted response; the expired
+     * second iteration must not have issued another request. */
+    assert_int_equal(g_fake_perform_count, 1);
+
+    if (postfields) {
+        secure_memzero(postfields, strlen(postfields));
+        free(postfields);
+    }
+    secure_zero_json_tree(tok_json);
+    if (tok_json) {
+        json_object_put(tok_json);
+    }
+    free_http_response(&resp);
+    curl_easy_cleanup(curl);
+}
+
+/**
+ * @brief Pins the definitive provider-error classifications in the poll loop:
+ *        expired_token -> TOKEN_PHASE_EXPIRED, access_denied ->
+ *        TOKEN_PHASE_DENIED, and any other provider error (here server_error)
+ *        -> TOKEN_PHASE_UNAVAILABLE, each failing with PAM_AUTH_ERR and no
+ *        token issued.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_poll_loop_maps_provider_error_phases(void **state) {
+    (void)state;
+    static const char *const bodies[] = {
+        "{\"error\":\"expired_token\"}",
+        "{\"error\":\"access_denied\"}",
+        "{\"error\":\"server_error\"}",
+    };
+    static const token_phase_t expected[] = {TOKEN_PHASE_EXPIRED, TOKEN_PHASE_DENIED, TOKEN_PHASE_UNAVAILABLE};
+
+    for (int i = 0; i < 3; i++) {
+        reset_fake_curl_transport();
+        config_t cfg;
+        init_config_defaults(&cfg);
+        assert_int_equal(copy_checked(cfg.client_id, sizeof(cfg.client_id), "test-client"), 0);
+        assert_int_equal(copy_checked(cfg.token_endpoint, sizeof(cfg.token_endpoint), "https://idp.example.com/token"),
+                         0);
+
+        struct timespec now;
+        assert_int_equal(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+        device_auth_t dev;
+        memset(&dev, 0, sizeof(dev));
+        assert_int_equal(copy_checked(dev.device_code, sizeof(dev.device_code), "DEV123"), 0);
+        dev.poll_interval = MIN_POLL_INTERVAL;
+        dev.expires_in = 60;
+        dev.deadline.tv_sec = now.tv_sec + dev.expires_in;
+        dev.deadline.tv_nsec = now.tv_nsec;
+
+        CURL *curl = curl_easy_init();
+        assert_non_null(curl);
+        http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        struct json_object *tok_json = NULL;
+        char *access_token = NULL;
+        char *postfields = NULL;
+        token_phase_t phase = TOKEN_PHASE_UNAVAILABLE;
+
+        const long code = 400;
+        script_fake_responses(&bodies[i], &code, 1);
+        assert_int_equal(poll_for_access_token(NULL, &cfg, LOGLEVEL_NONE, "probeuser", &dev, NULL, 0, curl, &resp,
+                                               &tok_json, &access_token, &postfields, &phase),
+                         PAM_AUTH_ERR);
+        assert_int_equal(phase, expected[i]);
+        assert_null(access_token);
+        assert_int_equal(g_fake_perform_count, 1);
+
+        if (postfields) {
+            secure_memzero(postfields, strlen(postfields));
+            free(postfields);
+        }
+        secure_zero_json_tree(tok_json);
+        if (tok_json) {
+            json_object_put(tok_json);
+        }
+        free_http_response(&resp);
+        curl_easy_cleanup(curl);
+    }
 }
 
 /**
@@ -1332,6 +2167,15 @@ static void test_verify_user_access(void **state) {
     cfg.system_uid_min = 0;
     cfg.system_uid_max = 999;
     assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
+    assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
+    /* "Not found" is distinct from "lookup error" and must not trip either uid gate:
+     * a name with no local account entry satisfies no range check and is still
+     * decided by the user lists alone (listing it in allow_users permits it). The
+     * PWNAM_ERROR path (ERANGE, NSS outage) fails closed but cannot be induced
+     * deterministically in this harness, so it is covered by code review only. */
+    strncpy(cfg.allow_users, "f3_unit_test_absent_user_name_long", sizeof(cfg.allow_users) - 1);
+    assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
+    cfg.allow_users[0] = '\0';
     assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
     strncpy(cfg.allow_users, "root", sizeof(cfg.allow_users) - 1);
     assert_int_equal(verify_user_access("root", &cfg, NULL), 0);
@@ -1595,7 +2439,6 @@ static void init_config_defaults(config_t *cfg) {
     cfg->claim_capture_group = 1;
     cfg->max_poll_seconds = 120;
     cfg->case_sensitive = 1;
-    cfg->show_host = 1;
     cfg->show_expiry = 1;
     cfg->loglevel = LOGLEVEL_INFO;
     cfg->deny_system_uids = 1;
@@ -1656,7 +2499,6 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.claim_capture_group, 1);
     assert_int_equal(cfg.max_poll_seconds, 120);
     assert_int_equal(cfg.case_sensitive, 1);
-    assert_int_equal(cfg.show_host, 1);
     assert_int_equal(cfg.show_expiry, 1);
     assert_int_equal(cfg.loglevel, LOGLEVEL_INFO);
     assert_int_equal(cfg.deny_system_uids, 1);
@@ -1775,6 +2617,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "require_exp_claim = no\n"
                                     "use_pkce = true\n"
                                     "discovery_endpoint = https://idp.example.com/.well-known/openid-configuration\n"
+                                    "proxy = https://proxy.example.com:3129\n"
                                     "[claim]\n"
                                     "claim_field = preferred_username\n"
                                     "claim_regex = ^(.*)$\n"
@@ -1793,7 +2636,6 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "group_claim_field = roles\n"
                                     "[prompt]\n"
                                     "init_message = Code: %s\n"
-                                    "show_host = false\n"
                                     "show_expiry = false\n"
                                     "[runtime]\n"
                                     "max_poll_seconds = 60\n"
@@ -1835,7 +2677,6 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.enforce_groups, 1);
     assert_string_equal(cfg.group_claim_field, "roles");
     assert_string_equal(cfg.init_message, "Code: %s");
-    assert_int_equal(cfg.show_host, 0);
     assert_int_equal(cfg.show_expiry, 0);
     assert_int_equal(cfg.max_poll_seconds, 60);
     assert_int_equal(cfg.loglevel, LOGLEVEL_VERBOSE);
@@ -1844,6 +2685,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.require_exp_claim, 0);
     assert_int_equal(cfg.use_pkce, 1);
     assert_string_equal(cfg.discovery_endpoint, "https://idp.example.com/.well-known/openid-configuration");
+    assert_string_equal(cfg.proxy, "https://proxy.example.com:3129");
     assert_int_equal(cfg.qr_enabled, 1);
     assert_int_equal(cfg.qr_style, QR_STYLE_ASCII);
     assert_string_equal(cfg.qr_block_char, "@");
@@ -2356,6 +3198,96 @@ static void test_parse_config_file_duplicate_discovery_endpoint(void **state) {
     config_t cfg;
     init_config_defaults(&cfg);
     FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+}
+
+/**
+ * @brief Unit test verifying [oauth] proxy parsing: a valid HTTPS proxy URL
+ *        loads, an explicitly empty value loads (disabled), and unsafe values
+ *        (plain HTTP, embedded credentials) are rejected.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_config_file_proxy(void **state) {
+    (void)state;
+    config_t cfg;
+
+    /* A valid HTTPS proxy loads and is stored verbatim. */
+    static const char *const valid = "[oauth]\n"
+                                     "client_id = test-client\n"
+                                     "device_authorization_endpoint = https://idp.example.com/device\n"
+                                     "token_endpoint = https://idp.example.com/token\n"
+                                     "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                     "proxy = https://proxy.example.com:3129\n"
+                                     "[claim]\n"
+                                     "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(valid);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_string_equal(cfg.proxy, "https://proxy.example.com:3129");
+
+    /* An explicitly empty proxy value loads and keeps the default (disabled). */
+    static const char *const empty = "[oauth]\n"
+                                     "client_id = test-client\n"
+                                     "device_authorization_endpoint = https://idp.example.com/device\n"
+                                     "token_endpoint = https://idp.example.com/token\n"
+                                     "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                     "proxy =\n"
+                                     "[claim]\n"
+                                     "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(empty);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_string_equal(cfg.proxy, "");
+
+    /* A plain-HTTP proxy is rejected (HTTPS-only, matching the endpoint rule). */
+    static const char *const insecure = "[oauth]\n"
+                                        "client_id = test-client\n"
+                                        "device_authorization_endpoint = https://idp.example.com/device\n"
+                                        "token_endpoint = https://idp.example.com/token\n"
+                                        "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                        "proxy = http://proxy.example.com:3128\n"
+                                        "[claim]\n"
+                                        "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(insecure);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+
+    /* A proxy URL with embedded userinfo (credentials) is rejected. */
+    static const char *const credentialed = "[oauth]\n"
+                                            "client_id = test-client\n"
+                                            "device_authorization_endpoint = https://idp.example.com/device\n"
+                                            "token_endpoint = https://idp.example.com/token\n"
+                                            "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                            "proxy = https://user:pass@proxy.example.com:3129\n"
+                                            "[claim]\n"
+                                            "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(credentialed);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+    fclose(f);
+
+    /* A duplicated proxy key is rejected (house rule). */
+    static const char *const duplicated = "[oauth]\n"
+                                          "client_id = test-client\n"
+                                          "device_authorization_endpoint = https://idp.example.com/device\n"
+                                          "token_endpoint = https://idp.example.com/token\n"
+                                          "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                                          "proxy = https://a.example.com:3129\n"
+                                          "proxy = https://b.example.com:3129\n"
+                                          "[claim]\n"
+                                          "claim_regex = ^([a-zA-Z0-9._-]+)$\n";
+    init_config_defaults(&cfg);
+    f = open_config_stream(duplicated);
     assert_non_null(f);
     assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
     fclose(f);
@@ -2942,9 +3874,16 @@ int main(void) {
         cmocka_unit_test(test_jwt_non_finite_claims_rejected),
         cmocka_unit_test(test_jwt_malformed_structure),
         cmocka_unit_test(test_jwt_base64url_strict_alphabet),
+        cmocka_unit_test(test_jwt_base64url_excess_padding_rejected),
         cmocka_unit_test(test_jwt_extract_claim_string),
         cmocka_unit_test(test_retryable_token_http_status),
         cmocka_unit_test(test_http_request_enforces_tls_options),
+        cmocka_unit_test(test_http_request_proxy_routing),
+        cmocka_unit_test(test_http_request_response_size_cap),
+        cmocka_unit_test(test_http_request_scrubs_bearer_header_nodes),
+        cmocka_unit_test(test_http_request_bearer_header_truncation),
+        cmocka_unit_test(test_pam_oauth_log_line_dropped_marker),
+        cmocka_unit_test(test_pam_oauth_log_escapes_untrusted_bytes),
         cmocka_unit_test(test_pkce_code_verifier),
         cmocka_unit_test(test_pkce_s256_challenge),
         cmocka_unit_test(test_verify_user_access),
@@ -2973,6 +3912,7 @@ int main(void) {
         cmocka_unit_test(test_parse_config_file_system_uid_range_invalid),
         cmocka_unit_test(test_parse_config_file_invalid_discovery_endpoint),
         cmocka_unit_test(test_parse_config_file_duplicate_discovery_endpoint),
+        cmocka_unit_test(test_parse_config_file_proxy),
         cmocka_unit_test(test_discovery_json_advertises_s256),
         cmocka_unit_test(test_discovery_probe_pkce_failsafe_non_200),
         cmocka_unit_test(test_discovery_probe_pkce_failsafe_transport_error),
@@ -2981,6 +3921,15 @@ int main(void) {
         cmocka_unit_test(test_discovery_probe_pkce_null_args),
         cmocka_unit_test(test_is_retryable_token_http_status_matrix),
         cmocka_unit_test(test_poll_interval_backoff_math),
+        cmocka_unit_test(test_poll_loop_schedule_rules),
+        cmocka_unit_test(test_poll_request_budget_rules),
+        cmocka_unit_test(test_poll_request_budget_whole_second_zero),
+        cmocka_unit_test(test_form_field_append_overflow_guard),
+        cmocka_unit_test(test_request_device_authorization_parses_provider_response),
+        cmocka_unit_test(test_poll_loop_immediate_token_success),
+        cmocka_unit_test(test_poll_loop_pending_then_deadline_expiry),
+        cmocka_unit_test(test_poll_loop_maps_provider_error_phases),
+        cmocka_unit_test(test_poll_loop_malformed_pending_definitive_abort),
         cmocka_unit_test(test_qr_config_parsing),
         cmocka_unit_test(test_qr_render_matrix),
         cmocka_unit_test(test_qr_encode_uri),

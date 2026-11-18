@@ -67,4 +67,3 @@ examples/** linguist-documentation
 .windsurfrules export-ignore
 AGENTS.md export-ignore
 CLAUDE.md export-ignore
-REVIEW.md export-ignore

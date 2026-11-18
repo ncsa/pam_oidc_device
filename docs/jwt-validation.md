@@ -25,6 +25,11 @@ When enabled (`verify_jwt_claims = true`), the module parses Base64URL-encoded a
 > **Target token: the access token only.**
 > In the PAM flow, `verify_jwt_claims` is invoked only on the **access token** returned from the token endpoint; the **`id_token` is not inspected**. The function is token-type-agnostic in capability, but the device-flow PAM pipeline passes only the access token. The `id_token` is intentionally out of scope because (1) its `aud` semantics differ — an `id_token` audience is the *client* application, whereas the configured `audience` matches the resource/userinfo audience of the access token; (2) some providers omit the `id_token` in the device flow; and (3) signature enforcement for authentication occurs at the provider's UserInfo endpoint, which is driven by the access token.
 
+> [!IMPORTANT]
+> **No JWKS / `jwks_url` signature-verification path exists — and the severity escalates if you consume ID-token claims directly.**
+> Because this inspection is claims-only, the module holds **no JWKS signature-verification path**: `jwks_url` (and `introspection_endpoint`) are parsed and HTTPS-validated but **unused** — a load-time notice is emitted. Token authenticity and validity are enforced **entirely** by the provider's UserInfo endpoint over enforced TLS; there is no other authority for the returned token.
+> If a deployment ever switches from that fresh UserInfo call to consuming the ID token's claims directly (offline trust — skipping UserInfo, or trusting the ID token's embedded claims without a live exchange), this becomes **High severity** (a forged/tampered ID token with acceptable `iss`/`aud`/`sub`/`exp` could authenticate) and a **JWKS / RFC 7517 signature-verification path** would be required before any token claims could be trusted locally. The module does not implement that path today.
+
 ---
 
 ## Configuration Reference

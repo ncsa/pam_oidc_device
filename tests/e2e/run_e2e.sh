@@ -129,9 +129,11 @@ python3 "$E2E_DIR/mock_oidc.py" --port "$PORT" \
     --scenario-file "$SCENARIO_FILE" > "$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
 # The conf back-up/scratch files may mirror a live config (client credentials);
-# remove them on exit even when a scenario aborts mid-flight.
+# remove them on exit even when a scenario aborts mid-flight (the 0700 workdir
+# would otherwise keep credential copies behind after the run).
 trap 'kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true;
-      rm -f "$WORKDIR/conf.uid0.orig" "$WORKDIR/conf.uid0.tmp"' EXIT
+      rm -f "$WORKDIR/conf.uid0.orig" "$WORKDIR/conf.uid0.tmp" \
+            "$WORKDIR/conf.uidrange.orig" "$WORKDIR/conf.uidrange.tmp"' EXIT
 
 for _ in $(seq 1 50); do
     if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
