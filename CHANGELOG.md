@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-11-19
+
+### Fixed
+
+- **Large passwd entries no longer lock out legitimate accounts (`src/identity.c`):** the
+  uid lookup in `verify_user_access()` used a fixed 4096-byte stack buffer, so an account
+  whose passwd record is larger (LDAP/SSSD entries with long GECOS strings or home paths)
+  made `getpwnam_r()` report `ERANGE`; with either uid guard enabled that error failed
+  closed, locking the account out entirely. The lookup now starts at
+  `sysconf(_SC_GETPW_R_SIZE_MAX)` (4 KiB where the constant is undefined, e.g. glibc)
+  and retries `ERANGE` with a doubling heap buffer up to 1 MiB before giving up; a
+  persistent backend error still fails closed exactly as before. Pinned by the new
+  `test_verify_user_access_large_entry` CMocka test (scripted `getpwnam_r()` override).
+- **`no_proxy`/`NO_PROXY` can no longer bypass a configured `[oauth] proxy`
+  (`src/http.c`):** `http_request()` only ever cleared `CURLOPT_PROXY`; when a proxy
+  was configured, libcurl still consulted the caller's `no_proxy`/`NO_PROXY`
+  environment variables (it does so whenever `CURLOPT_NOPROXY` was never set), so a
+  PAM caller could steer provider traffic around the admin's egress proxy. Both proxy
+  options are now always set explicitly: `CURLOPT_PROXY` to the configured URL (empty
+  string when none) and `CURLOPT_NOPROXY` to the empty string, so neither `*_proxy`
+  nor `no_proxy`/`NO_PROXY` of a setuid PAM caller is ever honored. The
+  `test_http_request_proxy_routing` test now pins both options on every path.
+- **Proxy TLS leg is explicitly pinned to certificate validation and TLS >= 1.2
+  (`src/http.c`):** a code comment claimed the strict TLS options also applied to
+  the proxy connection, but `CURLOPT_SSL_VERIFYPEER`/`SSL_VERIFYHOST`/`SSLVERSION`
+  govern only the provider (endpoint) connection — the TLS session libcurl
+  negotiates to a configured `[oauth] proxy` is governed by the separate
+  `CURLOPT_PROXY_SSL_*` options. Proxy certificate checks default on, so nothing
+  was ever unverified, but the TLS 1.2 minimum was not enforced on that leg.
+  `http_request()` now explicitly sets `CURLOPT_PROXY_SSL_VERIFYPEER=1`,
+  `CURLOPT_PROXY_SSL_VERIFYHOST=2`, and `CURLOPT_PROXY_SSLVERSION` to TLSv1.2 on
+  every request, and the comment/doc claims were corrected;
+  `test_http_request_proxy_routing` pins all three on the with-proxy and
+  without-proxy paths alike.
+
+
 ## [0.3.4] - 2026-11-18
 
 ### Fixed
