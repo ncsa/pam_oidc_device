@@ -11,7 +11,7 @@
 #define METADATA_H
 
 #define MODULE_NAME "pam_oidc_device"
-#define MODULE_VERSION "0.3.3"
+#define MODULE_VERSION "0.3.4"
 #define MODULE_DESCRIPTION "PAM authentication module for OAuth 2.0 Device Authorization Grant"
 #define MODULE_MAINTAINER "NCSA CyberInfrastructure <help@ncsa.illinois.edu>"
 #define MODULE_USER_AGENT MODULE_NAME "/" MODULE_VERSION

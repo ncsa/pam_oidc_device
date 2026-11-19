@@ -187,21 +187,16 @@ typedef struct {
     int claim_capture_group;                 /**< Regex capture group index to select username slice. */
     int max_poll_seconds;                    /**< Maximum total polling time allowed before timing out. */
     char init_message[MAX_INIT_MSG_LEN];     /**< Custom template string for user terminal prompt. */
-    int show_host;                           /**< Flag: 1 (default) to display the target host's hostname in the
-                                              *  sign-in prompt as the user's cross-check against device-code phishing
-                                              *  — named in the trailing status line of the built-in default template
-                                              *  ("Waiting for your approval to sign in to <host>; ...") and expanded by the
-                                              *  `{host}` token in custom templates; 0 hides the host entirely — the
-                                              *  built-in default drops the host clause and `{host}` expands to an
-                                              *  empty string. */
     int show_expiry;                         /**< Flag: 1 (default) adds the device-code approval window to the
                                               *  trailing status line of the built-in default template
-                                              *  ("Waiting for your approval to sign in to <host> (expires in
-                                              *  15 minutes); ..."); 0 hides it. The window is the provider's
+                                              *  ("Waiting for approval (expires in 15m; auto-completes on
+                                              *  sign-in)."); 0 hides it
+                                              *  ("Waiting for approval; auto-completes on sign-in."). The window
+                                              *  is the provider's
                                               *  `expires_in` clamped by `max_poll_seconds`. Independent of this
                                               *  flag, the `{expiry}` token in any template expands to the
-                                              *  human-readable duration or to an empty string when the window
-                                              *  is unknown. */
+                                              *  compact duration ("45s", "15m", "1h 5m") or to an empty string
+                                              *  when the window is unknown. */
     int case_sensitive;                      /**< Flag: 1 for case-sensitive username comparison, 0 otherwise. */
     loglevel_t loglevel; /**< Configured syslog verbosity level (none, error, info, debug, verbose). */
     char issuer[512];    /**< Expected token issuer claim (iss). */
@@ -210,6 +205,9 @@ typedef struct {
                             verification. */
     char introspection_endpoint[512]; /**< Reserved: RFC 7662 Token Introspection endpoint URL; parsed and validated,
                                          but not yet used. */
+    char proxy[512];                  /**< Optional outbound HTTPS proxy URL (must begin with `https://`); empty (the
+                                       *  default) routes provider traffic directly. The proxy URL must not embed
+                                       *  credentials; proxies requiring authentication are not supported. */
     int verify_jwt_claims; /**< Flag: 1 to enforce local JWT claim inspection (exp, nbf, iss, aud). Claims-only; NOT a
                               signature check. */
     int clock_skew_leeway; /**< Allowed clock skew leeway in seconds for exp/nbf validation. */
@@ -417,14 +415,18 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh);
  * @param[in]  url          Target URL string.
  * @param[in]  postfields   URL-encoded POST request payload (can be NULL for GET).
  * @param[in]  bearer_token Optional OAuth Bearer access token string for authorization.
+ * @param[in]  proxy        Optional outbound HTTPS proxy URL (`https://host[:port]`,
+ *                         validated at config load). Empty/NULL routes traffic directly.
+ *                         In either case the `*_proxy` environment variables are
+ *                         never honored.
  * @param[in]  timeout_ms   Request timeout period in milliseconds.
  * @param[out] resp         Pointer to http_response_t structure receiving response data.
  * @param[in]  loglevel     Active log verbosity level for HTTP transport tracing.
  * @param[in]  pamh         PAM handle for syslog logging context (optional).
  * @return 0 on HTTP execution success, -1 on transport or error conditions.
  */
-int http_request(const char *method, const char *url, const char *postfields, const char *bearer_token, long timeout_ms,
-                 http_response_t *resp, loglevel_t loglevel, pam_handle_t *pamh);
+int http_request(const char *method, const char *url, const char *postfields, const char *bearer_token,
+                 const char *proxy, long timeout_ms, http_response_t *resp, loglevel_t loglevel, pam_handle_t *pamh);
 
 /**
  * @brief Securely frees resources allocated in an HTTP response structure.
@@ -474,13 +476,14 @@ int discovery_json_advertises_s256(const struct json_object *doc);
  * The decision (and its rationale) is logged so operators can audit the suggestion.
  *
  * @param[in]  url        HTTPS discovery metadata URL (must be pre-validated).
+ * @param[in]  proxy      Optional outbound HTTPS proxy URL; empty/NULL routes directly.
  * @param[out] supported  Set to 1 when PKCE should be enabled, 0 otherwise.
  * @param[in]  loglevel   Active syslog verbosity level.
  * @param[in]  pamh       PAM handle for syslog logging context (optional).
  * @return 0 when the probe completed (check *supported for the decision), -1 when the
  *         probe could not complete (transport/HTTP/JSON failure; *supported is 0).
  */
-int discovery_probe_pkce(const char *url, int *supported, loglevel_t loglevel, pam_handle_t *pamh);
+int discovery_probe_pkce(const char *url, const char *proxy, int *supported, loglevel_t loglevel, pam_handle_t *pamh);
 
 /**
  * @brief Encodes a verification URI into a packed QR Code module matrix.
@@ -587,17 +590,18 @@ int pkce_compute_s256_challenge(const char *verifier, char *out, size_t out_len)
 /**
  * @brief Formats prompt display string presented to user during authentication.
  *
- * Evaluates configured template tokens ({host}, {url}, {url_complete}, {code}, {expiry}) and
- * newline escape sequences. The {host} token carries the target host's hostname so the approving
- * user can tell which machine the sign-in request belongs to (device-code phishing mitigation; see
- * docs/threat-model.md §8). The {expiry} token carries the human-readable device-code approval
+ * Evaluates configured template tokens ({url}, {url_complete}, {code}, {expiry}) and
+ * newline escape sequences. The {expiry} token carries the human-readable device-code approval
  * window (the provider's `expires_in`, clamped by `max_poll_seconds`; e.g. "15 minutes"), or
- * expands to an empty string when the window is unknown. The fully rendered result is validated
- * line-by-line for terminal-injection safety (newline-tolerant `is_safe_terminal_string`); unsafe
- * output fails the call, including hostnames that are not printable ASCII (fail-closed).
+ * expands to an empty string when the window is unknown. The prompt deliberately carries no
+ * host identification: in a device-code phishing attack (docs/threat-model.md §8) the prompt
+ * reaches the party that *ran ssh* (the attacker), while the approving user only ever sees the
+ * identity provider's approval page — so machine context must live in the registered OAuth
+ * client name shown on that approval page, not in this prompt. The fully rendered result is
+ * validated line-by-line for terminal-injection safety (newline-tolerant `is_safe_terminal_string`);
+ * unsafe template/URL/code output fails the call (fail-closed).
  *
  * @param[in]  cfg          Active configuration context.
- * @param[in]  host         Target host's hostname (e.g. from `gethostname()`).
  * @param[in]  url          Base verification URI string.
  * @param[in]  url_complete Complete verification URI string containing embedded user code (optional).
  * @param[in]  code         User verification code string.
@@ -607,8 +611,8 @@ int pkce_compute_s256_challenge(const char *verifier, char *out, size_t out_len)
  * @param[in]  out_len      Destination buffer size in bytes.
  * @return 0 on success, -1 on buffer overflow, rendering error, or terminal-safety rejection.
  */
-int render_prompt_message(const config_t *cfg, const char *host, const char *url, const char *url_complete,
-                          const char *code, int expires_in, char *out, size_t out_len);
+int render_prompt_message(const config_t *cfg, const char *url, const char *url_complete, const char *code,
+                          int expires_in, char *out, size_t out_len);
 
 /**
  * @brief Matches raw identity claim value against expected PAM username using regex mapping rules.

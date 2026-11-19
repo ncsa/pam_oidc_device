@@ -12,7 +12,7 @@
 #     make VERSION=0.3.0
 # Keep these in sync with include/metadata.h when the metadata changes.
 NAME        ?= pam_oidc_device
-VERSION     ?= 0.3.3
+VERSION     ?= 0.3.4
 DESCRIPTION ?= PAM authentication module for OAuth 2.0 Device Authorization Grant
 
 CC ?= gcc
@@ -48,10 +48,12 @@ SAN_RUNNER = build/sanitize/runner
 # Extra flags appended to every compile recipe. CI passes
 # `EXTRA_CFLAGS=-Werror` to mechanically enforce the documented zero-warning
 # bar (see .github/workflows/build.yml); the default is empty for local builds.
-EXTRA_CFLAGS =
+# `?=` (not `=`) so a developer-supplied EXTRA_CFLAGS — in the environment or
+# on the command line — is honored instead of silently clobbered.
+EXTRA_CFLAGS ?=
 
 TARGET = $(NAME).so
-OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/pkce.o src/qr.o third_party/qrcodegen/qrcodegen.o src/pam_module.o
+OBJS = src/config.o src/http.o src/identity.o src/jwt.o src/message.o src/pkce.o src/qr.o third_party/qrcodegen/qrcodegen.o src/pam_module.o
 CONFIG_DEFAULT = config/$(NAME).conf
 
 PAM_DIR ?= /lib64/security
@@ -130,7 +132,7 @@ sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -fPIC -shared -Wall -Wextra $(EXTRA_CFLAGS) -g \
 		-fsanitize=address -fsanitize=undefined -fsanitize=leak \
-		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c $(LIBS)
+		-o build/sanitize/$(TARGET) src/config.c src/http.c src/identity.c src/jwt.c src/message.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c $(LIBS)
 
 test: $(OBJS)
 	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g tests/test_suite.c $(OBJS) \
@@ -152,7 +154,7 @@ test: $(OBJS)
 test-sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g $(SAN_FLAGS) \
-		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c \
+		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/message.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c \
 		-o $(SAN_RUNNER) -lcmocka $(LIBS)
 	ASAN_OPTIONS=detect_leaks=1 \
 	LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp \
@@ -184,7 +186,7 @@ FUZZ_CC       ?= clang
 FUZZ_MAX_TIME ?= 30
 FUZZ_FLAGS    = -fsanitize=fuzzer,address,undefined,leak -fno-omit-frame-pointer
 FUZZ_TARGETS  ?= config jwt_extract token_meta string_validators verify_claim pkce
-FUZZ_SRC      = src/config.c src/http.c src/identity.c src/jwt.c src/pkce.c \
+FUZZ_SRC      = src/config.c src/http.c src/identity.c src/jwt.c src/message.c src/pkce.c \
                 src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c
 
 build/fuzz/fuzz_%: tests/fuzz/fuzz_%.c $(FUZZ_SRC)

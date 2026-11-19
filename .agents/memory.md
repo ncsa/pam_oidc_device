@@ -197,6 +197,215 @@
   `Depends:` line, and captures stderr to a mktemp file that is printed on failure.
 
 ## Interaction Log (newest first)
+
+### 2026-11-18 — Review finding M-3: document the claims-only / no-JWKS trust model for operators
+- **Task:** Address review finding 5 (M-3) — document clearly for operators in `SECURITY.md`/threat-model that JWT handling is **claims-only** and the signature is intentionally NOT verified, that there is **no JWKS signature path**, and that offline ID-token consumption would make this High severity.
+- **Decisions & Rationale:** Trust for the returned token rests entirely on (1) enforced HTTPS/TLS 1.2+ transport and (2) the provider's UserInfo endpoint — the module's single authoritative validity/signature checkpoint. `verify_token_metadata()` and `jwt_extract_claim_string()` (`src/jwt.c`) are claims-only inspectors; no local signature verification. `jwks_url`/`introspection_endpoint` are parsed+HTTPS-validated but **unused** (load-time notice). If a deployment ever consumes ID-token claims directly/offline, this escalates to **High** and requires a JWKS/RFC 7517 signature path (module does not provide it). Kept the documented-jargon aligned with the standing invariant: do NOT overclaim "zero-trust"/"replay protection."
+- **Gotchas & Lessons:** `docs/threat-model.md` §5 already had a "Cryptographic Boundary" NOTE and `docs/jwt-validation.md` a claims-only WARNING, but neither stated the NO-JWKS fact explicitly nor the offline-ID-token severity escalation — added explicit operator callouts (`[!IMPORTANT]` trust model, `[!CAUTION]` escalation) to both, plus a dedicated M-3 bullet in `SECURITY.md`. Reused the existing `[!NOTE]`/`[!IMPORTANT]` admonition style already present in both docs.
+- **Verification:** Docs-only change (no build/test needed). `git diff` limited to `SECURITY.md`, `docs/threat-model.md`, `docs/jwt-validation.md`, `.agents/memory.md`. Anchored the `#5-...` anchor link to the exact existing heading slug in threat-model TOC.
+- **Follow-ups / Open Items:** JWKS signature verification and RFC 7662 introspection remain unimplemented (accepted-but-unused keys) — a future High-severity item if offline ID-token-trust is ever adopted.
+
+### 2026-11-18 — USER_NOTICE_* PIC-link fix + full Linux-gate re-confirmation at 73 tests + workflow least-privilege/SHA-pinning audit
+- **Task:** (a) Fix CI `-Werror` link failures (`R_X86_64_PC32` relocation after the M-2
+  `message.c` extraction) by converting the 4 exported `const char *const USER_NOTICE_*`
+  globals in `src/message.c` into `#define` string-literal macros in `src/device_flow.h`;
+  (b) address review finding #3 — re-run the full Linux gate set since the in-tree test count
+  is now 73 vs. the previously recorded 61; (c) run a dedicated CI least-privilege /
+  SHA-pinning audit of `.github/workflows/`.
+- **Decisions & Rationale:** Root cause of the link failure: a shared-object (PIC) build that
+  references exported data symbols (`USER_NOTICE_*`) across TUs emits `R_X86_64_PC32`
+  relocations, which `ld.bfd` rejects (`relocation ... can not be used when making a shared
+  object`); toolchain-dependent (container GCC 13 did not reproduce — CI's GCC did). Fix is
+  attribute-free and works on all toolchains: the macros inline the string literal at each call
+  site, eliminating the cross-TU data reference entirely. Option (b) re-confirms: the local
+  container runs are green at **73/73 CMocka** under gcc and clang (`-Werror` zero-warning),
+  73/73 under `make test-sanitize CC=clang` (ASan/UBSan/LSan), `make lint` full
+  (clang-format/clang-tidy/cppcheck/flawfinder/check-scrub) clean, and `make sandbox` e2e
+  **9/9 scenarios green**. Option (c): every `uses:` across all 5 workflows is SHA-pinned to
+  actions/checkout commit `3d3c42e5…90b1` — API-verified as exactly the commit that tag
+  `v7.0.1` points at ("prep v7.0.1 release (#2531)") — and all workflows set a top-level
+  `permissions: contents: read` with no job-level grants, no `id-token`, no elevation
+  (license-audit's `GITHUB_TOKEN` use is a read-only dependency-graph query). Audit: NO
+  action-version or least-privilege changes required.
+- **Gotchas & Lessons:** (1) The reviewer's "last recorded green run = 61/61" was stale —
+  memory.md's newest dated gate entry was older than the 61→73 test growth, and the actual
+  container re-runs during this work were NOT recorded in `.agents/memory.md`, so a reviewer
+  reading only the log correctly concluded "unconfirmed at 73" and flagged a re-run. Lesson:
+  end every session that runs Linux gates in the container with a fresh Interaction Log entry
+  stating the current CMocka count, so the log never lags the tree. (2) `make sandbox` runs
+  the host's Docker (not docker-in-docker) and does NOT need the separate CI-mirror container;
+  it is a real installed-module PAM-stack e2e vs the in-repo HTTPS mock provider.
+- **Verification.** PASSING — full CI-mirror `ubuntu:24.04` container + host Docker: gcc &
+  clang `-Werror` builds zero-warning, **73/73** under both compilers, **73/73** under
+  `make test-sanitize CC=clang` (ASan/UBSan/LSan), `make lint` clean, `make check-scrub`
+  clean, and `make sandbox` **9/9** e2e scenarios. No public API (include/) or packaging
+  touched — internal-only reorg (`src/device_flow.h` macros + `src/message.c` comment).
+- **Follow-ups / Open Items.** Push to trigger real CI runners (Compile & Test, e2e-sandbox,
+  all 6 distro-build legs) to independently confirm; `make fuzz` remains the only gate not yet
+  exercised. This entry supersedes the stale 61/61 record for gate-status purposes.
+### 2026-11-17 — Low-priority review batch: Base64 padding fix + 4 regression tests + docs/Makefile/.gitattributes
+- **Task:** Close 7 low-priority code-review findings: reject excess Base64 padding in
+  `base64url_decode()` (OpenSSL's lenient `BIO_f_base64` decodes 1-mod-4 segments into garbage);
+  threat-model callout that the JWT-sub/UserInfo-sub consistency check requires
+  `verify_jwt_claims = true` (off by default); `EXTRA_CFLAGS ?=` in Makefile; drop stale
+  `REVIEW.md` `.gitattributes` line; document the `strlen`→int cast + TLS-1.2 version guard in
+  `src/http.c`; add 4 regression tests.
+- **Decisions & Rationale:** padding check computes `total_pad = (in_len - pad_start) +
+  (padded_len - in_len)` and fails closed on `> 2` (RFC 4648 §3.5). New tests:
+  `test_jwt_base64url_excess_padding_rejected`, `test_http_request_proxy_routing` (weak
+  `curl_easy_setopt` captures `CURLOPT_PROXY`: `""` when unset — env-var override defense — and
+  verbatim when configured), `test_http_request_response_size_cap` (fake `curl_easy_perform`
+  feeds the body through the module's write callback; exactly-256 KiB accepted, +1 byte
+  rejected; `http_request` return value intentionally unasserted on the reject case because the
+  fake transport still reports `CURLE_OK`), `test_pam_oauth_log_line_dropped_marker`
+  (`vsnprintf` encoding error via `(wchar_t)-1` `%lc` on glibc; 9000-char arg exercises the
+  8192-byte truncation path; live `pam_start` handle needed since `pam_oauth_log` early-returns
+  on NULL). CHANGELOG gained the `[Unreleased]` section.
+- **Gotchas & Lessons:** this CMocka has **no** `assert_ptr_null`/`assert_ptr_not_null` — use
+  `assert_null`/`assert_non_null`. `make clean` runs `rm -rf build/`, so keep scratch scripts
+  and logs OUTSIDE the repo (used `/tmp/pam_verify.sh` + `/tmp/pam_verify.log`). On the arm64
+  Docker host, `make test-sanitize CC=clang` additionally needs `libclang-rt-18-dev` (ASan
+  runtime) beyond the usual dev packages; x86_64 CI doesn't.
+- **Verification:** all gates green in `ubuntu:24.04` container (arm64): `make` gcc and clang
+  with `EXTRA_CFLAGS=-Werror` (zero-warning), `make test` gcc + clang (66/66),
+  `make test-sanitize CC=clang` (66/66 under ASan+UBSan+LSan), `make lint` with all five
+  checks active (clang-format/clang-tidy/cppcheck/flawfinder/memory-scrub, no skips),
+  `make check-licenses`. Working tree: only the 7 intended files modified.
+- **Follow-ups / Open Items:** none; the `pam_oauth_log` escape-buffer malloc-failure branch
+  remains intentionally untested (requires a failing malloc).
+
+### 2026-11-17 — Default prompt gains a leading blank line when `[qr] enabled = false`
+- **Task:** User: the first prompt line "gets lost" on a live SSH host — it shares the banner/prompt line (`(bglick@cc-login-test3...) Sign in via browser:`). Request: start the default prompt with a leading blank line when `[qr] enabled = false`.
+- **Decisions & Rationale:** `render_prompt_message()` default branch now prepends `"\n"` via `const char *lead = cfg->qr_enabled ? "" : "\n";` + a leading `%s` in BOTH snprintf formats (direct-link and plain-URL branches). Config-driven and deterministic: `prompt_buf` is rendered before the QR block is emitted (Step 4b), and the rendered result still passes the line-by-line `is_safe_rendered_prompt()` check (a leading empty line is safe). When the QR code is enabled the leading blank line stays omitted — the QR block's bottom vertical quiet zone already separates art from the "Sign in via browser:" line. Edge case (QR enabled but rendering fails → no leading blank line) accepted: rare, non-fatal debug-logged path, back to the prior display.
+- **Gotchas & Lessons:** (a) PAM keyboard-interactive clients print PAM_TEXT_INFO without a leading newline, so the FIRST rendered line lands on the host-banner line — any future first-line prompt reword must keep the leading `\n` when QR is off. (b) `test_prompt_rendering`: all six default-case expectations re-pinned with a leading `"\n"`; NEW pin `def_qr_cfg` (fresh config, `qr_enabled = 1`) asserts the NO-leading-newline output so both branches stay pinned; the escape-rejection tests below still use the shared `def_cfg` (QR off) and are unaffected. (c) Wording now quoted in: shipped-config `[prompt]` comment, `docs/getting-started.md` [prompt] sample (both show the leading blank line + note), CHANGELOG 0.3.4 prompt bullet. Examples' `[prompt]` blocks do NOT quote the rendered layout → untouched; e2e conf uses a custom `init_message` → untouched.
+- **Verification:** PASSED — the `run_commands` wrapper recovered mid-session: local `clang-format --dry-run --Werror src/*.c include/*.h tests/*.c` clean (it flagged one bin-packing nit in the new `def_qr_cfg` call — fixed), `make check-scrub` OK, and the ubuntu:24.04 Docker CI-mirror gate: gcc zero-warning build + 62/62 CMocka, clang zero-warning build + 62/62 CMocka, clang-tidy clean, `make test-sanitize CC=clang` 62/62 → `CI_MIRROR_GATE_ALL_PASS`. Remaining: push + GitHub CI, then `v0.3.4` tag (user authority).
+### 2026-11-17 — Sign-in prompt rebased: new default layout + compact expiry units + shipped config/examples on built-in default
+- **Task:** User: "rebase the default prompts to be more user friendly" with an explicit mock layout (direct link up top, `Manual entry: <url>  |  Code: <code>` line, blank line, `Waiting for approval (expires in 2m; auto-completes on sign-in).`). Scope confirmed by user: rebase built-in default AND shipped config + examples; compact expiry units ("15m"/"2m"/"1h").
+- **Decisions & Rationale:** (a) `format_expiry_seconds()` now renders compact units: `45s` (<60s), `Nm` (rounded-up minutes <1h), `Nh [Mm]` (>=1h, total-minutes round-up preserved). Used by BOTH the default status clause and the `{expiry}` token, so custom templates get compact units too. (b) Built-in default in `render_prompt_message()`: with a distinct `url_complete` → "Sign in via browser:\n  <url_complete>\n\nManual entry: <url>  |  Code: <code>\nWaiting for approval<clause>\n"; else "Sign in via browser:\n  URL:  <url>\n  Code: <code>\n\nWaiting for approval<clause>\n". Clause: show_expiry && known window → " (expires in 15m; auto-completes on sign-in)."; show_expiry off OR unknown window → "; auto-completes on sign-in." — the auto-completes note is now ALWAYS present. `status_clause[64]` (was `expiry_clause[48]` — the clause grew: "(expires in 1h 59m; auto-completes on sign-in)." fits). (c) Shipped `config/pam_oidc_device.conf` + all three `examples/*.conf` now leave `init_message` UNSET (commented-out sample + full placeholder docs in its place) so they render the new built-in layout — the conditional direct-link/manual-entry structure is NOT expressible in a single template: `{url_complete}` falls back to `{url}` when absent (duplicate-URL line) and `{expiry}` → "(; auto-completes...)" when unknown. `tests/e2e/pam_oidc_device.e2e.conf` kept its `[E2E Sandbox]` custom template deliberately (exercises the custom-template path end-to-end). (d) `Press [Enter] to begin...` stays the separate `PAM_PROMPT_ECHO_ON` flush prompt (Step 4c) — NOT embedded in the PAM_TEXT_INFO (would double-print; the round-trip is what flushes the text to OpenSSH keyboard-interactive).
+- **Gotchas & Lessons:** (a) The deliberate blank line between the sign-in block and status line reverses the 2026-11-10 "no internal blank line" compactness decision — the user's new mock wins; the QR bottom quiet zone still separates art from the header line. (b) Wording now quoted in: `include/pam_oidc_device.h` show_expiry field doc, `docs/getting-started.md` [prompt] sample (now shows the full rendered default), shipped-config show_expiry comment, CHANGELOG 0.3.4 `### Changed`. Grep targets for future prompt-wording changes: "Sign in via browser", "Manual entry:", "auto-completes on sign-in", "expires in". (c) The `run_commands` wrapper intermittently broke mid-session (whole JSON array executed as one literal string, `[cmd]: command not found`) — retry or use the editor/search tools; it may self-recover.
+- **Verification:** PENDING at log time: local `clang-format --dry-run --Werror` (src/tests/include), then the ubuntu:24.04 CI-mirror container gate (gcc & clang zero-warning builds, CMocka suite incl. re-pinned `test_prompt_rendering` expectations, clang-tidy, ASan/UBSan/LSan). `test_prompt_rendering` pins all four default cases (direct/plain × expiry on/off/unknown) + `{expiry}` 900s→"15m", 3600s→"1h", 0→empty.
+- **Follow-ups / Open Items:** None. (The v0.3.4 release-tag task from the audit context is still open pending user confirmation.)
+
+### 2026-11-17 — Third independent review: full removal of in-prompt host display (F1) + PAM_RHOST corrections
+- **Task:** Address two findings: (F1, HIGH residual) the hostname in the prompt reaches the
+  ssh *initiator* (the attacker in device-code phishing), not the approving victim — the
+  reviewer directed that the host-display prompt options be removed *entirely*, with the
+  guidance changed to descriptive per-host OAuth client names and source-network limits;
+  (LOW docs) "PAM exposes no peer-address API" is factually wrong — sshd sets `PAM_RHOST`,
+  readable via `pam_get_item(PAM_RHOST)`; threat-model §8/§9, the prompt code comment, and
+  the v0.3.3 changelog all relied on the opposite claim.
+- **Decisions & Rationale:** Full removal: `config_t.show_host`, `[prompt] show_host` parsing
+  (a config containing the key now fails to load as an unknown key — fail-closed), the
+  `{host}` template token, the built-in default's host clause (wording reverts to
+  "Waiting for your approval; ..."), the `host` parameter of `render_prompt_message()`
+  (public-header signature), `sanitize_host_for_display()` + `PAM_OAUTH_HOST_DISPLAY_MAX`,
+  and the `gethostname()` block in `pam_sm_authenticate()` (`<unistd.h>` no longer needed in
+  pam_module.c). All shipped templates (config/, examples/{keycloak,entra_id,cilogon}.conf,
+  tests/e2e conf) demoted to host-free wording. A template still referencing `{host}` now
+  renders the literal text (consistent with existing unknown-token behavior) — documented in
+  the CHANGELOG upgrade note. PAM_RHOST correction: the source *is* identifiable; the real
+  in-module scope boundary for per-source rate limiting is process isolation (each PAM
+  invocation is a separate sshd worker with no shared state) — restated in threat-model
+  §8/§9, getting-started §4, the code comment, and a [Unreleased] Documentation erratum
+  (the v0.3.3 entry is historical and was not rewritten, per the standing invariant). New §8
+  guidance: register one descriptive OAuth client per host/cluster (e.g. "ssh:db-prod-3") so
+  the IdP's *approval page* — the only surface the victim reads — names the machine; limit
+  device-flow sign-ins by source network; privileged accounts get a second factor on the
+  approval session + alerts on new source addresses. Caveat documented: on console logins
+  PAM_RHOST is the local host name — identifying context, not a trusted input.
+- **Gotchas & Lessons:** The v0.3.3 prompt-based mitigation repeated the same audience flaw
+  as the original 0.3.2 "show client context in the prompt" recommendation: anything
+  rendered into the ssh terminal is read by the *attacker* in this attack. Before adding
+  user-facing mitigation for an attack where the attacker holds a terminal session, ask who
+  actually reads the output. Also: bulk C-test rewrites (many call-signature + expected-string
+  edits with subtle indentation) are more reliable as a count-asserted Python `str.replace`
+  script than many hand-matched editor calls; the heredoc `python3 -` form mangled multi-line
+  literals, so write the script to a file instead.
+- **Verification:** All gates green in the CI-mirror `ubuntu:24.04` container: gcc &
+  clang zero-warning builds, 62/62 CMocka tests under both compilers (63 minus the
+  removed `test_sanitize_host_for_display`), `clang-tidy` clean, `make test-sanitize
+  CC=clang` (ASan/UBSan/LSan) 62/62, `make lint` (clang-format → clang-tidy → cppcheck →
+  flawfinder → scrub) OK, local `make check-scrub` OK, `bash -n` on the e2e script OK.
+  `make sandbox` (e2e-sandbox CI job) not re-run locally: the harness asserts no prompt
+  text (verified by grep) and the conf change is wording-only; CI will confirm.
+- **Follow-ups / Open Items:** Close F1 + the PAM_RHOST finding externally (alongside the
+  three prior findings from the second review session).
+### 2026-11-17 — Second independent review: log-escaper silent drop, e2e trap residue, non-ASCII hostname lockout
+- **Task:** Address three review findings: (1) `pam_oauth_log()` dropped a log line silently
+  when its escape buffer allocation failed; (2) the e2e EXIT trap never removed the
+  `conf.uidrange.{orig,tmp}` config copies (0700 workdir kept credential-bearing copies);
+  (3) a hostname containing non-ASCII bytes made the rendered-prompt safety check reject the
+  prompt, failing *every* login while `show_host` was on (the default).
+- **Decisions & Rationale:** (1) No-silent-drop discipline: on `vsnprintf` failure or
+  `malloc` failure, scrub the rendered `line` buffer and emit a static
+  "pam_oidc_device: log line dropped (...)" marker via `pam_syslog` — the audit trail
+  records that a line was attempted; the untrusted content is withheld. (2) Trap now removes
+  both backup pairs (`conf.uid0.*` + `conf.uidrange.*`). (3) The hostname is *display-only
+  context, not an authorization input* (set by root on the host; per-login attacker control
+  is not a threat) — so it is sanitized at the source instead of failing closed: new
+  `sanitize_host_for_display()` (`src/pam_module.c`, declared in the public header following
+  the established test-export pattern) keeps only printable ASCII, caps at
+  `PAM_OAUTH_HOST_DISPLAY_MAX` (64), and `pam_sm_authenticate()` falls back to `(unknown)`
+  when nothing printable remains. The fail-closed `is_safe_rendered_prompt()` check is
+  retained as defense-in-depth for the template, provider URL(s), and user code — the
+  existing test asserting raw non-printable hostnames still fail `render_prompt_message()`
+  was kept, with its comment updated.
+- **Gotchas & Lessons:** fail-closed is appropriate for *attacker-influenced* prompt content
+  (template/URL/code) but wrong for *local display-only* data (hostname): the safety
+  invariant (no unsafe bytes reach the terminal) can be met by sanitizing at the source.
+  Test-exported helpers are declared in `include/pam_oidc_device.h` (same as
+  `is_safe_terminal_string`, `render_prompt_message`) — no separate test shim.
+- **Verification:** `make check-scrub` + e2e `bash -n` pass locally (macOS); full
+  gcc/clang build+test, clang-tidy, sanitizer, and `make lint` gates running in the
+  `ubuntu:24.04` CI-mirror container (see follow-up). New `test_sanitize_host_for_display`
+  (ASCII passthrough, UTF-8/control-byte drop, 64-char cap, tight-dst cap, NULL/zero-cap
+  inputs) registered after `test_prompt_rendering`.
+- **Follow-ups / Open Items:** confirm container gate run green; docs updated (threat-model
+  §1, getting-started + conf `show_host` comments, CHANGELOG [Unreleased] "Fixed").
+
+
+### 2026-11-17 — Independent review: fail-closed uid guards + HTTPS-only `[oauth] proxy` + upgrade notes
+- **Task:** Address two independent-review MEDIUM findings: (1) uid-0 / system-UID
+  guards skipped when `getpwnam_r()` errors; (2) upgrade from ≤0.3.2 breaks on
+  required `claim_regex`, default-deny UIDs 0–999, and disabled env-var proxies.
+- **Decisions & Rationale:** (1) Implemented as a three-state lookup in
+  `verify_user_access()` (`PWNAM_FOUND`/`PWNAM_NOT_FOUND`/`PWNAM_ERROR`):
+  not-found still skips both gates (a name with no local account cannot hold a
+  local uid; the user lists decide), while a lookup *error* (ERANGE,
+  NSS/LDAP outage) is refused fail-closed by each active gate with an
+  actionable log line naming the errno and the config key that disables the
+  gate. The reviewer's finding was taken against the committed baseline (HEAD)
+  — the working tree already carries the fix; re-verified after clang-format.
+  (2) The explicit proxy mitigation is the new `[oauth] proxy` key:
+  HTTPS-only (validated by `is_valid_https_url`, which also rejects embedded
+  userinfo — no proxy credentials), parsed in `load_config()` with
+  duplicate-key rejection, threaded through `http_request()` and
+  `discovery_probe_pkce()` (all four call sites in `pam_module.c`, 11 test
+  call sites); when unset, `CURLOPT_PROXY` is set to `""` so libcurl never
+  falls back to the caller's `*_proxy` env vars. Added "### Upgrade notes
+  (from ≤ 0.3.2)" to `CHANGELOG.md` [Unreleased] covering all three breakers
+  (all three shipped in 0.3.3; the proxy key is the new mitigation), plus a
+  commented `proxy` sample in `config/pam_oidc_device.conf` and the
+  `[oauth]` row of the getting-started config table.
+- **Gotchas & Lessons:** `PWNAM_ERROR` cannot be induced deterministically in
+  the CMocka harness (needs a real NSS/DB outage or ERANGE), so that branch is
+  code-reviewed only; the `PWNAM_NOT_FOUND` branch *is* unit-tested (unknown
+  name → uid gates skip, lists decide). A sed bulk-edit of the 11 test call
+  sites once clobbered a doc comment (missing `/**` opener) — caught by the
+  gcc test build (`stray '@' in the program`); recovered via `git checkout` +
+  targeted editor edits. `init_config_defaults()` needed no change: it
+  `memset`s to zero first, matching `load_config()`, so `proxy` defaults to
+  `""` in both.
+- **Verification:** PASSED in `ubuntu:24.04` CI-mirror container: gcc + clang
+  builds zero-warning; 62/62 CMocka tests under both compilers (was 58/58;
+  +1 proxy test + pre-existing adds); `clang-tidy src/*.c -- -Iinclude
+  -D_GNU_SOURCE` clean; `clang-format --dry-run --Werror` clean (one
+  in-container `clang-format -i` pass on wrap-width fixes); `make
+  test-sanitize CC=clang` (ASan/UBSan/LSan) 62/62; macOS-native `make
+  check-scrub` + `check-licenses` clean.
+- **Follow-ups / Open Items:** none — both findings closed; changes uncommitted
+  (8 files: CHANGELOG, config, header, 4 src, test_suite).
+
 ### 2026-11-17 — `discovery_probe_pkce()` provider-JSON scrub gap closed (comprehensive review finding)
 - **Task.** Comprehensive review flagged the one Low finding: `discovery_probe_pkce()` (src/http.c)
   released the provider-parsed discovery document with bare `json_object_put()` on two exit paths
