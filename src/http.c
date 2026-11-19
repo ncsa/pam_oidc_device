@@ -362,10 +362,11 @@ static void scrub_and_free_slist(struct curl_slist *headers) {
  * @brief Executes an HTTP GET or POST request using libcurl.
  *
  * Configures headers (`Content-Type`, `Accept`, `Authorization: Bearer`), enforces
- * strict TLS/HTTPS transport security (certificate validation via
- * `CURLOPT_SSL_VERIFYPEER`/`CURLOPT_SSL_VERIFYHOST` and a TLS >= 1.2 minimum via
- * `CURLOPT_SSLVERSION`), disables signal handling for multi-threaded safety,
- * logs HTTP transport tracing at LOGLEVEL_VERBOSE, sets request timeouts, and captures response codes.
+ * strict TLS/HTTPS transport security on the provider connection (certificate validation
+ * via `CURLOPT_SSL_VERIFYPEER`/`CURLOPT_SSL_VERIFYHOST` and a TLS >= 1.2 minimum via
+ * `CURLOPT_SSLVERSION`; the TLS leg to a configured proxy is pinned the same way through
+ * the separate `CURLOPT_PROXY_SSL_*` options), disables signal handling for multi-threaded
+ * safety, logs HTTP transport tracing at LOGLEVEL_VERBOSE, sets request timeouts, and captures response codes.
  *
  * @param[in]  method       HTTP method ("GET" or "POST").
  * @param[in]  url          Target URL endpoint.
@@ -373,7 +374,8 @@ static void scrub_and_free_slist(struct curl_slist *headers) {
  * @param[in]  bearer_token Access token for Authorization header (optional).
  * @param[in]  proxy        Optional outbound HTTPS proxy URL (validated at config load);
  *                          empty/NULL routes traffic directly. In either case the
- *                          `*_proxy` environment variables are never honored.
+ *                          `*_proxy` and `no_proxy`/`NO_PROXY` environment
+ *                          variables are never honored.
  * @param[in]  timeout_ms   Request timeout limit in milliseconds.
  * @param[out] resp         Pointer to response object receiving result; zero-initialized by this
  *                          function before any return (success or error), so callers may always
@@ -509,16 +511,36 @@ int http_request(const char *method, const char *url, const char *postfields, co
     /*
      * Proxy handling: when the admin has explicitly configured an [oauth] proxy
      * (an https:// URL, validated at config load), route provider traffic through
-     * it; the strict TLS validation options below apply to the proxy connection
-     * as well. Otherwise the proxy is explicitly cleared: an empty string
-     * overrides libcurl's fallback to the *_proxy environment variables, and a
-     * PAM module runs in the calling user's environment under setuid, so those
-     * variables are user-controlled: honoring them would let the caller steer
-     * this module's HTTPS traffic. The proxy URL (which a third-party proxy can
-     * observe) is deliberately kept out of the request trace above.
+     * it; the TLS leg to the proxy is pinned separately below, because the
+     * provider-connection TLS options do not cover it. Both proxy routing options
+     * are always set explicitly, because the PAM module runs in the calling user's
+     * environment under setuid and libcurl otherwise falls back to that
+     * environment: an empty CURLOPT_PROXY string
+     * overrides the *_proxy environment variables, and an explicitly set empty
+     * CURLOPT_NOPROXY string suppresses the no_proxy/NO_PROXY environment
+     * variables (libcurl only consults them when CURLOPT_NOPROXY was never
+     * set). Honoring any of them would let the caller steer this module's
+     * HTTPS traffic or bypass a configured proxy. The proxy URL (which a
+     * third-party proxy can observe) is deliberately kept out of the request
+     * trace above.
      */
     const char *const proxy_url = (proxy != NULL && proxy[0] != '\0') ? proxy : "";
     CHECK_SETOPT(CURLOPT_PROXY, proxy_url);
+    CHECK_SETOPT(CURLOPT_NOPROXY, "");
+#if LIBCURL_VERSION_NUM >= 0x073400
+    /* CURLOPT_PROXY_SSL_* governs only the TLS session libcurl negotiates to
+     * the proxy; the CURLOPT_SSL_* options further down configure only the
+     * provider (endpoint) connection. Pin certificate validation and the
+     * TLS >= 1.2 minimum on that leg too, so the admin-configured proxy is held
+     * to the same bar as the provider. The options are always set (they are
+     * inert when no proxy connection is made). The guard mirrors the
+     * CURLOPT_SSLVERSION guard below: the options require libcurl >= 7.52 while
+     * every supported distro ships >= 7.61, so it is retained only for source
+     * portability to older releases. */
+    CHECK_SETOPT(CURLOPT_PROXY_SSL_VERIFYPEER, 1L);
+    CHECK_SETOPT(CURLOPT_PROXY_SSL_VERIFYHOST, 2L);
+    CHECK_SETOPT(CURLOPT_PROXY_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
+#endif
     if (proxy_url[0] != '\0') {
         pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                       "HTTPS traffic will be routed via the configured [oauth] proxy");
@@ -533,7 +555,9 @@ int http_request(const char *method, const char *url, const char *postfields, co
 #endif
 
     /* Enforce strict TLS certificate validation and a TLS >= 1.2 minimum protocol
-     * version (defense in depth on top of the HTTPS-only restriction above). */
+     * version on the provider connection (defense in depth on top of the HTTPS-only
+     * restriction above); the proxy connection's TLS leg is pinned separately via
+     * the CURLOPT_PROXY_SSL_* options in the proxy block above. */
     CHECK_SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
     CHECK_SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
 #if LIBCURL_VERSION_NUM >= 0x072000

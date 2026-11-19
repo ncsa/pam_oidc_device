@@ -35,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.4, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.5, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).

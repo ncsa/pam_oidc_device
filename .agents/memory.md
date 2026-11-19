@@ -198,6 +198,72 @@
 
 ## Interaction Log (newest first)
 
+### 2026-11-19 — Bumped project to 0.3.5; consolidated/audited CHANGELOG post-0.3.4 state
+- **Task:** User: make the project reference version 0.3.5; refactor the CHANGELOG so all changes after 0.3.4 live under `[0.3.5]` with today's date (combine `[Unreleased]` and `[0.3.5]`); clean up anything added after 0.3.4 that was later removed.
+- **Decisions & Rationale:** The "combine" was already complete at commit time: `1120f40` created `## [0.3.5] - 2026-11-19` with both post-release fixes (ERANGE passwd buffer, NO_PROXY bypass) and reverted the `fb81b10` rewrite of the *released* 0.3.4 section — that rewrite was the only "added since 0.3.4, later removed" artifact, and it is fully reverted. `4c2dbe2` then added the third bullet (proxy TLS pinning). Verified: the 0.3.4 section is byte-identical to `git show v0.3.4:CHANGELOG.md`, no `[Unreleased]` section remains, and all three 0.3.5 bullets match live code (http.c `CURLOPT_NOPROXY` + `CURLOPT_PROXY_SSL_*` setopts; identity.c `PWNAM_BUF_INITIAL_LEN`=4096 / `PWNAM_BUF_MAX_LEN`=1 MiB with `sysconf(_SC_GETPW_R_SIZE_MAX)` hint; test pins all three). No CHANGELOG text edits were required. The version bump touched exactly the five synced locations: `include/metadata.h` (`MODULE_VERSION`), `Makefile` (`VERSION ?=`), `packaging/pam_oidc_device.spec` (`%global mod_version`), `packaging/gen-changelog.py` (`default_ver` fallback), `.agents/context.md` (project identity). No changelog bullet for the `docs/developer/review.md` sync commit (`5ee65d5`) — internal-doc maintenance is a "trivial edit" per log rules; the Makefile `-ldl` test-link change (EL8 glibc < 2.34) is subsumed by the ERANGE bullet's "scripted `getpwnam_r()` override" mention.
+- **Verification:** `python3 packaging/gen-changelog.py` now emits `* Thu Nov 19 2026 … - 0.3.5-1` (3 bullets) ahead of `0.3.4-1`. Repo-wide grep: no `0.3.4` references remain outside CHANGELOG history, this memory file, and gitignored stale build artifacts (`src/*.o`, `pam_oidc_device.so` — `make clean` territory). No code changes this session beyond the Makefile version literal and docs, so no gate re-run was performed; the next Linux/CI build will pick up the new literal.
+- **Follow-ups / Open Items:** none (bump not yet committed/tagged at log time — user to commit; CI gates confirm on push).
+
+### 2026-11-19 — Proxy TLS leg explicitly pinned to cert validation + TLS >= 1.2 (review doc §3E)
+- **Task:** `src/http.c`'s comment claimed the strict provider-side TLS options also applied to the proxy connection, but `CURLOPT_SSL_VERIFYPEER`/`SSL_VERIFYHOST`/`SSLVERSION` govern only the endpoint leg; the proxy leg's cert checks were libcurl-default-on, and its TLS 1.2 minimum was never enforced.
+- **Decisions & Rationale:** `http_request()` now sets `CURLOPT_PROXY_SSL_VERIFYPEER=1`, `CURLOPT_PROXY_SSL_VERIFYHOST=2`, and `CURLOPT_PROXY_SSLVERSION` to `CURL_SSLVERSION_TLSv1_2` on every request, behind the same `#if LIBCURL_VERSION_NUM >= 0x073400` guard as the provider-side `CURLOPT_SSLVERSION` (options exist since libcurl 7.52; EL8 ships 7.61.1). Comment/doc claims corrected: `src/http.c` setopt block comment and `docs/developer/review.md` §3E now state the proxy TLS pin explicitly.
+- **Gotchas & Lessons:** the test suite's weak-symbol `curl_easy_setopt` override was extended to capture the `CURLOPT_PROXY_SSL_*` values; `test_http_request_proxy_routing` now asserts the pins on BOTH the with-proxy and without-proxy paths (pins are set unconditionally, so they must hold even when no proxy is configured).
+- **Verification:** ubuntu:24.04 CI-mirror container: gcc and clang builds zero-warning, CMocka suite green under gcc and clang, ASan+UBSan+LSan suite green, clang-tidy gate clean (user-committed as `4c2dbe2`).
+- **Follow-ups / Open Items:** none.
+
+### 2026-11-19 — Review finding: large passwd entries lock out legitimate accounts (LOW, HARDENING)
+- **Task:** `verify_user_access()` resolved the requesting uid with a fixed 4096-byte
+  stack `getpwnam_r()` buffer; an account with a larger passwd record (LDAP/SSSD long
+  GECOS/home paths) hit `ERANGE` and, with either uid guard on, failed closed → lockout.
+  Second half of the v0.3.3 recommendation (fail-closed on lookup error landed in
+  0.3.3/0.3.4; growing-buffer retry was the deferred half).
+- **Decisions & Rationale:** Heap buffer starting at `sysconf(_SC_GETPW_R_SIZE_MAX)`
+  (4 KiB floor — glibc reports -1) doubling on `ERANGE` via `realloc` up to
+  `PWNAM_BUF_MAX_LEN` (1 MiB), then reporting a genuine lookup error: persistent ERANGE
+  and OOM still fail the uid gates closed, so the security default is unchanged; the
+  cap terminates a pathological backend. Constants + rationale documented in
+  `src/identity.c`; doc comments updated ("ERANGE from the internal buffer" was no
+  longer the expected failure mode).
+- **Gotchas & Lessons:** `PWNAM_ERROR` became deterministically testable via a weak
+  `getpwnam_r()` override in `tests/test_suite.c` that forwards unscripted calls to the
+  real NSS lookup with `dlsym(RTLD_NEXT, "getpwnam_r")` (RTLD_DEFAULT would re-find the
+  executable's own weak symbol → recursion); that is why the test link lines gained
+  `-ldl` (EL8 glibc < 2.34; no-op stub elsewhere). The fake's "ERANGE N times then
+  FOUND with uid 1500" script makes the regression pin platform-independent
+  (exactly 3 intercepted calls). Realloc-failure path deliberately leaves `pw_buf`
+  pointing at the original allocation (realloc leaves it intact on failure) so the
+  single `free()` after the loop cannot double-free.
+- **Verification:** PASSED in `ubuntu:24.04` CI-mirror container (`pamed-review`):
+  gcc + clang builds zero-warning with `-Werror`; 79/79 CMocka tests under both
+  compilers (was 78; +1 `test_verify_user_access_large_entry`); `make
+  test-sanitize CC=clang` 79/79; `make lint` (clang-format/clang-tidy/cppcheck/
+  flawfinder/memory-scrub) clean; `make check-licenses` clean on the macOS host.
+- **Follow-ups / Open Items:** none.
+
+### 2026-11-19 — Review finding: NO_PROXY env bypass of configured proxy (LOW, CONFIRMED)
+- **Task:** `http_request()` set `CURLOPT_PROXY` but not `CURLOPT_NOPROXY`, so libcurl read
+  `no_proxy`/`NO_PROXY` from the environment — user-controlled under a setuid PAM caller (e.g.
+  `su`), able to bypass a configured `[oauth] proxy`.
+- **Decisions & Rationale:** Added `CHECK_SETOPT(CURLOPT_NOPROXY, "")` next to the existing
+  `CURLOPT_PROXY` setopt in `src/http.c`. Empirically verified on libcurl 8.5.0 (CI version)
+  with a two-case probe (listener on 127.0.0.1 + `NO_PROXY=*`): unset NOPROXY → proxy bypassed
+  (direct connect, rc=0); explicitly empty NOPROXY → proxy used (listener connected, rc=56 via
+  non-proxy listener). Backed by libcurl source: the `no_proxy` env is consulted only when
+  `CURLOPT_NOPROXY` was never set — an explicitly set empty string counts as "set", so the env
+  fallback is suppressed (stable behavior since no_proxy support landed; well above our 7.61
+  minimum).
+- **Gotchas & Lessons:** The libcurl man-page wording ("not set or is empty") is misleading —
+  libcurl distinguishes "option never set" from "option set to empty string"; always verify
+  setopt semantics empirically before relying on documented edge cases.
+- **Verification:** Extended `test_http_request_proxy_routing` (`tests/test_suite.c`): weak
+  `curl_easy_setopt` override now captures `CURLOPT_NOPROXY` (new
+  `g_fake_curl_noproxy`, reset in `reset_fake_curl_transport()`); asserts `""` for both the
+  no-proxy and configured-proxy cases. Wording corrected (the old "never honored" claim
+  covered only `*_proxy`): `src/http.c` (both the doc comment and the inline proxy comment),
+  `include/pam_oidc_device.h`, `config/pam_oidc_device.conf`, `CHANGELOG.md` 0.3.4 entry
+  (proxy paragraph + test paragraph). 0.3.3 changelog entry left as history.
+- **Follow-ups / Open Items:** none.
+
 ### 2026-11-18 — Review finding M-3: document the claims-only / no-JWKS trust model for operators
 - **Task:** Address review finding 5 (M-3) — document clearly for operators in `SECURITY.md`/threat-model that JWT handling is **claims-only** and the signature is intentionally NOT verified, that there is **no JWKS signature path**, and that offline ID-token consumption would make this High severity.
 - **Decisions & Rationale:** Trust for the returned token rests entirely on (1) enforced HTTPS/TLS 1.2+ transport and (2) the provider's UserInfo endpoint — the module's single authoritative validity/signature checkpoint. `verify_token_metadata()` and `jwt_extract_claim_string()` (`src/jwt.c`) are claims-only inspectors; no local signature verification. `jwks_url`/`introspection_endpoint` are parsed+HTTPS-validated but **unused** (load-time notice). If a deployment ever consumes ID-token claims directly/offline, this escalates to **High** and requires a JWKS/RFC 7517 signature path (module does not provide it). Kept the documented-jargon aligned with the standing invariant: do NOT overclaim "zero-trust"/"replay protection."

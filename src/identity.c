@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /**
  * @brief Case-insensitive ASCII string comparison helper.
@@ -221,6 +222,16 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
     return matched;
 }
 
+/* The uid lookup in verify_user_access() runs getpwnam_r() against a heap buffer that
+ * starts at PWNAM_BUF_INITIAL_LEN (or the platform's _SC_GETPW_R_SIZE_MAX hint, when it is
+ * defined and sane) and doubles on ERANGE up to PWNAM_BUF_MAX_LEN, so that accounts whose
+ * passwd entry exceeds any fixed buffer (LDAP/SSSD records with long GECOS strings or home
+ * paths) are not refused. 1 MiB far exceeds any realistic passwd entry, so the cap also
+ * bounds a pathological backend that would otherwise report ERANGE indefinitely; a record
+ * that still does not fit there is reported as a genuine lookup error. */
+#define PWNAM_BUF_INITIAL_LEN 4096
+#define PWNAM_BUF_MAX_LEN 1048576 /* 1 MiB */
+
 /**
  * @brief Enforces local account allow/deny list controls against the requesting PAM username.
  *
@@ -235,9 +246,9 @@ int verify_claim(const char *pam_user, const char *raw_claim, const config_t *cf
  *
  * The requesting account is resolved to a numeric UID once, up front. A name that resolves
  * to no local account is simply not subject to the UID gates (it cannot hold a local uid);
- * but if the lookup *itself* fails (e.g. `ERANGE` from the internal buffer, or an NSS/DB
- * outage), the uid cannot be established and every active UID gate fails closed with a
- * refusal, rather than being silently skipped.
+ * but if the lookup *itself* fails (out of memory, a backend that keeps reporting `ERANGE`
+ * past the buffer-growth cap, or an NSS/DB outage), the uid cannot be established and every
+ * active UID gate fails closed with a refusal, rather than being silently skipped.
  *
  * @param[in] pam_user  Target POSIX system username.
  * @param[in] cfg       Module configuration parameters containing the account lists and
@@ -259,9 +270,10 @@ int verify_user_access(const char *pam_user, const config_t *cfg, pam_handle_t *
      *                     success with no record, or an NSS module signalled ENOENT).
      *                     Such a name cannot hold a local uid-0 or in-range uid, so
      *                     neither gate applies and the user lists still decide.
-     *   PWNAM_ERROR:      the lookup itself failed (ERANGE, an NSS/DB outage, ...). The
-     *                     account's uid cannot be established, so each active gate fails
-     *                     closed instead of being silently skipped. */
+     *   PWNAM_ERROR:      the lookup itself failed (out of memory, persistent ERANGE past
+     *                     the buffer cap, an NSS/DB outage, ...). The account's uid cannot
+     *                     be established, so each active gate fails closed instead of being
+     *                     silently skipped. */
     enum { PWNAM_FOUND, PWNAM_NOT_FOUND, PWNAM_ERROR } pwnam_state;
     uid_t acct_uid = 0;
     int lookup_errno = 0;
@@ -271,22 +283,59 @@ int verify_user_access(const char *pam_user, const config_t *cfg, pam_handle_t *
     } else {
         struct passwd pw;
         struct passwd *pw_res = NULL;
-        char pw_buf[4096];
-        int rc = getpwnam_r(pam_user, &pw, pw_buf, sizeof(pw_buf), &pw_res);
-        if (rc == 0) {
-            if (pw_res != NULL) {
-                pwnam_state = PWNAM_FOUND;
-                acct_uid = pw_res->pw_uid;
-            } else {
-                pwnam_state = PWNAM_NOT_FOUND;
-            }
-        } else if (rc == ENOENT) {
-            /* Some NSS backends report "no such account" via errno instead of a NULL
-             * result; treat it identically to the success-with-no-record case. */
-            pwnam_state = PWNAM_NOT_FOUND;
-        } else {
+        char *pw_buf = NULL;
+
+        /* NSS backends (LDAP/SSSD) can hold passwd entries larger than any fixed stack
+         * buffer can hold: a long GECOS string or home path pushes the record past
+         * PWNAM_BUF_INITIAL_LEN and getpwnam_r() reports ERANGE for it. Refusing on that
+         * raw error would lock out every legitimate account with a large entry while any
+         * uid gate is active, so the lookup starts at the platform's
+         * _SC_GETPW_R_SIZE_MAX hint (PWNAM_BUF_INITIAL_LEN where the constant is
+         * undefined, e.g. glibc) and retries ERANGE with a doubling heap buffer up to
+         * PWNAM_BUF_MAX_LEN. A record that still does not fit there (or a backend that
+         * keeps reporting ERANGE) is not a realistic passwd entry: the lookup is
+         * reported as a genuine error and each active uid gate keeps its fail-closed
+         * behavior. */
+        long hint = sysconf(_SC_GETPW_R_SIZE_MAX);
+        size_t pw_buf_len = (hint > 0 && hint <= PWNAM_BUF_MAX_LEN) ? (size_t)hint : PWNAM_BUF_INITIAL_LEN;
+        pw_buf = malloc(pw_buf_len);
+        if (pw_buf == NULL) {
             pwnam_state = PWNAM_ERROR;
-            lookup_errno = rc;
+            lookup_errno = ENOMEM;
+        } else {
+            int rc = 0;
+            do {
+                rc = getpwnam_r(pam_user, &pw, pw_buf, pw_buf_len, &pw_res);
+                if (rc != ERANGE || pw_buf_len >= PWNAM_BUF_MAX_LEN) {
+                    break;
+                }
+                size_t next_len = pw_buf_len * 2;
+                char *grown = realloc(pw_buf, next_len);
+                if (grown == NULL) {
+                    rc = ENOMEM;
+                    break;
+                }
+                /* On realloc failure the original allocation is still owned by pw_buf
+                 * and is released by the free() below. */
+                pw_buf = grown;
+                pw_buf_len = next_len;
+            } while (1);
+            free(pw_buf);
+            if (rc == 0) {
+                if (pw_res != NULL) {
+                    pwnam_state = PWNAM_FOUND;
+                    acct_uid = pw_res->pw_uid;
+                } else {
+                    pwnam_state = PWNAM_NOT_FOUND;
+                }
+            } else if (rc == ENOENT) {
+                /* Some NSS backends report "no such account" via errno instead of a NULL
+                 * result; treat it identically to the success-with-no-record case. */
+                pwnam_state = PWNAM_NOT_FOUND;
+            } else {
+                pwnam_state = PWNAM_ERROR;
+                lookup_errno = rc;
+            }
         }
     }
 

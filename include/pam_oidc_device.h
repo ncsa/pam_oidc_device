@@ -417,8 +417,8 @@ int parse_config_file(FILE *fp, config_t *cfg, pam_handle_t *pamh);
  * @param[in]  bearer_token Optional OAuth Bearer access token string for authorization.
  * @param[in]  proxy        Optional outbound HTTPS proxy URL (`https://host[:port]`,
  *                         validated at config load). Empty/NULL routes traffic directly.
- *                         In either case the `*_proxy` environment variables are
- *                         never honored.
+ *                         In either case the `*_proxy` and `no_proxy`/`NO_PROXY`
+ *                         environment variables are never honored.
  * @param[in]  timeout_ms   Request timeout period in milliseconds.
  * @param[out] resp         Pointer to http_response_t structure receiving response data.
  * @param[in]  loglevel     Active log verbosity level for HTTP transport tracing.
