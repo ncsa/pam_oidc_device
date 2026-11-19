@@ -33,6 +33,9 @@
 #include "../include/pam_oidc_device.h"
 
 /* clang-format off */
+#include <dlfcn.h>
+#include <errno.h>
+#include <pwd.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -61,8 +64,9 @@
  * http_request()/discovery_probe_pkce tests. Defining these global symbols in
  * the test executable redirects the calls made by the module code here
  * instead of into libcurl (no real transfer is ever performed):
- *  - curl_easy_setopt() records the TLS options and the proxy URL requested
- *    by http_request() and captures the WRITEFUNCTION/WRITEDATA pair so a
+ *  - curl_easy_setopt() records the TLS options, the proxy URL, the no-proxy
+ *    string, and the proxy-TLS options requested by http_request() and captures the WRITEFUNCTION/WRITEDATA
+ *    pair so a
  *    fake response body can be "received" by the module's write callback;
  *  - curl_easy_perform() returns `g_fake_curl_perform_rc` and, when a fake
  *    body is configured, invokes the captured write callback with it;
@@ -81,6 +85,14 @@ static long tls_opt_ssl_verifyhost;
 static int tls_opt_ssl_version;
 /** Last CURLOPT_PROXY value requested ("" when the proxy is explicitly cleared). */
 static char g_fake_curl_proxy[512];
+/** Last CURLOPT_NOPROXY value requested ("" when the no-proxy list is explicitly cleared). */
+static char g_fake_curl_noproxy[512];
+/** Last CURLOPT_PROXY_SSL_VERIFYPEER value requested (-1 if not yet set). */
+static long proxy_tls_opt_verifypeer = -1L;
+/** Last CURLOPT_PROXY_SSL_VERIFYHOST value requested (-1 if not yet set). */
+static long proxy_tls_opt_verifyhost = -1L;
+/** Last CURLOPT_PROXY_SSLVERSION value requested (-1 if not yet set). */
+static int proxy_tls_opt_version = -1;
 
 static CURLcode g_fake_curl_perform_rc = CURLE_OK;
 static long g_fake_curl_status_code = 0;
@@ -110,6 +122,7 @@ static void reset_fake_curl_transport(void) {
     g_fake_write_cb = NULL;
     g_fake_write_data = NULL;
     g_fake_curl_proxy[0] = '\0';
+    g_fake_curl_noproxy[0] = '\0';
     for (int i = 0; i < FAKE_TRANSPORT_MAX_STEPS; i++) {
         g_fake_steps_bodies[i] = NULL;
         g_fake_steps_codes[i] = 0;
@@ -135,6 +148,85 @@ static void script_fake_responses(const char *const bodies[], const long codes[]
     g_fake_step_index = 0;
 }
 
+/*
+ * Weak/strong note: this override is deliberately a STRONG definition (unlike
+ * the curl fakes above). The sanitizer build links ASan's runtime into the test
+ * executable, and that runtime aliases its own weak __interceptor_getpwnam_r to
+ * getpwnam_r; two weak definitions in one executable resolve to the runtime's
+ * copy, silently bypassing this fake (the large-entry test then sees call count
+ * 0). A strong definition beats both the ASan alias and libc's shared-library
+ * definition, so module calls always land here; unscripted calls forward to the
+ * real NSS lookup via dlsym(RTLD_NEXT, "getpwnam_r"), so behavior stays
+ * identical either way.
+ *
+ * Weak override of getpwnam_r(), used exclusively by the verify_user_access()
+ * uid-gate tests. The host's real NSS database cannot deterministically provide
+ * a "passwd entry larger than the initial buffer" or a "persistent lookup
+ * failure", so those tests script the outcome. Unless a name is scripted, every
+ * call forwards to the real NSS lookup (resolved once via
+ * dlsym(RTLD_NEXT, "getpwnam_r")), so the rest of the suite sees /etc/passwd
+ * exactly as before. Scripted modes (g_fake_pwnam_mode):
+ *  - FAKE_PWNAM_ERANGE_THEN_FOUND: g_fake_pwnam_script_name gets
+ *    g_fake_pwnam_script_erange_calls ERANGE replies (regardless of the buffer
+ *    size offered) and then a fabricated FOUND record with uid
+ *    g_fake_pwnam_script_uid -- simulating an entry larger than the early
+ *    buffers (an LDAP/SSSD record with a long GECOS string or home path);
+ *  - FAKE_PWNAM_ERANGE_FOREVER: g_fake_pwnam_script_name gets ERANGE on every
+ *    call -- simulating a persistent backend failure; the module's
+ *    buffer-growth cap must terminate the retry loop.
+ * g_fake_pwnam_call_count counts intercepted calls for the scripted name.
+ */
+enum { FAKE_PWNAM_OFF, FAKE_PWNAM_ERANGE_THEN_FOUND, FAKE_PWNAM_ERANGE_FOREVER };
+typedef int (*fake_getpwnam_r_fn)(const char *, struct passwd *, char *, size_t, struct passwd **);
+static fake_getpwnam_r_fn g_fake_pwnam_real;
+static int g_fake_pwnam_mode;
+static char g_fake_pwnam_script_name[32];
+static int g_fake_pwnam_script_erange_calls;
+static uid_t g_fake_pwnam_script_uid;
+static int g_fake_pwnam_call_count;
+
+/** Resets the scripted getpwnam_r() state so individual tests never leak into each other. */
+static void reset_fake_pwnam_lookup(void) {
+    g_fake_pwnam_mode = FAKE_PWNAM_OFF;
+    g_fake_pwnam_script_name[0] = '\0';
+    g_fake_pwnam_script_erange_calls = 0;
+    g_fake_pwnam_script_uid = 0;
+    g_fake_pwnam_call_count = 0;
+}
+
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen, struct passwd **result) {
+    if (g_fake_pwnam_mode != FAKE_PWNAM_OFF && g_fake_pwnam_script_name[0] != '\0' &&
+        strcmp(name, g_fake_pwnam_script_name) == 0) {
+        g_fake_pwnam_call_count++;
+        if (g_fake_pwnam_mode == FAKE_PWNAM_ERANGE_FOREVER || g_fake_pwnam_script_erange_calls > 0) {
+            if (g_fake_pwnam_script_erange_calls > 0) {
+                g_fake_pwnam_script_erange_calls--;
+            }
+            *result = NULL;
+            return ERANGE;
+        }
+        pwd->pw_name = g_fake_pwnam_script_name;
+        pwd->pw_passwd = "";
+        pwd->pw_uid = g_fake_pwnam_script_uid;
+        pwd->pw_gid = g_fake_pwnam_script_uid;
+        pwd->pw_gecos = "";
+        pwd->pw_dir = "";
+        pwd->pw_shell = "";
+        *result = pwd;
+        return 0;
+    }
+    if (g_fake_pwnam_real == NULL) {
+        g_fake_pwnam_real = (fake_getpwnam_r_fn)dlsym(RTLD_NEXT, "getpwnam_r");
+    }
+    if (g_fake_pwnam_real != NULL) {
+        return g_fake_pwnam_real(name, pwd, buf, buflen, result);
+    }
+    /* The real NSS backend is unresolvable: report "no record", the outcome
+     * getpwnam_r() gives for an unknown name. */
+    *result = NULL;
+    return 0;
+}
+
 __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
     (void)curl;
     va_list args;
@@ -151,6 +243,15 @@ __attribute__((weak)) CURLcode curl_easy_setopt(CURL *curl, CURLoption option, .
     } else if (option == CURLOPT_PROXY) {
         const char *p = va_arg(args, const char *);
         snprintf(g_fake_curl_proxy, sizeof(g_fake_curl_proxy), "%s", (p != NULL) ? p : "");
+    } else if (option == CURLOPT_NOPROXY) {
+        const char *np = va_arg(args, const char *);
+        snprintf(g_fake_curl_noproxy, sizeof(g_fake_curl_noproxy), "%s", (np != NULL) ? np : "");
+    } else if (option == CURLOPT_PROXY_SSL_VERIFYPEER) {
+        proxy_tls_opt_verifypeer = va_arg(args, long);
+    } else if (option == CURLOPT_PROXY_SSL_VERIFYHOST) {
+        proxy_tls_opt_verifyhost = va_arg(args, long);
+    } else if (option == CURLOPT_PROXY_SSLVERSION) {
+        proxy_tls_opt_version = va_arg(args, int);
     } else if (option == CURLOPT_WRITEFUNCTION) {
         g_fake_write_cb = va_arg(args, test_write_cb);
     } else if (option == CURLOPT_WRITEDATA) {
@@ -1095,35 +1196,59 @@ static void test_http_request_enforces_tls_options(void **state) {
 }
 
 /**
- * @brief Unit test verifying http_request() proxy routing (CURLOPT_PROXY).
+ * @brief Unit test verifying http_request() proxy routing (CURLOPT_PROXY,
+ *        CURLOPT_NOPROXY, and the CURLOPT_PROXY_SSL_* options that pin the
+ *        proxy connection's TLS leg).
  *
- * The weak curl_easy_setopt override captures the requested proxy value.
- * When no proxy is configured, CURLOPT_PROXY must be set to the empty string
- * so libcurl never falls back to the caller's *_proxy environment variables
- * (user-controlled under a setuid PAM caller); a configured proxy must be
- * routed through verbatim.
+ * The weak curl_easy_setopt override captures the requested proxy, no-proxy,
+ * and proxy-TLS values. When no proxy is configured, CURLOPT_PROXY must be set
+ * to the empty string so libcurl never falls back to the caller's *_proxy
+ * environment variables (user-controlled under a setuid PAM caller), and in
+ * all cases CURLOPT_NOPROXY must be set to the empty string so the
+ * no_proxy/NO_PROXY environment variables never bypass the configured proxy;
+ * a configured proxy must be routed through verbatim. The TLS leg to the
+ * proxy is governed by the separate CURLOPT_PROXY_SSL_* options (the
+ * provider-connection CURLOPT_SSL_* options do not cover it), so certificate
+ * validation and a TLS >= 1.2 minimum must be pinned there on every request.
  *
  * @param[in,out] state CMocka test state context (unused).
  */
 static void test_http_request_proxy_routing(void **state) {
     (void)state;
     reset_fake_curl_transport();
+    proxy_tls_opt_verifypeer = -1L;
+    proxy_tls_opt_verifyhost = -1L;
+    proxy_tls_opt_version = -1;
 
     http_response_t resp;
     memset(&resp, 0, sizeof(resp));
 
-    /* No proxy configured: CURLOPT_PROXY is explicitly empty (env override). */
+    /* No proxy configured: CURLOPT_PROXY is explicitly empty (env override)
+     * and CURLOPT_NOPROXY is explicitly empty (no_proxy env bypass). */
     int rc = http_request("GET", "https://auth.example/token", NULL, NULL, NULL, 1000L, &resp, LOGLEVEL_NONE, NULL);
     assert_int_equal(rc, 0);
     assert_string_equal(g_fake_curl_proxy, "");
+    assert_string_equal(g_fake_curl_noproxy, "");
+#if LIBCURL_VERSION_NUM >= 0x073400
+    /* The proxy TLS leg is pinned on every request, proxy configured or not. */
+    assert_int_equal(proxy_tls_opt_verifypeer, 1);
+    assert_int_equal(proxy_tls_opt_verifyhost, 2);
+    assert_int_equal(proxy_tls_opt_version, (int)CURL_SSLVERSION_TLSv1_2);
+#endif
     free_http_response(&resp);
 
-    /* Configured proxy: routed through verbatim. */
+    /* Configured proxy: routed through verbatim; no-proxy list still cleared. */
     memset(&resp, 0, sizeof(resp));
     rc = http_request("GET", "https://auth.example/token", NULL, NULL, "https://proxy.example:8443", 1000L, &resp,
                       LOGLEVEL_NONE, NULL);
     assert_int_equal(rc, 0);
     assert_string_equal(g_fake_curl_proxy, "https://proxy.example:8443");
+    assert_string_equal(g_fake_curl_noproxy, "");
+#if LIBCURL_VERSION_NUM >= 0x073400
+    assert_int_equal(proxy_tls_opt_verifypeer, 1);
+    assert_int_equal(proxy_tls_opt_verifyhost, 2);
+    assert_int_equal(proxy_tls_opt_version, (int)CURL_SSLVERSION_TLSv1_2);
+#endif
     free_http_response(&resp);
 }
 
@@ -2171,8 +2296,9 @@ static void test_verify_user_access(void **state) {
     /* "Not found" is distinct from "lookup error" and must not trip either uid gate:
      * a name with no local account entry satisfies no range check and is still
      * decided by the user lists alone (listing it in allow_users permits it). The
-     * PWNAM_ERROR path (ERANGE, NSS outage) fails closed but cannot be induced
-     * deterministically in this harness, so it is covered by code review only. */
+     * PWNAM_ERROR path (persistent ERANGE, NSS outage) fails closed; it is induced
+     * deterministically in test_verify_user_access_large_entry() via the scripted
+     * getpwnam_r() override. */
     strncpy(cfg.allow_users, "f3_unit_test_absent_user_name_long", sizeof(cfg.allow_users) - 1);
     assert_int_equal(verify_user_access("f3_unit_test_absent_user_name_long", &cfg, NULL), 1);
     cfg.allow_users[0] = '\0';
@@ -2222,6 +2348,68 @@ static void test_verify_user_access(void **state) {
     /* NULL pointers are rejected. */
     assert_int_equal(verify_user_access(NULL, &cfg, NULL), 0);
     assert_int_equal(verify_user_access("alice", NULL, NULL), 0);
+}
+
+/**
+ * @brief Unit test for verify_user_access()'s uid lookup against large and unreachable
+ *        passwd entries (scripted getpwnam_r() override).
+ *
+ * Pins both halves of the uid-gate lookup contract: (1) an account whose passwd entry is
+ * too large for the initial getpwnam_r() buffer (ERANGE) must be rescued by the
+ * growing-buffer retry and not locked out; (2) a persistent lookup failure must still
+ * fail closed while any uid gate is active, the retry loop must terminate at the
+ * buffer-growth cap, and a lookup error is not a refusal when no gate is active.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_user_access_large_entry(void **state) {
+    (void)state;
+    config_t cfg;
+
+    reset_fake_pwnam_lookup();
+
+    /* A passwd entry larger than the early buffers: the first two lookups report
+     * ERANGE whatever the offered buffer size, then the account resolves to uid 1500
+     * (outside the default system range 0..999). Without the growing-buffer retry the
+     * lookup would end in PWNAM_ERROR and the active uid gate would lock out this
+     * legitimate account. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.deny_system_uids = 1;
+    cfg.system_uid_min = 0;
+    cfg.system_uid_max = 999;
+    g_fake_pwnam_mode = FAKE_PWNAM_ERANGE_THEN_FOUND;
+    strncpy(g_fake_pwnam_script_name, "biguser", sizeof(g_fake_pwnam_script_name) - 1);
+    g_fake_pwnam_script_erange_calls = 2;
+    g_fake_pwnam_script_uid = 1500;
+    assert_int_equal(verify_user_access("biguser", &cfg, NULL), 1);
+    assert_int_equal(g_fake_pwnam_call_count, 3); /* ERANGE, ERANGE (buffer grew), FOUND */
+
+    /* A persistent backend failure fails closed under an active uid gate... */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.deny_system_uids = 1;
+    cfg.system_uid_min = 0;
+    cfg.system_uid_max = 999;
+    reset_fake_pwnam_lookup();
+    g_fake_pwnam_mode = FAKE_PWNAM_ERANGE_FOREVER;
+    strncpy(g_fake_pwnam_script_name, "ghostuser", sizeof(g_fake_pwnam_script_name) - 1);
+    assert_int_equal(verify_user_access("ghostuser", &cfg, NULL), 0);
+    /* ...and the buffer-growth cap keeps the retry loop finite (it retried at least
+     * once past the initial buffer before giving up). */
+    assert_true(g_fake_pwnam_call_count >= 2);
+
+    /* With no active uid gate the same lookup error is not a refusal: allow_root
+     * exempts the uid-0 gate and deny_system_uids stays off. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    cfg.allow_root = 1;
+    assert_int_equal(verify_user_access("ghostuser", &cfg, NULL), 1);
+
+    reset_fake_pwnam_lookup();
 }
 
 /**
@@ -3887,6 +4075,7 @@ int main(void) {
         cmocka_unit_test(test_pkce_code_verifier),
         cmocka_unit_test(test_pkce_s256_challenge),
         cmocka_unit_test(test_verify_user_access),
+        cmocka_unit_test(test_verify_user_access_large_entry),
         cmocka_unit_test(test_verify_group_membership_lists),
         cmocka_unit_test(test_verify_group_membership_deny_only_fail_closed),
         cmocka_unit_test(test_parse_config_file_minimal_valid),

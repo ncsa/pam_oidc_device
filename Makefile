@@ -12,7 +12,7 @@
 #     make VERSION=0.3.0
 # Keep these in sync with include/metadata.h when the metadata changes.
 NAME        ?= pam_oidc_device
-VERSION     ?= 0.3.4
+VERSION     ?= 0.3.5
 DESCRIPTION ?= PAM authentication module for OAuth 2.0 Device Authorization Grant
 
 CC ?= gcc
@@ -136,7 +136,7 @@ sanitize:
 
 test: $(OBJS)
 	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g tests/test_suite.c $(OBJS) \
-		-o tests/runner -lcmocka $(LIBS)
+		-o tests/runner -lcmocka $(LIBS) -ldl
 	./tests/runner
 	@rm -f tests/runner
 
@@ -151,11 +151,14 @@ test: $(OBJS)
 # LSan suppression file (tests/lsan.supp) documents intentional
 # process-lifetime third-party allocations (libcurl global state) that the
 # standalone test binary would otherwise report as leaks at exit.
+# -ldl: tests/test_suite.c resolves the real getpwnam_r() via dlsym(RTLD_NEXT);
+# required on EL8 (glibc < 2.34, where dlsym still lives in libdl), a no-op
+# stub on glibc >= 2.34 and on Debian/openSUSE.
 test-sanitize:
 	@mkdir -p build/sanitize
 	$(CC) $(CPPFLAGS) -Wall -Wextra $(EXTRA_CFLAGS) -g $(SAN_FLAGS) \
 		tests/test_suite.c src/config.c src/http.c src/identity.c src/jwt.c src/message.c src/pkce.c src/qr.c third_party/qrcodegen/qrcodegen.c src/pam_module.c \
-		-o $(SAN_RUNNER) -lcmocka $(LIBS)
+		-o $(SAN_RUNNER) -lcmocka $(LIBS) -ldl
 	ASAN_OPTIONS=detect_leaks=1 \
 	LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
