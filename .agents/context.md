@@ -35,7 +35,7 @@
 
 ## 1. Project Overview & Architecture
 
-- **Project identity:** `pam_oidc_device` (v0.3.5, see `include/metadata.h`) is a Linux Pluggable
+- **Project identity:** `pam_oidc_device` (v0.3.6, see `include/metadata.h`) is a Linux Pluggable
   Authentication Module (PAM) written in C.
 - **Core purpose:** out-of-band user authentication via the OAuth 2.0 Device Authorization Grant
   (RFC 8628) and OpenID Connect (OIDC), extended with PKCE (RFC 7636).
@@ -522,7 +522,8 @@ AI-assisted work on this repo — **not** a user-facing changelog (that is `CHAN
   log only). Never leave a new failure path log-only.
 - **Guide navigation & link labels (WCAG 2.4.4 / 2.4.5):** every long guide
   (4+ H2 sections: `docs/getting-started.md`, `docs/testing.md`,
-  `docs/jwt-validation.md`, `docs/access-control.md`, `docs/threat-model.md`)
+  `docs/jwt-validation.md`, `docs/access-control.md`, `docs/threat-model.md`,
+  `docs/security.md`, `docs/device-flow.md`)
   begins with a `## Table of Contents` in the threat-model format; link labels
   are descriptive and context-unique (no bare-URL labels, no repeated
   unanchored link text); prose uses words, not symbols — no `≠` and no inline

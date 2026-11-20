@@ -8,22 +8,115 @@
 > **Pre-Release Notice**:
 > This module is in active pre-release. It has passed initial functional testing and automated test suites, but awaits formal security review (see the [Developer Review Guide](docs/developer/review.md)). We encourage community testing and feedback, but advise against deploying to live production systems without prior internal audit.
 
-`pam_oidc_device.so` is a lightweight, secure Linux [PAM authentication module](https://www.redhat.com/en/blog/pluggable-authentication-modules-pam) written in C. It enables out-of-band multi-factor authentication (MFA) and step-up login for SSH sessions using the standard [OAuth 2.0 Device Authorization Grant](https://oauth.net/2/device-flow/) ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)).
+`pam_oidc_device` is a Linux PAM module — a small program that plugs into the
+PAM authentication stack of services such as OpenSSH — that enables
+OpenID Connect sign-in via the **OAuth 2.0 Device Authorization Grant**
+([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Users approve logins in a
+browser on a second device instead of entering passwords directly into SSH;
+once the provider approves the code, the module validates the provider's
+identity claims and completes the login sequence. It works with any
+[OIDC](https://openid.net/) identity provider (e.g., Microsoft Entra ID,
+Okta, Keycloak, Auth0) and — because it is a standard PAM module — extends
+beyond SSH to any PAM-managed service that gives the user a terminal.
 
-Users authenticating over SSH are presented with a verification URL and standard user code. Once authenticated in a web browser against your OpenID Connect (OIDC) identity provider (e.g., Microsoft Entra ID, Okta, Keycloak, Auth0), the module validates provider identity claims and completes the Linux login sequence.
+Designed for Linux servers, HPC systems, bastion hosts, research computing
+environments, and other systems that need browser-based authentication without
+running a local web login flow.
+
+## The Device Authorization Grant (RFC 8628)
+
+The **OAuth 2.0 Device Authorization Grant** ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) is the standard authorization flow for **limited-input clients** — systems with no comfortable place to type a username and password. It splits sign-in across two devices: the limited-input client requests a short, single-use **user code** and a **verification URL**, displays both, and then polls the identity provider; on *any other* device, the user opens the URL, signs in, and approves the code. No password ever travels through the limited-input client — the only secret it handles is the short, expiring user code. The same pattern powers smart-TV and streaming apps, game consoles, and headless devices.
+
+The full background, and how it maps onto a Linux PAM module, is in the [device-flow guide](docs/device-flow.md).
+
+---
+
+## Use Cases
+
+`pam_oidc_device` is useful when:
+
+* SSH passwords should never be typed into shared systems.
+* Local accounts need to be tied to Entra ID identities.
+* Password authentication has been disabled.
+* MFA enforcement should occur at the identity provider.
+* HPC, research, or bastion hosts need centralized identity management.
 
 ---
 
 ## How It Works
 
-The device flow delivers out-of-band multi-factor authentication without any client-side software on the login host:
+The device flow delivers out-of-band sign-in without any client-side software on the login host.
 
-1. **Login starts.** A user runs `ssh user@host`; the PAM `auth` stack invokes `pam_oidc_device.so`.
-2. **Verification prompt.** The module requests a one-time user code from your identity provider and displays the sign-in URL and code in the terminal (optionally also as a scannable QR code), then waits for you to press **Enter** to begin; the keystroke reliably flushes the prompt to OpenSSH keyboard-interactive clients, which otherwise buffer informational text until a prompt triggers a round-trip.
-3. **User approves.** On a *second* device, the user opens the URL in a browser, signs in to their OIDC account, and authorizes the login for this host.
-4. **Module validates.** The module polls the token endpoint on a monotonic clock — a stopwatch that only ever counts forward — so its timing stays accurate even if the system's wall-clock time is adjusted (e.g., via NTP or a manual time change). Once approved, it validates the returned token and identity claims against the local system user (plus optional group/role and JWT claim checks) before completing the login — or fails closed, blocking it.
+**Figure 1 — Device-flow authentication sequence.** The SSH terminal (limited-input client) and
+the browser on a second device are both operated by the user; the PAM module talks only to the
+identity provider:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U1 as User (SSH terminal)
+    participant M as pam_oidc_device
+    actor U2 as User (browser, 2nd device)
+    participant IdP as OIDC Identity Provider
+
+    U1->>M: ssh user@host (PAM auth stack)
+    M->>IdP: Device authorization request (device_authorization_endpoint)
+    IdP-->>M: user_code + verification URL
+    M-->>U1: Sign-in prompt: URL + user code
+    U1->>M: Press Enter (flushes prompt, begins polling)
+    U2->>IdP: Open URL, sign in, approve user_code
+    loop Monotonic-clock polling (with backoff)
+        M->>IdP: Token request (device_code, PKCE)
+        IdP-->>M: authorization_pending …
+    end
+    IdP-->>M: access token + identity claims
+    M->>M: Validate token & claims against local user
+    M-->>U1: Login granted (or failed closed)
+```
+
+What the SSH session looks like (built-in default prompt; the optional QR code is omitted here):
+
+```text
+Sign in via browser:
+  https://auth.example.com/oauth2/device/code?user_code=ABCD-EFGH
+
+Manual entry: https://auth.example.com/oauth2/device/code  |  Code: ABCD-EFGH
+Waiting for approval (expires in 2m; auto-completes on sign-in).
+Press [Enter] to begin...
+```
+
+Details the diagram does not show:
+
+* **Enter flushes the prompt.** After the sign-in prompt is shown, the module
+  waits for you to press **Enter** before polling begins. The keystroke
+  reliably flushes the prompt to OpenSSH keyboard-interactive clients, which
+  otherwise buffer informational text until a prompt triggers a round-trip.
+* **Monotonic-clock polling.** The module polls the token endpoint on a
+  monotonic clock — a stopwatch that only ever counts forward — so its timing
+  stays accurate even if the system's wall-clock time is adjusted (e.g., via
+  NTP or a manual time change).
+* **Fail-closed validation.** Once the provider approves the code, the module
+  validates the returned token and identity claims against the local system
+  user (plus any configured group/role and JWT claim checks) before completing
+  the login — or fails closed, blocking it.
 
 No passwords cross the wire in this flow, and no provider credentials live on the host beyond the `client_id`/`client_secret` in the root-only config file.
+
+---
+
+## Device Flow Is Not MFA By Itself
+
+This module enforces one thing: that the login was approved **out-of-band** by your identity
+provider through the device flow, plus any claim, group, and role policies you configure. By
+itself it does not require a second factor — a user whose provider sign-in is just a password has
+completed exactly one factor through this module.
+
+That is why this module is normally deployed *as one layer of a larger control*. When your PAM
+stack combines the device-flow sign-in with other PAM modules, or when your identity provider
+enforces a second step (e.g., a phishing-resistant MFA challenge) during the browser sign-in, the
+resulting login *is* multi-factor; the module is the out-of-band step in that combination, not an
+MFA guarantee on its own. See [Use Cases](#use-cases) and the
+[Threat Model](docs/threat-model.md) for the deployment guidance.
 
 ---
 
@@ -34,9 +127,9 @@ No passwords cross the wire in this flow, and no provider credentials live on th
 * **Flexible Claim Mapping:** Extract local system usernames from OIDC UserInfo claims (`sub`, `preferred_username`, etc.) using POSIX Extended Regular Expressions.
 * **Pre-Flight Access Controls:** Reject unauthorized local accounts *before* contacting the identity provider, limiting identity mapping risks.
 * **Group & Role Authorization:** Restrict access to users belonging to specific provider groups or roles.
-* **Terminal QR Sign-In:** Opt-in `[qr]` section renders the device-flow sign-in URL as a scannable QR code on TTY logins so users can open it with a phone camera; authentication never depends on the QR — when it is disabled or rendering fails, the plain text prompt is still shown.
 * **Sign-In Confirmation:** The module shows the sign-in URL and code, then waits for a single Enter before polling the token endpoint begins — giving you time to note the URL and code on a secondary device.
 * **Security & Memory Hardening:** Zeroes sensitive memory buffers in process RAM (`secure_memzero`), enforces strict root ownership (`0600`/`0640` permissions), and sanitizes terminal output against ANSI escape sequence injection.
+* **Convenience: Terminal QR Sign-In:** As a usability enhancement, the opt-in `[qr]` section renders the device-flow sign-in URL as a scannable QR code on TTY logins so users can open it with a phone camera. The QR code plays no role in the authentication architecture: it is off by default, authentication never depends on it, and when it is disabled or rendering fails, the plain text prompt is still shown.
 
 ---
 
@@ -46,74 +139,39 @@ Deploy `pam_oidc_device` in 4 steps. The complete walkthrough — prerequisites,
 
 ### Step 1: Install the Module
 
-Build from source. On Enterprise Linux 8 / 9 / 10 (RHEL, Rocky Linux, AlmaLinux):
-
 ```bash
-# Install dependencies
-sudo dnf install -y gcc pam-devel libcurl-devel libcmocka-devel json-c-devel openssl-devel make
-
-# Clone and compile
 git clone https://github.com/ncsa/pam_oidc_device.git
 cd pam_oidc_device
+# install your distro's build dependencies first —
+# see the per-distro lists in Getting Started §2
 make
 sudo make install
-```
-
-On SUSE (openSUSE Leap / SLES):
-
-```bash
-sudo zypper install -y gcc make pam-devel libcurl-devel libjson-c-devel libopenssl-devel libcmocka-devel
-make
-sudo make install
-```
-
-On Debian 13 / Ubuntu 26.04 LTS:
-
-```bash
-sudo apt-get install -y build-essential libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
-make
-sudo make install PAM_DIR="/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security"
 ```
 
 ---
 
 ### Step 2: Configure `/etc/pam_oidc_device.conf`
 
-Create or edit `/etc/pam_oidc_device.conf`. Ensure the file is owned by `root:root` with strict `0600` permissions.
+Create or edit `/etc/pam_oidc_device.conf` (owned by `root:root`, permissions `0600`) with the four
+required provider endpoints and your claim mapping:
 
 ```ini
 [oauth]
 client_id = your-oauth-client-id
-# client_secret = your-oauth-client-secret   # only for confidential clients (leave unset for public clients)
 device_authorization_endpoint = https://auth.example.com/oauth2/v2.0/devicecode
 token_endpoint = https://auth.example.com/oauth2/v2.0/token
 userinfo_endpoint = https://auth.example.com/oauth2/v2.0/userinfo
 scopes = openid profile email
 
 [claim]
-# Map UserInfo field 'preferred_username' (e.g., 'jdoe@example.com') to local system user 'jdoe'
+# claim_regex is REQUIRED (there is no default)
 claim_field = preferred_username
-claim_regex = ^([^@]+)@example\.com$
-claim_capture_group = 1
-case_sensitive = false
-
-[runtime]
-loglevel = info
-max_poll_seconds = 120
-
-[prompt]
-# Optional custom prompt template (printable ASCII; use \n for newlines).
-# init_message = Sign in at {url} with code {code}   # placeholders: {url}, {url_complete}, {code}, {expiry}
-
-[qr]
-# Optional: render the sign-in URL as a scannable QR code on TTY logins (phone-camera friendly).
-enabled = false
-style = utf8        # or ascii for minimal/legacy fonts (pair with: block_char = #)
-# scale = 1         # 1-3 module enlargement
-# vertical_quiet_zone = 4  # 0-4 blank module rows above/below (ISO minimum 4; lower = more compact)
-# ec_level = M      # L/M/Q/H error correction level
-# uri = complete    # or plain (encode verification_uri_complete vs. verification_uri)
+claim_regex = ^jdoe$
 ```
+
+The full annotated template — every option including `use_pkce`, access controls, prompt
+customization, and the opt-in `[qr]` section — is in
+[Getting Started §3](docs/getting-started.md).
 
 ---
 
@@ -132,6 +190,8 @@ Reload SSH configuration:
 ```bash
 sudo systemctl reload sshd
 ```
+
+(Extended hardening — connection-burst throttling, rate-limiting, and idle pre-auth timeouts — is in [Getting Started §4](docs/getting-started.md).)
 
 ---
 
@@ -154,6 +214,23 @@ auth        include       postlogin
 
 ---
 
+## Beyond SSH: Other PAM Services
+
+OpenSSH is the primary, best-documented use case for this module, but `pam_oidc_device` is a standard PAM module: the same device-flow sign-in works with **any Linux service that authenticates through PAM** and gives the user a terminal to read the verification prompt:
+
+* **`sudo` and `su`** — device-flow step-up before privilege escalation (`/etc/pam.d/sudo`, `/etc/pam.d/su`);
+* **Local console and display-manager logins** (`login`/`getty`, GDM, SDDM) — where the optional terminal QR code makes approval especially quick, since a phone is usually right there;
+* **PAM-aware daemons and stacks** (LXD, Proxmox VE, and similar services that gate their operations through PAM).
+
+Two rules apply outside SSH:
+
+1. **The user needs an interactive terminal.** The flow requires reading the URL/code and pressing Enter, so services without an interactive user — cron jobs, `sudo -n`, non-interactive PAM policy checks — cannot complete it.
+2. **The fail-closed rule applies everywhere.** Use `required` or `requisite`, never `sufficient`, in every PAM stack you add the module to (the Step 4 warning above).
+
+For service-specific stack placement and the `authselect` interaction, see [Getting Started §5–§6](docs/getting-started.md).
+
+---
+
 ## Documentation
 
 Pick the guide that matches what you are about to do:
@@ -161,11 +238,14 @@ Pick the guide that matches what you are about to do:
 | I want to… | Read |
 | --- | --- |
 | **Deploy it from scratch** (install, config, OpenSSH, PAM stack, `authselect`, logging) | [Getting Started](docs/getting-started.md) |
+| **Understand the device flow protocol** (RFC 8628 background, where you've seen it before, how it maps to PAM) | [Device-Flow Guide](docs/device-flow.md) |
+| **Protect something other than SSH** (`sudo`, `su`, console logins, PAM-aware daemons) | [Beyond SSH: Other PAM Services](#beyond-ssh-other-pam-services) |
 | **Connect my identity provider** (discover endpoints, PKCE support, complete config templates) | [Provider Examples & Discovery](examples/README.md) |
 | **Test it before relying on it** (one-command e2e sandbox, `pamtester`, trial IdP, pre-production audit) | [Testing & Pre-Production Audit Guide](docs/testing.md) |
 | **Restrict who can log in** (local users, provider groups/roles) | [Account & Group Access Control](docs/access-control.md) |
 | **Harden token acceptance** (issuer pinning, audience, `exp`/`nbf`) | [Local JWT Claim Inspection](docs/jwt-validation.md) |
-| **Understand the security model** (threat matrix, injection defense, memory scrubbing) | [Security Policy](SECURITY.md) & [Threat Model](docs/threat-model.md) |
+| **Understand the security model** (threat matrix, injection defense, memory scrubbing, credential handling) | [Security Policy](SECURITY.md), [Threat Model](docs/threat-model.md), [Security & Credential Handling](docs/security.md) |
+| **Review accessibility & compliance posture** (WCAG 2.1 AA, terminal UX) | [Accessibility](docs/accessibility.md) |
 | **Build RPM/DEB packages** | [Building RPM & DEB Packages](docs/packaging.md) |
 | **Contribute** (build/test gates, developing on non-Linux hosts) | [Contributing Guide](CONTRIBUTING.md) |
 
@@ -173,13 +253,16 @@ Pick the guide that matches what you are about to do:
 
 ## Security & Credential Handling
 
-For a complete security analysis, attack vector breakdown, and trust boundary mapping, see the [Threat Model & Security Architecture](docs/threat-model.md).
+The module keeps provider secret materials in volatile memory only: device codes, tokens, and
+response bodies are never written to disk or swap, and module-owned secrets (client secret,
+access/refresh tokens, decoded JSON fields) are scrubbed with `secure_memzero` before release.
+Every terminal-facing value (URLs, user codes, rendered prompts) is validated against ANSI and
+control-character injection before display.
 
-* **Zero Disk Footprint:** OAuth device codes, tokens, and response bodies are never written to disk or swap files.
-* **Volatile Memory Scrubbing:** Module-owned secret materials (client secrets, access/refresh tokens, decoded JSON payload fields) are explicitly zeroed out in process RAM via `secure_memzero` before memory is released.
-* **Terminal Injection Defense:** URL endpoints and user verification codes are validated (`is_valid_https_url`, `is_safe_user_code`) before display, and the fully rendered prompt is validated line-by-line (`is_safe_terminal_string`, newline-tolerant) before it reaches the user's terminal to prevent ANSI sequence and control-character injection. Custom `init_message` templates are therefore limited to printable ASCII with escaped `\n` newlines.
-* **User Code Format:** Verification codes are displayed exactly as issued by the identity provider. The RFC 8628 §3.1 recommendations on code character sets (consonant-only base-20 or pure-numeric sets, omission of visually ambiguous characters) and chunked display formatting are server-side choices, so the module does not reject or reformat codes to enforce them — it applies terminal-safety filtering only.
-* **Client Authentication:** `client_id`/`client_secret` are transmitted as form-encoded request-body parameters (the RFC 6749 §2.3.1 `client_secret_post` pattern). The `client_secret_basic` (HTTP Basic `Authorization`) client-authentication method is not supported — the identity provider must accept body-posted client secrets.
+The full treatment — threat matrix, attack-vector breakdown, trust boundaries, user-code format
+policy, and the client-authentication method (`client_secret_post`) — is in the
+[Security & Credential Handling guide](docs/security.md) and the
+[Threat Model & Security Architecture](docs/threat-model.md).
 
 ---
 
@@ -199,18 +282,15 @@ To enable detailed tracing temporarily, set `loglevel = debug` or `loglevel = ve
 
 ## Third-Party Components & Licenses
 
-The module's own code is MIT-licensed. It vendors exactly one third-party component — **Project Nayuki's QR Code generator (C edition, MIT)** — and otherwise links against standard system libraries that ship as distribution packages:
+The module's own code is MIT-licensed. It vendors exactly one third-party component —
+**Project Nayuki's QR Code generator (C edition, MIT)** — and otherwise links against
+standard system libraries that ship as distribution packages (Linux-PAM, cURL, json-c,
+OpenSSL; CMocka is build/test-only and never shipped).
 
-| Component | Role | License |
-| --- | --- | --- |
-| [Project Nayuki QR Code generator (C)](third_party/qrcodegen/AUTHORS) | Vendored into `third_party/qrcodegen/` (pinned, drift-audited) | MIT |
-| Linux-PAM | Runtime system library | 3-clause BSD-style (Linux-PAM license) |
-| cURL | Runtime system library | curl license (MIT-style) |
-| json-c | Runtime system library | MIT |
-| OpenSSL | Runtime system library | Apache-2.0 |
-| CMocka | Build/test only — never shipped | Apache-2.0 |
-
-Full licensing, provenance pins, local-deviation records, and the license-audit procedure are maintained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and checked automatically in CI (the [license audit workflow](.github/workflows/license-audit.yml) plus the [vendor drift audit](.github/workflows/vendor-audit.yml)).
+Full licensing, provenance pins, local-deviation records, and the license-audit procedure
+are maintained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and checked
+automatically in CI (the [license audit workflow](.github/workflows/license-audit.yml)
+plus the [vendor drift audit](.github/workflows/vendor-audit.yml)).
 
 ---
 
@@ -218,51 +298,21 @@ Full licensing, provenance pins, local-deviation records, and the license-audit 
 
 This project's documentation and terminal user experience are built to
 [WCAG 2.1 Level AA](https://www.w3.org/TR/WCAG21/) — the shared technical
-baseline of the three accessibility mandates governing NCSA / University of
-Illinois public-facing content:
+baseline of the accessibility mandates governing NCSA / University of
+Illinois public-facing content (IITAA 2.1, ADA Title II, and Section 508).
 
-* **Illinois Information Technology Accessibility Act (IITAA 2.1,
-  30 ILCS 587):** applies to Illinois state agencies and state-supported
-  universities (including the University of Illinois), requiring digital
-  content and documentation to meet WCAG 2.1 Level AA.
-* **ADA Title II Web Accessibility Rule (28 CFR Part 35):** requires public
-  universities and state entities to conform public web content and
-  documentation to WCAG 2.1 Level AA (effective April 2026).
-* **Section 508 of the Rehabilitation Act (29 U.S.C. § 794d):** applies to
-  federally funded research, software, and documentation (e.g., NSF-supported
-  NCSA projects) and incorporates the WCAG Level AA standards (36 CFR
-  Part 1194, per the Access Board's 2017 final rule).
+In short: the guides under `docs/` use semantic headings, tables with header
+rows, and text alternatives for every image; the terminal sign-in experience
+is text-first and screen-reader friendly — the sign-in URL and user code are
+always presented as plain, selectable terminal text, and failed attempts
+deliver a plain-text, actionable explanation rather than a bare
+"permission denied." The optional `[qr]` code is strictly supplemental:
+authentication never depends on it, and `style = ascii` renders it for
+minimal fonts.
 
-In concrete terms, this means:
-
-* **Documentation:** The README and the guides under `docs/` use semantic
-  heading structure, data tables with header rows, text alternatives for every
-  image, no information conveyed by color alone, and content that remains fully
-  navigable by keyboard and screen reader in rendered form.
-* **Terminal sign-in experience:** The authentication prompt is text-first and
-  screen-reader friendly. The sign-in URL and user code are *always* presented
-  as plain, selectable terminal text — never image-only — and no prompt
-  information depends on color. The interaction is entirely keyboard-driven:
-  **Enter** begins waiting for your approval, and **Ctrl-C** aborts the attempt
-  at any point (the login is denied — `PAM_ABORT`). There are no time-limited
-  interactions that cannot be cancelled; the user-code lifetime itself is set by
-  your identity provider (`expires_in`), and idle time at the confirmation
-  prompt counts against it (see [Getting Started, §4](docs/getting-started.md#4-openssh-server-setup-etcsshsshd_config)).
-  Failed attempts are never silent: the module delivers a plain-text, actionable
-  explanation to the terminal (for example, the sign-in code expired, the identity
-  provider service is unavailable, or the account is denied) so users are not left
-  with an unexplained "permission denied" (WCAG 3.3.1 *Error Identification*).
-  Delivery is best-effort, and detailed causes remain in the audit log only
-  (see [Getting Started, §7](docs/getting-started.md#7-logging--auditing)).
-* **QR sign-in (opt-in):** The `[qr]` terminal QR code is strictly
-  *supplemental* (WCAG 1.1.1 *Non-text Content*): authentication never depends
-  on it, it is off by default, and `style = ascii` renders it in plain ASCII
-  for minimal fonts. Screen-reader and low-vision users should rely on the
-  text prompt, which is displayed in all cases.
-
-If you encounter an accessibility barrier in this documentation or in the
-module's terminal experience, please [open an issue](https://github.com/ncsa/pam_oidc_device/issues)
-describing the barrier; accessibility reports are triaged with priority.
+The full details — each mandate, the concrete WCAG criteria in play, and
+how to report an accessibility barrier — are in the
+[Accessibility guide](docs/accessibility.md).
 
 ---
 
