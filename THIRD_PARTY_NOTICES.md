@@ -5,7 +5,7 @@
 a small set of well-known system libraries. This file is the **authoritative record** of every
 third-party component, its license, its provenance, and how license compliance is verified.
 
-The [README](README.md#third-party-components--licenses) carries a high-level summary; the
+The [README](README.md#third-party-components) carries a high-level summary; the
 detail lives here. Compliance is enforced mechanically — see
 [Compliance enforcement](#compliance-enforcement) and `scripts/check-licenses.sh`
 (CI: `.github/workflows/license-audit.yml`).

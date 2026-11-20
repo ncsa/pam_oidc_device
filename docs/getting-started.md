@@ -3,7 +3,9 @@
 The end-to-end walkthrough from a fresh host to a first successful
 device-flow login: prerequisites, installation, configuration, OpenSSH
 setup, PAM stack integration (including `authselect` on Enterprise Linux),
-and logging.
+and logging. This guide focuses on OpenSSH, the module's primary use case;
+§5 ends with notes on deploying the module with other PAM-managed services
+(`sudo`, `su`, console logins, PAM-aware daemons).
 
 > [!TIP]
 > If you are still choosing provider values (endpoints, `client_id`, claim
@@ -34,7 +36,9 @@ and logging.
   [OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628)
   enabled for a registered OAuth client.
 * `root` (or `sudo`) on the host you want to protect.
-* The logins you want to protect are served by OpenSSH (`sshd`).
+* The logins you want to protect are served by OpenSSH (`sshd`) — the
+  primary focus of this guide. The module also works with other PAM-aware
+  services that present the user with an interactive terminal (see §5).
 
 ---
 
@@ -210,7 +214,7 @@ AuthenticationMethods keyboard-interactive
 > waiting for your approval, **Ctrl-C** aborts the attempt (`PAM_ABORT`, login
 > denied). The user-code lifetime is set by your identity provider — see the
 > Note below, idle time at the confirmation prompt counts against it. See also
-> the [Accessibility section of the README](../README.md#accessibility).
+> [Accessibility guide](accessibility.md).
 
 Apply configuration changes:
 
@@ -313,7 +317,7 @@ completing the device flow in all of these cases).
 > - With `sufficient`, a module failure does **not** block login: PAM simply continues to the
 >   next module. If a later module (e.g., `pam_unix.so`) then succeeds, the user is
 >   authenticated **without ever completing the OIDC device flow**. That silently downgrades
->   step-up/MFA authentication to your fallback method the moment the module errors — which is
+>   step-up authentication to your fallback method the moment the module errors — which is
 >   almost never what you want on a security gate.
 >
 > `required` runs the remainder of the stack after a failure; use `requisite` to stop
@@ -323,6 +327,40 @@ completing the device flow in all of these cases).
 ### Safety Guard Recommendation (`pam_succeed_if.so`)
 
 Placing `auth required pam_succeed_if.so uid >= 1000 quiet` immediately **before** `pam_oidc_device.so` guarantees that system accounts (`root`, `daemon`, `bin`) are filtered locally and never trigger an OIDC authentication prompt, even if a loose identity claim regex is configured.
+
+### Other PAM Services (Beyond SSH)
+
+The deployment in this section targets `/etc/pam.d/sshd`, but the module
+is a standard PAM module: the same device-flow sign-in works with **any
+PAM-managed service that presents the user with an interactive terminal**.
+Common candidates:
+
+* **`sudo` / `su`** — add an `auth required pam_oidc_device.so` line to
+  `/etc/pam.d/sudo` or `/etc/pam.d/su` for device-flow step-up before
+  privilege escalation.
+* **Local console and display-manager logins** — `login`/`getty`
+  (`/etc/pam.d/login`) and display managers (GDM, SDDM), where the
+  optional terminal QR code makes phone approval especially quick.
+* **PAM-aware daemons** — services that gate their operations through
+  PAM (LXD, Proxmox VE, and similar).
+
+Caveats that apply to every non-SSH deployment:
+
+1. **An interactive terminal is required.** The user must read the URL and
+   code and press Enter, so services without an interactive user (cron
+   jobs, `sudo -n`, non-interactive PAM policy checks) cannot complete
+   the flow.
+2. **Fail-closed control flags everywhere.** Use `required` or
+   `requisite` in every stack you add the module to — never `sufficient`
+   (see the warning above).
+3. **Shared-stack scope on Enterprise Linux.** Integrating via the shared
+   `system-auth`/`password-auth` stacks applies the device flow to
+   **every** service that includes them — scope it to one service's own
+   `/etc/pam.d/<service>` file when you want that (Option A in §6).
+4. **`authselect` persistence.** `authselect` manages only the shared
+   stack files — never a service-specific file like `/etc/pam.d/sudo` —
+   so a direct edit to a service file survives profile re-applications,
+   the same way Option A does for SSH.
 
 ---
 
