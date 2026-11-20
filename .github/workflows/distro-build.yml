@@ -1,0 +1,174 @@
+name: Distro Package Builds
+
+# Native package-build gate for every supported distribution: EL
+# (Rocky Linux 8/9/10 — RPM), SUSE (openSUSE Leap — RPM), and
+# Debian / Ubuntu (DEB). Each matrix job runs inside the distro's own
+# base container (latest LTS release) and verifies the full local loop:
+# zero-warning build, unit tests, native binary package build, package
+# install, and on-disk layout check.
+#
+# The compiler/lint/test gates (compile-matrix, sanitize-test,
+# qr-scan-audit, e2e-sandbox) live in .github/workflows/build.yml.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Least privilege: every job in this workflow only needs to read the
+# repository contents.
+permissions:
+  contents: read
+
+# Cancel superseded runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  distro-build:
+    name: ${{ matrix.distro.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          # EL: Rocky Linux mirrors RHEL. `dnf config-manager` needs
+          # dnf-utils (EL8) / dnf-plugins-core (EL9+) and the optional
+          # extra-products repo (powertools on EL8, crb on EL9+) enabled
+          # before the spec's BuildRequires resolve.
+          - label: "EL8: Rocky Linux 8 (RPM)"
+            image: "rockylinux/rockylinux:8"
+            pkg: rpm
+            install: |
+              dnf install -y dnf-utils
+              dnf config-manager --set-enabled powertools
+              dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3 \
+                || { echo ">>> retrying with --nobest (mirrors may publish a newer gcc without its matching libgcc/libgomp)"
+                     dnf install -y --nobest gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+                   }
+            verify: |
+              set -euo pipefail
+              MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm" | head -1)
+              [ -n "$MAIN_RPM" ]
+              echo ">>> installing $MAIN_RPM"
+              dnf install -y "$MAIN_RPM"
+              ls -la /lib64/security/pam_oidc_device.so /etc/pam_oidc_device.conf
+          - label: "EL9: Rocky Linux 9 (RPM)"
+            image: "rockylinux/rockylinux:9"
+            pkg: rpm
+            install: |
+              dnf install -y dnf-plugins-core
+              dnf config-manager --set-enabled crb
+              dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+            verify: |
+              set -euo pipefail
+              MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm" | head -1)
+              [ -n "$MAIN_RPM" ]
+              echo ">>> installing $MAIN_RPM"
+              dnf install -y "$MAIN_RPM"
+              ls -la /lib64/security/pam_oidc_device.so /etc/pam_oidc_device.conf
+          - label: "EL10: Rocky Linux 10 (RPM)"
+            image: "rockylinux/rockylinux:10"
+            pkg: rpm
+            install: |
+              dnf install -y dnf-plugins-core
+              dnf config-manager --set-enabled crb
+              dnf install -y gcc pam-devel libcurl-devel json-c-devel openssl-devel libcmocka-devel rpm-build make tar python3
+            verify: |
+              set -euo pipefail
+              MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm" | head -1)
+              [ -n "$MAIN_RPM" ]
+              echo ">>> installing $MAIN_RPM"
+              dnf install -y "$MAIN_RPM"
+              ls -la /lib64/security/pam_oidc_device.so /etc/pam_oidc_device.conf
+          # SUSE: openSUSE Leap 16.0 is the current SUSE-family LTS-based
+          # release. `make rpm` works unchanged (rpmbuild + dnf-equivalent
+          # zypper); the spec's %if 0%{?suse_version} branch selects the
+          # SUSE binary package names (libcurl4, libjson-c5, ...).
+          - label: "SUSE: openSUSE Leap 16.0 (RPM)"
+            image: "opensuse/leap:16.0"
+            pkg: rpm
+            install: |
+              set -euo pipefail
+              zypper --non-interactive install --type package \
+                gcc make rpm-build rpm python3 tar gzip \
+                pam-devel libcurl-devel libjson-c-devel libopenssl-devel libcmocka-devel \
+                || { echo ">>> zypper install failed; probing candidate package names:"
+                     for probe in 'pam-devel' 'libpam-devel' 'libcurl-devel' \
+                                  'libjson-c-devel' 'json-c-devel' 'libopenssl-devel' \
+                                  'openssl-devel' 'libcmocka-devel' 'cmocka-devel'; do
+                       zypper search --type package "$probe" || true
+                     done
+                     exit 1
+                   }
+            verify: |
+              set -euo pipefail
+              MAIN_RPM=$(find rpmbuild/RPMS -name "pam_oidc_device-[0-9]*.rpm" | head -1)
+              [ -n "$MAIN_RPM" ]
+              echo ">>> installing $MAIN_RPM"
+              # CI-built RPMs are unsigned (no signing key in the container),
+              # and zypper enforces GPG verification by default ("Signature
+              # verification failed [6-File is unsigned]") — skip it for this
+              # local install test.
+              zypper --non-interactive --no-gpg-checks install "$MAIN_RPM"
+              ls -la /lib64/security/pam_oidc_device.so /etc/pam_oidc_device.conf
+          # Debian 13 (trixie) is the current Debian stable/LTS release.
+          - label: "Debian 13 (DEB)"
+            image: "debian:13"
+            pkg: deb
+            install: |
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential dpkg-dev python3 \
+                libpam0g-dev libcurl4-openssl-dev libjson-c-dev libcmocka-dev libssl-dev
+            verify: |
+              set -euo pipefail
+              DEB=$(find build -maxdepth 1 -name "pam-oidc-device_*.deb" | head -1)
+              [ -n "$DEB" ]
+              echo ">>> installing $DEB"
+              dpkg -i "$DEB"
+              PAM_DIR="/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security"
+              ls -la "$PAM_DIR/pam_oidc_device.so" /etc/pam_oidc_device.conf
+          # Ubuntu 26.04 LTS is the current Ubuntu LTS release.
+          - label: "Ubuntu 26.04 LTS (DEB)"
+            image: "ubuntu:26.04"
+            pkg: deb
+            install: |
+              apt-get update
+              apt-get install -y --no-install-recommends ca-certificates build-essential \
+                dpkg-dev python3 libpam0g-dev libcurl4-openssl-dev libjson-c-dev \
+                libcmocka-dev libssl-dev
+            verify: |
+              set -euo pipefail
+              DEB=$(find build -maxdepth 1 -name "pam-oidc-device_*.deb" | head -1)
+              [ -n "$DEB" ]
+              echo ">>> installing $DEB"
+              dpkg -i "$DEB"
+              PAM_DIR="/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security"
+              ls -la "$PAM_DIR/pam_oidc_device.so" /etc/pam_oidc_device.conf
+    container:
+      image: ${{ matrix.distro.image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          ${{ matrix.distro.install }}
+
+      # EXTRA_CFLAGS=-Werror mechanically enforces the documented
+      # zero-warning bar.
+      - name: Build shared module
+        run: make EXTRA_CFLAGS=-Werror
+
+      - name: Run unit test suite
+        run: make test EXTRA_CFLAGS=-Werror
+
+      - name: Build native binary package
+        run: make ${{ matrix.distro.pkg }}
+
+      - name: Install and verify package layout
+        run: |
+          ${{ matrix.distro.verify }}

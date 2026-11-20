@@ -1,0 +1,53 @@
+# ==============================================================================
+# Build & Compilation Artifacts
+# ==============================================================================
+*.o
+*.so
+*.a
+*.la
+*.lo
+
+# Build output directories
+rpmbuild/
+.libs/
+build/
+build/sanitize/
+
+# Source Archives
+*.tar.gz
+*.tgz
+
+# Unit Test Binaries
+tests/runner
+tests/*.o
+
+# Python bytecode (tests/qr_scan/*.py tooling)
+__pycache__/
+
+# ==============================================================================
+# Local Configuration & Secrets
+# ==============================================================================
+config/*.secret.conf
+*.conf.bak
+*.rpmnew
+
+# Personal, gitignored LLM scratchpad (companion to .agents/memory.md)
+.agents/memory.local.md
+
+# ==============================================================================
+# Editor & System Artifacts
+# ==============================================================================
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Icon?
+Thumbs.db

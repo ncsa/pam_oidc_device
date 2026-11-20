@@ -1,0 +1,5 @@
+# Vendored third-party code (Project Nayuki QR Code generator, MIT License).
+# Kept out of the project's lint/static-analysis gates by directory placement
+# (CI clang-tidy gates only `src/*.c`); this file disables clang-tidy entirely
+# if it is ever run directly on this directory.
+Checks: ''
