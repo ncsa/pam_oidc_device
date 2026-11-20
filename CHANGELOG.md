@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-11-19
+
+### Changed
+
+- **Documentation: RFC 8628 introduction, non-SSH generalization, and MFA
+  claim clarification (`README.md`, `docs/getting-started.md`,
+  `examples/README.md`, `docs/threat-model.md`):** the README now leads
+  with an introduction to the OAuth 2.0 Device Authorization Grant —
+  what it is, the two-device sign-in shape, and the familiar
+  limited-input-client use cases (smart-TV/streaming apps, game
+  consoles/IoT devices, headless systems) — and gains a
+  "Beyond SSH: Other PAM Services" section (`sudo`/`su`, console and
+  display-manager logins, PAM-aware daemons) making the
+  interactive-terminal requirement explicit; `docs/getting-started.md`
+  mirrors this in §1 and a new "Other PAM Services (Beyond SSH)"
+  subsection of §5. "Out-of-band multi-factor authentication (MFA)"
+  claims were replaced with "out-of-band sign-in and step-up login",
+  plus a note that the module alone does not require a second factor —
+  whether a resulting login is multi-factor depends on the surrounding
+  PAM stack and on what the identity provider enforces during the
+  browser sign-in. No behavior or interface changes.
+- **README restructured around the primary value proposition; substantial
+  content moved into dedicated guides (`README.md`, new
+  `docs/device-flow.md`, `docs/security.md`, `docs/accessibility.md`):**
+  the detailed RFC 8628 protocol introduction moved to
+  `docs/device-flow.md`; "Security & Credential Handling" and "Accessibility"
+  moved to `docs/security.md` and `docs/accessibility.md` (the README keeps
+  short summaries plus links); the Third-Party Components section is now a
+  short summary pointing at `THIRD_PARTY_NOTICES.md` (which already carries
+  the full component table). A new "Use Cases" section states when an
+  administrator should deploy the module; the Quickstart is now genuinely
+  quick (distro-specific dependency lists, the full annotated config
+  including the commented `[qr]` options, and the extended OpenSSH
+  hardening moved to the Getting Started guide, which already contained
+  them); "How It Works" gains a sequence diagram and a sample terminal
+  prompt block; the multi-factor discussion was elevated from a buried note
+  to a top-level section; and the terminal QR feature is repositioned as a
+  convenience/usability enhancement throughout, never an architectural
+  pillar. `docs/getting-started.md`'s accessibility cross-reference now
+  targets the new guide. A readability pass followed: the README intro no
+  longer re-explains the device flow (that stays in the RFC 8628 section),
+  the "How It Works" step list now carries only details the diagram does not
+  show, `docs/device-flow.md` gained the table of contents its section count
+  requires, and `docs/threat-model.md`'s trust-boundary overview and
+  access-control decision flow now render as Mermaid flowcharts above their
+  existing reference tables. No behavior or interface changes.
+- **Threat Model de-duplication pass (`docs/threat-model.md`):** the
+  Device-Code Phishing, Device Code Interception/Replay, and Provider
+  Rate-Limit Exhaustion rows of the Threat Matrix were each shrunk from
+  multi-paragraph cells to one- or two-sentence summaries with cross
+  references, since their full analyses already live in §7/§8/§9; a
+  "Key finding" callout now names device-code phishing as the module's top
+  residual risk immediately after the introduction, so the headline risk is
+  visible on page 1; the "Trust relationships" table under Figure 1 was
+  replaced by a one-line pointer because the figure's edge labels already
+  state each relationship's protection; the `PAM_RHOST` attribution in §8/§9
+  was corrected to "exposed to the PAM service, set by the SSH service";
+  and the stopwatch aside in §6's monotonic-clock bullet was trimmed. No
+  threat, mitigation, or code-symbol content was lost — only duplication
+  removed. No behavior or interface changes.
+- **Security disclosure elevated to the top of the security policy
+  (`SECURITY.md`):** the "Reporting a Vulnerability" section now leads the
+  page (with the table of contents reordered to match) and opens with an
+  alert-style callout stating the private-report rule and the contact email,
+  so the disclosure path is no longer buried below the security-documentation
+  index. No behavior or interface changes.
+
 ## [0.3.5] - 2026-11-19
 
 ### Fixed
@@ -39,7 +106,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every request, and the comment/doc claims were corrected;
   `test_http_request_proxy_routing` pins all three on the with-proxy and
   without-proxy paths alike.
-
 
 ## [0.3.4] - 2026-11-18
 

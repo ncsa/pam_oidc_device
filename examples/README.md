@@ -131,7 +131,7 @@ Instead of maintaining separate files for dozens of individual vendors, this rep
 * **Key Traits:**
   * Uses public client flows (empty `client_secret`).
   * Demonstrates domain-pinned regular expressions that extract the local POSIX handle only from user principal names (UPNs) or emails belonging to your own tenant (e.g., `jdoe@company.com` maps to `jdoe`; `jdoe@otherdomain.com` does not match).
-  * Configures extended polling timeouts for enterprise MFA policies.
+  * Configures an extended polling timeout (`max_poll_seconds = 600`) so users have time to complete their identity provider's conditional-access / MFA challenges during approval.
 
 ### 3. Academic & Research Federation Pattern
 * [cilogon.conf](cilogon.conf)

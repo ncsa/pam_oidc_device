@@ -1,6 +1,6 @@
 # Fallback defaults if built directly via rpmbuild without Makefile defines
 %{!?mod_name:    %global mod_name pam_oidc_device}
-%{!?mod_version: %global mod_version 0.3.5}
+%{!?mod_version: %global mod_version 0.3.6}
 %{!?mod_summary: %global mod_summary PAM authentication module for OAuth 2.0 Device Authorization Grant}
 
 Name:           %{mod_name}

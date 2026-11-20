@@ -1,8 +1,16 @@
 # Threat Model & Security Architecture
 
-`pam_oidc_device` is a Linux Pluggable Authentication Module (PAM) executing inside privileged process spaces (such as OpenSSH `sshd`) to authenticate system users via the [OAuth 2.0 Device Authorization Grant](https://oauth.net/2/device-flow/) ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Because authentication modules operate at the primary security boundary of the operating system, this document details the system trust boundaries, threat matrix, defense mechanisms, and implementation specifics.
+`pam_oidc_device` is a Linux Pluggable Authentication Module (PAM) executing inside privileged process spaces (such as OpenSSH `sshd`) to authenticate system users via the [OAuth 2.0 Device Authorization Grant](https://oauth.net/2/device-flow/) ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Because authentication modules operate at the primary security boundary of the operating system, this document details the system trust boundaries, threat matrix, defense mechanisms, and implementation specifics. OpenSSH is the concrete deployment used throughout; the trust boundaries and controls hold for any PAM-managed service that hosts the module (see [Beyond SSH: Other PAM Services](../README.md#beyond-ssh-other-pam-services)).
 
 > **Security disclosures.** To report a vulnerability in `pam_oidc_device`, follow the [security disclosure procedure](../SECURITY.md).
+
+> [!NOTE]
+> **Key finding — the module's top residual risk.** Device-code phishing (§8) cannot
+> be closed in-module: in that attack the sign-in prompt reaches the *attacker*, not
+> the approving user, so no in-prompt control can stop it. It is mitigated only by
+> operator controls — one descriptive OAuth client per host, source-network limits,
+> and user vigilance. All other threats below have in-module or in-stack technical
+> mitigations.
 
 ## Table of Contents
 
@@ -30,6 +38,25 @@ The module operates across three distinct operational boundaries:
 **Figure 1 — Trust boundary overview.** The three trust zones, and the
 trust relationships that run within and between them:
 
+```mermaid
+flowchart LR
+    subgraph LH["Local host"]
+        PAM["PAM application context<br/>(e.g. /usr/sbin/sshd)"]
+        CONF["Configuration file<br/>/etc/pam_oidc_device.conf"]
+    end
+    subgraph IDP["Identity provider (IdP)"]
+        EP["device-authorization, token, UserInfo endpoints<br/>+ discovery endpoint when use_pkce = auto"]
+    end
+    subgraph UC["User &amp; client device"]
+        TERM["SSH terminal prompt"]
+        BROW["Web browser"]
+    end
+    CONF -->|"POSIX ownership &amp; permission checks on fail-closed open"| PAM
+    PAM -->|"HTTPS, TLS 1.2+, certificate verification"| EP
+    BROW -->|"authenticated browser session; user credentials never reach the module"| EP
+    TERM -.->|"user code, shared out-of-band; never transmitted through the module"| BROW
+```
+
 *Zones:*
 
 | Zone | Contents |
@@ -38,14 +65,11 @@ trust relationships that run within and between them:
 | **Identity provider (IdP)** | The device-authorization, token, and UserInfo endpoints — plus the OIDC discovery endpoint when `use_pkce = auto`. |
 | **User & client device** | The SSH terminal prompt and an external web browser. |
 
-*Trust relationships:*
-
-| Trust relationship | Connects | Protection |
-| --- | --- | --- |
-| Config & POSIX access | PAM application context to configuration file (within the local host) | Ownership and permission checks (`root:root`, `0600`/`0640`) on a fail-closed open; any deviation aborts authentication |
-| Enforced TLS transport | Local host to the IdP's OAuth/OIDC endpoints | HTTPS only, TLS 1.2+, certificate verification enabled (`CURLOPT_SSL_VERIFYPEER=1`, `CURLOPT_SSL_VERIFYHOST=2`) |
-| Out-of-band browser session | IdP to the user's browser | A standard authenticated browser session; user credentials are never presented to, or seen by, the module |
-| User verification code | SSH terminal to web browser (on the user's own device) | The code is the only material shared between the two; it is never transmitted through the module |
+*Trust relationships:* each arrow in the figure labels the protection on that
+relationship (fail-closed config-file checks; enforced TLS 1.2+ with certificate
+verification; a browser session that never exposes user credentials to the
+module; and a user code shared out-of-band, never transmitted through the
+module).
 
 ### 1. Local Host Integrity (Privileged Kernel & Process Boundary)
 
@@ -74,10 +98,10 @@ trust relationships that run within and between them:
 | **Medium** | Privilege Escalation via Group Claims | IdP user lacking required operational roles gains host machine access. | Evaluation of UserInfo group/role claims against strict allow and deny group lists (deny list takes precedence). | `verify_group_membership()` |
 | **Medium** | Config File Manipulation | Low-privileged local user tampers with `/etc/pam_oidc_device.conf` or uses symlink traversal to alter auth logic. | Secure file descriptor opening (`O_NOFOLLOW`, `O_CLOEXEC`), strict file ownership checks (`uid 0`, `gid 0`), and permission validation (`0600`/`0640`). | `load_config()` |
 | **Medium** | Token Replay / Token Spoofing | Stale, expired, or wrong-audience access tokens are accepted by the PAM module. | Authoritative IdP enforcement when the token is presented to the `userinfo_endpoint`, complemented by a fail-closed `token_type = Bearer` check, opt-in local claims inspection (`exp`, `nbf`, `iss`, `aud`), and a JWT-sub ↔ UserInfo-sub consistency check. | `verify_token_metadata()`, `jwt_extract_claim_string()` |
-| **High** | Device-Code Phishing (Social Engineering) | An attacker who already has a session on the target host (stolen or socially engineered access) initiates the device flow *themselves*, copies the verification URL and user code, and persuades the victim to approve it ("IT here, please confirm this sign-in"). The identity check passes because the identity really is the victim's; PKCE provides no protection because the attacker started the flow and holds its `code_verifier`. No technical vulnerability is required — the impact is full account takeover through social engineering. | **Residual risk.** The sign-in prompt reaches the party that *ran ssh* (in this attack, the attacker); the victim only sees the IdP's approval page — so in-prompt host identification (present in v0.3.3, removed) cannot reach the approver and was removed rather than carried further. Effective controls: register one descriptive OAuth client per host or cluster (e.g. "ssh:db-prod-3") so the IdP's *approval page* tells the victim which machine is requesting; restrict which source networks may use the device flow for privileged accounts; pair with a second factor on the approval session. User vigilance is the final control. See §8. | operator policy: per-host OAuth client registration, source-network limits; `docs/threat-model.md` §8 |
-| **Medium** | Device Code Interception / Replay | An attacker who *intercepts or recovers* a live `device_code` (log leakage, network compromise, or shoulder-surfing a code the legitimate user is completing) attempts to complete the token exchange instead of the legitimate flow. | Optional PKCE (RFC 7636) S256 binding: a fresh per-attempt CSPRNG `code_verifier` ties the token exchange to the originating device flow, so a stolen `device_code` alone cannot obtain tokens when enabled. **Scope boundary:** PKCE protects only against an *interceptor* who was not the flow's initiator — it does **not** stop device-code phishing, where the attacker is the initiator (row above; see §8). | `pkce_generate_code_verifier()`, `pkce_compute_s256_challenge()`, `use_pkce` |
+| **High** | Device-Code Phishing (Social Engineering) | An attacker who already has a terminal session on the host initiates the device flow *themselves* and persuades a victim to approve it; the identity check passes because the identity really is the victim's, and PKCE offers no protection because the attacker holds the flow's `code_verifier`. | **Residual risk — cannot be closed in-module** (the sign-in prompt reaches the attacker, not the approver). Mitigated only by operator controls: one descriptive OAuth client per host, source-network limits, second factor on the approval session, user vigilance. See §8. | operator policy; full analysis in §8 |
+| **Medium** | Device Code Interception / Replay | An attacker who *intercepts or recovers* a live `device_code` (log leakage, network compromise, shoulder-surfing) attempts to complete the token exchange instead of the legitimate flow. | Optional PKCE (RFC 7636) S256 binding: a fresh per-attempt CSPRNG `code_verifier` ties the token exchange to the flow's *initiator*, so a stolen `device_code` alone cannot obtain tokens when enabled. **Scope boundary:** this does not stop device-code phishing, where the attacker *is* the initiator (§8). | `pkce_generate_code_verifier()`, `pkce_compute_s256_challenge()`, `use_pkce`; see §7 |
 | **Low** | Denial of Service (DoS) via HTTP Buffers | Rogue server sends unbounded HTTP response payloads or redirection loops to exhaust host resources. | Strict HTTPS protocol enforcement, redirection disabling, request timeouts, and fixed response size limits (256 KiB). | `http_request()`, `write_callback()` |
-| **Medium** | Provider Rate-Limit Exhaustion (Self-DoS) | A pre-auth client that loops SSH connections against usernames that pass the local allow/deny pre-flight generates one device-authorization request per connection and can exhaust the OAuth client's provider-side rate limit, locking out legitimate sign-ins (HTTP 429 / `slow_down`). | Per-source pre-auth throttling at the SSH layer (`MaxStartups`, `PerSourcePenalties` on OpenSSH ≥ 9.7, `MaxAuthTries`, `LoginGraceTime`) plus narrow local allow-lists (pre-flight rejection happens before any provider contact). The source *is* identifiable inside the module (sshd sets `PAM_RHOST`, readable via `pam_get_item`), but in-module per-source limiting would need state shared by concurrent `sshd` workers, which is outside PAM module scope. See §9. | sshd configuration; `verify_user_access()` pre-flight |
+| **Medium** | Provider Rate-Limit Exhaustion (Self-DoS) | A pre-auth source that loops SSH connections against usernames passing the local pre-flight check issues one device-authorization request per connection and can exhaust the OAuth client's provider-side rate limit, locking out legitimate sign-ins (HTTP 429 / `slow_down`). | Per-source pre-auth throttling at the SSH layer plus narrow local allow-lists (rejection happens before any provider contact); in-module limiting is out of PAM scope. See §9. | sshd configuration; `verify_user_access()` pre-flight; see §9 |
 
 ---
 
@@ -117,7 +141,27 @@ Mapping identity claims from an [OpenID Connect Core 1.0](https://openid.net/spe
 token exchange completes, a linear sequence of gates is evaluated using the PAM
 username and the provider's UserInfo payload: any failed gate fails closed and
 rejects the login, and only a fully passing path reaches
-**GRANT AUTHENTICATION** (`PAM_SUCCESS`).
+**GRANT AUTHENTICATION** (`PAM_SUCCESS`):
+
+```mermaid
+flowchart TD
+    START["PAM username + provider UserInfo payload<br/>(after token exchange)"]
+    G1{"Gate 1: verify_user_access()<br/>deny_users / allow_users, uid-0 check"}
+    G2{"Gate 2: UserInfo retrieval<br/>HTTPS GET /userinfo over enforced TLS"}
+    G3{"Gate 3: verify_claim()<br/>configured claim matches PAM username"}
+    G4{"Gate 4: verify_group_membership()<br/>group/role allow &amp; deny lists"}
+    GRANT(["GRANT AUTHENTICATION<br/>PAM_SUCCESS"])
+    DENY(["DENY LOGIN<br/>fail-closed rejection"])
+    START --> G1
+    G1 -->|rejects| DENY
+    G1 -->|passes| G2
+    G2 -->|request or transport fails| DENY
+    G2 -->|HTTP 200 payload arrives| G3
+    G3 -->|claim missing or no match| DENY
+    G3 -->|claim matches| G4
+    G4 -->|deny-list hit, no matching allowed<br/>group, or unparseable claim| DENY
+    G4 -->|passes, or no group policy configured| GRANT
+```
 
 | # | Gate | What is evaluated | Rejects when | Continues when |
 | --- | --- | --- | --- | --- |
@@ -162,7 +206,7 @@ HTTP network interactions managed by `http_request()` enforce security and stabi
 * **Enforced TLS Encryption**: Transport options force HTTPS (`CURLOPT_PROTOCOLS_STR` / `CURLOPT_PROTOCOLS` set to `"https"`). Unencrypted HTTP endpoints are rejected.
 * **Redirection Control**: Redirects are disabled (`CURLOPT_FOLLOWLOCATION = 0L`) to prevent credential redirection to unexpected hosts.
 * **Payload Bound Enforcement**: Network response payloads are captured via `write_callback()`, which enforces a maximum response size of 256 KiB (`MAX_HTTP_RESPONSE_SIZE`) to mitigate memory allocation attacks.
-* **Monotonic Deadline Polling**: Polling loops calculate deadline expirations using the POSIX monotonic clock (`CLOCK_MONOTONIC`) — a clock that only counts forward like a stopwatch and is unaffected by wall-clock time adjustments — together with `clock_nanosleep()`, preventing clock adjustments from affecting authentication timeouts.
+* **Monotonic Deadline Polling**: Polling loops calculate deadline expirations using the POSIX monotonic clock (`CLOCK_MONOTONIC`) together with `clock_nanosleep()`, so wall-clock adjustments (NTP steps, manual time changes) cannot affect authentication timeouts.
 * **Transient Error Backoff**: Non-OAuth HTTP errors (e.g., HTTP 429 rate limits, HTTP 5xx server errors, network dropouts) trigger exponential backoff rather than immediate failure, ensuring resilience during temporary provider disturbances.
 
 ### 7. PKCE Device-Flow Binding (RFC 7636)
@@ -194,7 +238,7 @@ Device-code phishing is the device grant's known social-engineering attack, and 
 
 PKCE does **not** mitigate this: the attacker initiated the flow, so they hold the `code_verifier`; PKCE (see §7) only stops a *receiving* party who merely intercepted or recovered the `device_code`. Likewise, the identity checks (§4) cannot stop it, because the identity really is the victim's.
 
-**Who sees what matters.** The module's sign-in prompt is delivered to the terminal of whoever ran `ssh` — in this attack, the *attacker*. The phishing victim only ever sees the identity provider's **approval page**. (The module can read the connecting source — sshd sets `PAM_RHOST`, available via `pam_get_item(PAM_RHOST)`; on console logins PAM_RHOST is the local host name, so it is identifying context, not a trusted input.) Any control that informs the *approver* must therefore live where the approver looks: the IdP's approval page. An earlier mitigation named the target host in the prompt itself (`[prompt] show_host` and the `{host}` template token in v0.3.3); it was removed because it could not reach the victim.
+**Who sees what matters.** The module's sign-in prompt is delivered to the terminal of whoever ran `ssh` — in this attack, the *attacker*. The phishing victim only ever sees the identity provider's **approval page**. (The connecting source is exposed to the PAM service as `PAM_RHOST`, set by the SSH service; on console logins it is the local host name, so it is identifying context, not a trusted input.) Any control that informs the *approver* must therefore live where the approver looks: the IdP's approval page. An earlier mitigation named the target host in the prompt itself (`[prompt] show_host` and the `{host}` template token in v0.3.3); it was removed because it could not reach the victim.
 
 Effective controls, in descending order of leverage:
 
@@ -212,7 +256,7 @@ Effective controls, in descending order of leverage:
 
 **Threat.** Every SSH connection for a username that passes the module's allow/deny pre-flight check issues one device-authorization request to the provider *before* any user interaction (the request is what carries the sign-in prompt). A source that opens connections in a loop — an SSH scanner, a credential brute-forcer, or a misbehaving client retrying forever — can exhaust the provider-side rate limit for this OAuth client and lock *legitimate* users out of their sign-ins (HTTP 429 responses; `slow_down`-style errors from the provider). The impact is self-inflicted denial of service, plus the risk of the provider flagging the client for abuse.
 
-**Why the module does not mitigate it in-code.** The connecting source *is* identifiable inside the module — sshd sets `PAM_RHOST`, readable via `pam_get_item(PAM_RHOST)` — but per-source rate limiting would still need state shared by the concurrent `sshd` workers (each connection is a separate process with its own PAM invocation), which is outside PAM module scope. The SSH layer already enforces per-source pre-auth throttling, and that is the correct place for this control:
+**Why the module does not mitigate it in-code.** The connecting source *is* identifiable to the PAM service — it is exposed as `PAM_RHOST`, set by the SSH service — but per-source rate limiting would still need state shared by the concurrent `sshd` workers (each connection is a separate process with its own PAM invocation), which is outside PAM module scope. The SSH layer already enforces per-source pre-auth throttling, and that is the correct place for this control:
 
 | Control | Where | Effect |
 | --- | --- | --- |
