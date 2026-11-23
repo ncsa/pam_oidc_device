@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-23
+
+### Changed
+
+- **Built-in default prompt: dropped the "auto-completes on sign-in" status-line
+  clause (`src/message.c`):** the trailing status line of the built-in default
+  prompt no longer carries the "auto-completes on sign-in" note — the phrasing was
+  ambiguous (browser sign-in vs. terminal sign-in) and redundant with the "Sign in
+  via browser" instruction and the "Press [Enter] to begin..." confirmation. The
+  status line now reads `Waiting for approval.` (approval window unknown, or
+  `show_expiry = false`) or `Waiting for approval (expires in 2m).` (known
+  window). `show_expiry` and the `{expiry}` template token semantics are unchanged,
+  and custom `init_message` templates are unaffected. The rendered-prompt samples in
+  `README.md`, `docs/getting-started.md`, and the shipped `config/pam_oidc_device.conf`,
+  plus the `show_expiry` field doc in `include/pam_oidc_device.h`, were updated to
+  match.
+
 ## [0.3.6] - 2026-11-19
 
 ### Changed

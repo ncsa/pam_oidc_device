@@ -81,7 +81,7 @@ Sign in via browser:
   https://auth.example.com/oauth2/device/code?user_code=ABCD-EFGH
 
 Manual entry: https://auth.example.com/oauth2/device/code  |  Code: ABCD-EFGH
-Waiting for approval (expires in 2m; auto-completes on sign-in).
+Waiting for approval (expires in 2m).
 Press [Enter] to begin...
 ```
 

@@ -608,13 +608,13 @@ static void test_prompt_rendering(void **state) {
      * (docs/threat-model.md §8)[cite: 7] */
     assert_string_equal(def_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                  "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                 "Waiting for approval; auto-completes on sign-in.\n");
+                                 "Waiting for approval.\n");
     char def_plain_out[512];
     assert_int_equal(render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, def_plain_out,
                                            sizeof(def_plain_out)),
                      0);
     assert_string_equal(def_plain_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                       "Waiting for approval; auto-completes on sign-in.\n");
+                                       "Waiting for approval.\n");
 
     /* With show_expiry on the built-in default carries the compact "(expires in ...)" clause in
      * the trailing status line; the window is the provider's expires_in clamped by
@@ -628,21 +628,21 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_exp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                      "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                     "Waiting for approval (expires in 15m; auto-completes on sign-in).\n");
+                                     "Waiting for approval (expires in 15m).\n");
     /* Sub-minute windows render in seconds (plain-URL form, no manual-entry line) */
     char def_exp_sec_out[512];
     assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 45, def_exp_sec_out,
                                            sizeof(def_exp_sec_out)),
                      0);
     assert_string_equal(def_exp_sec_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                         "Waiting for approval (expires in 45s; auto-completes on sign-in).\n");
+                                         "Waiting for approval (expires in 45s).\n");
     /* show_expiry on but the window unknown (0): the expiry parenthetical is omitted entirely */
     char def_exp_unknown_out[512];
     assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0,
                                            def_exp_unknown_out, sizeof(def_exp_unknown_out)),
                      0);
     assert_string_equal(def_exp_unknown_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                             "Waiting for approval; auto-completes on sign-in.\n");
+                                             "Waiting for approval.\n");
     /* show_expiry off with a known window: the approval window never appears in the
      * built-in default */
     char def_noexp_out[512];
@@ -651,7 +651,7 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_noexp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                        "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                       "Waiting for approval; auto-completes on sign-in.\n");
+                                       "Waiting for approval.\n");
 
     /* [qr] enabled = true: the leading blank line is omitted — the QR block's bottom vertical
      * quiet zone already separates the prompt from the rendered art */
@@ -664,7 +664,7 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_qr_out, "Sign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                     "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                    "Waiting for approval; auto-completes on sign-in.\n");
+                                    "Waiting for approval.\n");
 
     /* {expiry} template token expands to the compact approval window in any template
      * (independent of show_expiry), or to an empty string when the window is unknown */

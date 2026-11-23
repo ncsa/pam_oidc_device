@@ -130,7 +130,7 @@ max_poll_seconds = 120
 #     https://auth.example.com/oauth2/device/code?user_code=XXXX-XXXX
 #
 #   Manual entry: https://auth.example.com/oauth2/device/code  |  Code: XXXX-XXXX
-#   Waiting for approval (expires in 2m; auto-completes on sign-in).
+#   Waiting for approval (expires in 2m).
 # (the compact URL + code block is shown when the IdP does not provide a
 # direct-link URL). Placeholders: {url} (verification URL),
 # {url_complete} (direct-link URL with the code embedded, if the IdP provides
@@ -145,7 +145,7 @@ max_poll_seconds = 120
 # init_message = Sign in at {url} with code {code}
 # Show the device-code approval window in the prompt (default: true). With the built-in
 # default template it is named in the trailing status line ("Waiting for
-# approval (expires in 15m; auto-completes on sign-in)."); in custom
+# approval (expires in 15m)."); in custom
 # templates use the {expiry} token, which works regardless of this key. Set to false to
 # hide the approval window.
 # show_expiry = false

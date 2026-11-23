@@ -189,10 +189,8 @@ typedef struct {
     char init_message[MAX_INIT_MSG_LEN];     /**< Custom template string for user terminal prompt. */
     int show_expiry;                         /**< Flag: 1 (default) adds the device-code approval window to the
                                               *  trailing status line of the built-in default template
-                                              *  ("Waiting for approval (expires in 15m; auto-completes on
-                                              *  sign-in)."); 0 hides it
-                                              *  ("Waiting for approval; auto-completes on sign-in."). The window
-                                              *  is the provider's
+                                              *  ("Waiting for approval (expires in 15m)."); 0 hides it
+                                              *  ("Waiting for approval."). The window is the provider's
                                               *  `expires_in` clamped by `max_poll_seconds`. Independent of this
                                               *  flag, the `{expiry}` token in any template expands to the
                                               *  compact duration ("45s", "15m", "1h 5m") or to an empty string
