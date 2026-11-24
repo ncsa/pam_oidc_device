@@ -53,6 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value dump is allowed from `debug` upward — one level below the PII-protected UserInfo
   claim dumps, which remain `verbose`-only.
 
+### Fixed
+
+- **JWT audience check now accepts comma-bearing literal audiences (`src/jwt.c`):**
+  `verify_token_metadata()` matched the configured `audience` only as a
+  comma-separated list, so an audience value that itself contains a comma —
+  CILogon's OA4MP identifier
+  `cilogon:oa4mp,2012:/client_id/<client-id-md5>`, where the comma is part of the
+  versioned namespace, not a delimiter — was fragmented and could never match,
+  failing every device-flow sign-in at `verify_jwt_claims = true`. The configured
+  value is now matched as a single literal audience (whitespace-trimmed, exact)
+  first, falling back to the comma-separated list semantics only when the whole
+  value does not match; ordinary multi-audience lists behave exactly as before.
+  The PII-safe `Token audience mismatch` log line was also made consistent with
+  the `debug`/`verbose` claim dump: for a string `aud` claim it now reports the
+  received value's raw length (the same unescaped text the dump prints), instead
+  of the JSON-representation length (quotes + escaped slashes), which made the
+  two disagree.
+
 ## [0.3.6] - 2026-11-19
 
 ### Changed

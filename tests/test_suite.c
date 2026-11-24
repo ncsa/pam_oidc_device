@@ -964,6 +964,120 @@ static void test_jwt_audience_array(void **state) {
 }
 
 /**
+ * @brief Unit test verifying that a comma-bearing audience (CILogon OA4MP)
+ *        matches as a single literal `audience` value.
+ *
+ * OA4MP identifiers embed a literal comma (`cilogon:oa4mp,2012:/client_id/<md5>`);
+ * `verify_token_metadata()` must first treat the entire configured value as one
+ * audience — the comma-list split alone would fragment such a value and never
+ * match the token's `aud` claim.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_comma_bearing_value(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Payload:
+     * {"iss":"https://test.cilogon.org","aud":"cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51","exp":2524608000,"nbf":1600000000}
+     */
+    const char *oa4mp_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                            "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJjaWxvZ29uOm9hNG1wLDIwMTI6L2NsaWVudF"
+                            "9pZC8zZmU4MDg3ZWU1Mzk0"
+                            "NmJhODNmZGYwNjA4OGIxZmM1MSIsImV4cCI6MjUyNDYwODAwMCwibmJmIjoxNjAwMDAwMDAwfQ.sig";
+
+    /* The whole OA4MP value is one audience: accepted. */
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, NULL), 0);
+
+    /* A different client's OA4MP identifier must still be rejected: neither the
+     * whole value nor any comma fragment of it equals the token's aud. */
+    strncpy(cfg.audience, "cilogon:oa4mp,2012:/client_id/aaaa0000bbbb1111cccc2222dddd3333", sizeof(cfg.audience) - 1);
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test pinning the comma-separated `audience` list behavior.
+ *
+ * When the whole configured value does not match the token's aud (the comma
+ * case is absent), the value is still split on commas and each whitespace-
+ * trimmed fragment is accepted as a candidate, preserving the documented
+ * multi-audience configuration.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_comma_list(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "aud-1, aud-2", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Payload: {"iss":"https://test.cilogon.org","aud":"aud-2","exp":2524608000} */
+    const char *jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                      "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJhdWQtMiIsImV4cCI6MjUyNDYwODAwMH0.sig";
+
+    /* aud-2 is the second comma fragment: accepted. */
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), 0);
+
+    /* An aud outside the list: rejected. */
+    strncpy(cfg.audience, "aud-1, aud-3", sizeof(cfg.audience) - 1);
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test pinning the raw-value length reported on an audience mismatch.
+ *
+ * The PII-safe mismatch line carries only the received value's length. For a
+ * string aud claim that length must be the RAW value's length — the same text
+ * the DEBUG claim dump prints — so an operator can cross-check the two; the
+ * previous JSON-representation length (extra quotes and escaped slashes) made
+ * the number disagree with the displayed value.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_mismatch_length(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "other-client-id", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_ERROR;
+
+    /* Payload:
+     * {"iss":"https://test.cilogon.org","aud":"cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51","exp":2524608000,"nbf":1600000000}
+     */
+    const char *oa4mp_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                            "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJjaWxvZ29uOm9hNG1wLDIwMTI6L2NsaWVudF"
+                            "9pZC8zZmU4MDg3ZWU1Mzk0"
+                            "NmJhODNmZGYwNjA4OGIxZmM1MSIsImV4cCI6MjUyNDYwODAwMCwibmJmIjoxNjAwMDAwMDAwfQ.sig";
+
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, pamh), -1);
+
+    /* The 62-character aud value: the mismatch line must report 62, not the old
+     * 66 (62 + 2 JSON quotes + 2 escaped slashes). */
+    assert_true(captured_syslog_contains("Token audience mismatch"));
+    assert_true(captured_syslog_contains("received value length: 62"));
+    assert_false(captured_syslog_contains("received value length: 66"));
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
  * @brief Unit test verifying RFC 7519 NumericDate handling for exp/nbf: fractional
  *        (json_type_double) values are enforced, non-numeric types are rejected, and
  *        the configurable missing-exp policy (require_exp_claim) is honored.
@@ -4443,6 +4557,9 @@ int main(void) {
         cmocka_unit_test(test_jwt_claim_dump_debug_and_above),
         cmocka_unit_test(test_jwt_unconfigured_binding_fail_closed),
         cmocka_unit_test(test_jwt_audience_array),
+        cmocka_unit_test(test_jwt_audience_comma_bearing_value),
+        cmocka_unit_test(test_jwt_audience_comma_list),
+        cmocka_unit_test(test_jwt_audience_mismatch_length),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),
         cmocka_unit_test(test_jwt_non_finite_claims_rejected),
         cmocka_unit_test(test_jwt_malformed_structure),

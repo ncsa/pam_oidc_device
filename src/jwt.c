@@ -146,6 +146,37 @@ static char *base64url_decode(const char *input, size_t *out_len) {
 }
 
 /**
+ * @brief Checks whether a candidate value exactly matches a JWT's `aud` claim.
+ *
+ * The `aud` claim may be a JSON string or an array of strings (RFC 7519 §4.1);
+ * a candidate matches when it is equal (byte-for-byte) to the string value or to
+ * any string element of the array. Non-string array elements are ignored.
+ *
+ * @param[in] j_aud     Parsed `aud` claim (string or array), or NULL.
+ * @param[in] candidate Expected audience value (non-NULL, non-empty).
+ * @return 1 when @p candidate matches the claim, 0 otherwise.
+ */
+static int aud_value_matches(struct json_object *j_aud, const char *candidate) {
+    if (!j_aud || !candidate) {
+        return 0;
+    }
+    if (json_object_is_type(j_aud, json_type_string)) {
+        return strcmp(json_object_get_string(j_aud), candidate) == 0;
+    }
+    if (json_object_is_type(j_aud, json_type_array)) {
+        size_t array_len = json_object_array_length(j_aud);
+        for (size_t i = 0; i < array_len; i++) {
+            struct json_object *item = json_object_array_get_idx(j_aud, JSON_ARRAY_IDX(i));
+            if (item && json_object_is_type(item, json_type_string) &&
+                strcmp(json_object_get_string(item), candidate) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Inspects a decoded JWT's claims (exp, nbf, iss, aud) for local pre-flight validation.
  *
  * NOTE: This performs claims-only inspection and does NOT verify the JWT cryptographic
@@ -168,6 +199,14 @@ static char *base64url_decode(const char *input, size_t *out_len) {
  *
  * @note The `exp` and `nbf` claims are RFC 7519 NumericDate values and may be fractional;
  *       both integer and double JSON types are accepted, all others are rejected.
+ *
+ * @note The `audience` configuration value is matched as a *single literal audience*
+ *       (whitespace-trimmed, exact) first, because audience URNs can contain commas —
+ *       e.g. CILogon's OA4MP identifier `cilogon:oa4mp,2012:/client_id/<md5>`. When the
+ *       whole value does not match, it is then treated as a comma-separated list of
+ *       acceptable audiences, each fragment whitespace-trimmed and matched exactly.
+ *       The token's `aud` claim may be a JSON string or an array (RFC 7519 §4.1);
+ *       matching is exact-equality against the string value or any array member.
  *
  * @note At LOGLEVEL_DEBUG (and above) the token's `iss`, `aud`, `exp`, and `nbf` claims
  *       (when present) are additionally logged before evaluation so operators can discover
@@ -395,7 +434,14 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         return -1;
     }
 
-    /* Step 6: Verify Audience Claim (aud) */
+    /* Step 6: Verify Audience Claim (aud).
+     *
+     * The configured value is matched as a single literal audience first (so
+     * comma-bearing URNs such as CILogon's OA4MP identifier
+     * `cilogon:oa4mp,2012:/client_id/<md5>` work), and only then — when the
+     * whole value did not match — as a comma-separated list of acceptable
+     * audiences. Both paths compare exact (byte-for-byte) equality against the
+     * `aud` claim, which may be a JSON string or an array (RFC 7519 §4.1). */
     if (strlen(cfg->audience) > 0) {
         struct json_object *j_aud = NULL;
         int aud_valid = 0;
@@ -403,49 +449,62 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
         if (json_object_object_get_ex(payload_json, "aud", &j_aud)) {
             char aud_cfg_copy[256];
             if (copy_checked(aud_cfg_copy, sizeof(aud_cfg_copy), cfg->audience) == 0) {
-                char *saveptr = NULL;
-                char *expected_aud = strtok_r(aud_cfg_copy, ",", &saveptr);
-
-                while (expected_aud && !aud_valid) {
-                    while (isspace((unsigned char)*expected_aud)) {
-                        expected_aud++;
+                /* Candidate 1: the entire configured value, whitespace-trimmed. */
+                char *full_aud = aud_cfg_copy;
+                while (isspace((unsigned char)*full_aud)) {
+                    full_aud++;
+                }
+                if (*full_aud) {
+                    char *tail = full_aud + strlen(full_aud) - 1;
+                    while (tail > full_aud && isspace((unsigned char)*tail)) {
+                        *tail = '\0';
+                        tail--;
                     }
-                    if (*expected_aud != '\0') {
-                        char *end = expected_aud + strlen(expected_aud) - 1;
-                        while (end > expected_aud && isspace((unsigned char)*end)) {
-                            *end = '\0';
-                            end--;
-                        }
+                    if (aud_value_matches(j_aud, full_aud)) {
+                        aud_valid = 1;
+                    }
+                }
 
-                        if (json_object_is_type(j_aud, json_type_string)) {
-                            if (strcmp(json_object_get_string(j_aud), expected_aud) == 0) {
+                /* Candidates 2..N: comma-separated list of acceptable audiences. */
+                if (!aud_valid) {
+                    char *saveptr = NULL;
+                    char *expected_aud = strtok_r(aud_cfg_copy, ",", &saveptr);
+
+                    while (expected_aud && !aud_valid) {
+                        while (isspace((unsigned char)*expected_aud)) {
+                            expected_aud++;
+                        }
+                        if (*expected_aud != '\0') {
+                            char *end = expected_aud + strlen(expected_aud) - 1;
+                            while (end > expected_aud && isspace((unsigned char)*end)) {
+                                *end = '\0';
+                                end--;
+                            }
+                            if (aud_value_matches(j_aud, expected_aud)) {
                                 aud_valid = 1;
                             }
-                        } else if (json_object_is_type(j_aud, json_type_array)) {
-                            size_t array_len = json_object_array_length(j_aud);
-                            for (size_t i = 0; i < array_len; i++) {
-                                struct json_object *item = json_object_array_get_idx(j_aud, JSON_ARRAY_IDX(i));
-                                if (item && json_object_is_type(item, json_type_string) &&
-                                    strcmp(json_object_get_string(item), expected_aud) == 0) {
-                                    aud_valid = 1;
-                                    break;
-                                }
-                            }
                         }
+                        expected_aud = strtok_r(NULL, ",", &saveptr);
                     }
-                    expected_aud = strtok_r(NULL, ",", &saveptr);
                 }
             }
         }
 
         if (!aud_valid) {
             /* PII-safe: the received claim value is logged only as its length,
-             * never as the value itself (same rationale as the issuer check). */
+             * never as the value itself (same rationale as the issuer check).
+             * For a string claim the length is the RAW value's length — the same
+             * unescaped text the DEBUG dump prints — so an operator can
+             * cross-check the two; for an array claim it is the compact JSON
+             * representation's length. */
             size_t aud_received_len = 0;
-            const char *aud_repr = NULL;
             if (j_aud != NULL) {
-                aud_repr = json_object_to_json_string(j_aud);
-                aud_received_len = (aud_repr != NULL) ? strlen(aud_repr) : 0;
+                if (json_object_is_type(j_aud, json_type_string)) {
+                    aud_received_len = strlen(json_object_get_string(j_aud));
+                } else {
+                    const char *aud_repr = json_object_to_json_string_ext(j_aud, JSON_C_TO_STRING_NOSLASHESCAPE);
+                    aud_received_len = (aud_repr != NULL) ? strlen(aud_repr) : 0;
+                }
             }
             pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                           "Token audience mismatch (expected: '%s', received value length: %zu)", cfg->audience,

@@ -198,7 +198,10 @@ typedef struct {
     int case_sensitive;                      /**< Flag: 1 for case-sensitive username comparison, 0 otherwise. */
     loglevel_t loglevel; /**< Configured syslog verbosity level (none, error, info, debug, verbose). */
     char issuer[512];    /**< Expected token issuer claim (iss). */
-    char audience[256];  /**< Expected token audience claim (aud). */
+    char audience[256];  /**< Expected token audience claim (aud). A comma-bearing value (e.g. CILogon's
+                          *  OA4MP identifier `cilogon:oa4mp,2012:/client_id/<md5>`) is matched as one
+                          *  literal audience; otherwise the value may list several acceptable audiences
+                          *  separated by commas. */
     char jwks_url[512];  /**< Reserved: JWKS endpoint URL; parsed and validated, but not yet used for JWT signature
                             verification. */
     char introspection_endpoint[512]; /**< Reserved: RFC 7662 Token Introspection endpoint URL; parsed and validated,
