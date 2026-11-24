@@ -418,7 +418,7 @@ Log levels can be configured in `/etc/pam_oidc_device.conf` under `[runtime]` or
 | `none` | `0` | Disables all module syslog output. |
 | `error` | `1` | Logs operational failures, invalid configurations, and network errors. |
 | `info` | `2` | **Default.** Logs high-level auth success/failure lifecycle events. |
-| `debug` | `3` | Logs internal workflow steps, regex claim matches, and deadline clocks. |
+| `debug` | `3` | Logs internal workflow steps, regex claim matches, deadline clocks, and — when `verify_jwt_claims` is enabled — the access token's `iss`/`aud`/`exp`/`nbf` values, so operators can discover the correct `issuer`/`audience` settings. |
 | `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status, plus the full provider claim payload: every UserInfo claim name and value (and the group claim again at the allow/deny decision), so operators can see exactly what the IdP sent. |
 
 ### Polling Timeout (`max_poll_seconds`)

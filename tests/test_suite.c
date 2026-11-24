@@ -431,6 +431,11 @@ static void reset_captured_syslog_ring(void) {
     g_captured_syslog_ring_next = 0;
 }
 
+/* Forward declaration: defined below (near the log-drop test) but also used by the
+ * earlier JWT claim-dump test. */
+static int test_pam_noop_conv(int num_messages, const struct pam_message **message, struct pam_response **response,
+                              void *appdata_ptr);
+
 /**
  * @brief Unit test verifying cURL URL parameter encoding functionality[cite: 7].
  *
@@ -812,6 +817,77 @@ static void test_jwt_mismatch_claims(void **state) {
     strncpy(cfg.issuer, "https://sts.windows.net/tenant/", sizeof(cfg.issuer) - 1);
     strncpy(cfg.audience, "invalid-audience-guid", sizeof(cfg.audience) - 1);
     assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test pinning the LOGLEVEL_DEBUG-and-above JWT claim dump.
+ *
+ * At `loglevel = debug` (or `verbose`), `verify_token_metadata()` records the token's
+ * `iss`, `aud`, `exp`, and `nbf` claims (compact JSON representation) before evaluation
+ * so an operator with a misconfigured `issuer`/`audience` can see exactly what the
+ * provider's token carries. These claims are tenant/client/numeric identifiers rather
+ * than PII, so the value dump is allowed one level below the PII-protected UserInfo
+ * dumps. At `none`/`error`/`info` no claim value may reach the system log (mismatch
+ * lines carry lengths only).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_claim_dump_debug_and_above(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://sts.windows.net/tenant/", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "00000003-0000-0000-c000-000000000000", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_DEBUG;
+
+    /* Payload:
+     * {"iss":"https://sts.windows.net/tenant/","aud":"00000003-0000-0000-c000-000000000000","exp":2524608000,"nbf":1600000000}
+     */
+    const char *valid_jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjoyNTI0NjA4MDAwLCJuYmYiOjE2MDAwMDAwMDB9.sig";
+
+    /* DEBUG (the dump's new floor) + passing check: all four claim lines are recorded. */
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_true(captured_syslog_contains("JWT claim 'iss': \"https://sts.windows.net/tenant/\""));
+    assert_true(captured_syslog_contains("JWT claim 'aud': \"00000003-0000-0000-c000-000000000000\""));
+    assert_true(captured_syslog_contains("JWT claim 'exp': 2524608000"));
+    assert_true(captured_syslog_contains("JWT claim 'nbf': 1600000000"));
+
+    /* VERBOSE (above the floor): the dump is still recorded. */
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_true(captured_syslog_contains("JWT claim 'iss': \"https://sts.windows.net/tenant/\""));
+    assert_true(captured_syslog_contains("JWT claim 'aud': \"00000003-0000-0000-c000-000000000000\""));
+    assert_true(captured_syslog_contains("JWT claim 'exp': 2524608000"));
+    assert_true(captured_syslog_contains("JWT claim 'nbf': 1600000000"));
+
+    /* INFO (below the floor): the check passes but no claim value reaches the system log. */
+    cfg.loglevel = LOGLEVEL_INFO;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_false(captured_syslog_contains("JWT claim '"));
+
+    /* NONE: logging disabled — no claim value reaches the system log either. */
+    cfg.loglevel = LOGLEVEL_NONE;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_false(captured_syslog_contains("JWT claim '"));
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
 }
 
 /**
@@ -2774,8 +2850,8 @@ static void test_verify_group_membership_verbose_claim_log(void **state) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.case_sensitive = 1;
     cfg.loglevel = LOGLEVEL_VERBOSE;
-    strncpy(cfg.allow_groups, "sysadmins, devs", sizeof(cfg.allow_groups) - 1);
-    uinfo = json_tokener_parse("{\"groups\":\"users, sysadmins\"}");
+    strncpy(cfg.allow_groups, "sysadmins/ops", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":\"users, sysadmins/ops\"}");
     assert_non_null(uinfo);
     g_captured_syslog_calls = 0;
     g_captured_syslog_line[0] = '\0';
@@ -2783,7 +2859,7 @@ static void test_verify_group_membership_verbose_claim_log(void **state) {
     g_captured_syslog_priority = -1;
     assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 1);
     assert_int_equal(g_captured_syslog_calls, 2);
-    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: \"users, sysadmins\"");
+    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: \"users, sysadmins/ops\"");
     assert_string_equal(g_captured_syslog_line, "Group authorization verified for claim field 'groups'");
     json_object_put(uinfo);
 
@@ -2833,8 +2909,8 @@ static void test_verify_userinfo_identity_verbose_claim_dump(void **state) {
     (void)copy_checked(cfg.claim_regex, sizeof(cfg.claim_regex), "^([a-z]+)$");
     cfg.claim_capture_group = 1;
 
-    struct json_object *uinfo =
-        json_tokener_parse("{\"preferred_username\":\"alice\",\"email\":\"alice@example.com\",\"groups\":[\"devs\"]}");
+    struct json_object *uinfo = json_tokener_parse(
+        "{\"preferred_username\":\"alice\",\"email\":\"alice@example.com\",\"groups\":[\"devs\",\"ops/infra\"]}");
     assert_non_null(uinfo);
 
     /* VERBOSE: every claim is dumped (name + compact JSON value), regardless of hash order. */
@@ -2843,7 +2919,9 @@ static void test_verify_userinfo_identity_verbose_claim_dump(void **state) {
     assert_int_equal(verify_userinfo_identity(pamh, &cfg, LOGLEVEL_VERBOSE, "alice", uinfo, 123, NULL), PAM_SUCCESS);
     assert_true(captured_syslog_contains("UserInfo claim 'preferred_username': \"alice\""));
     assert_true(captured_syslog_contains("UserInfo claim 'email': \"alice@example.com\""));
-    assert_true(captured_syslog_contains("UserInfo claim 'groups': [\"devs\"]"));
+    assert_true(captured_syslog_contains("UserInfo claim 'groups': [\"devs\",\"ops/infra\"]"));
+    /* Slashes must reach the log unescaped (copy-paste safe), never backslash-slash. */
+    assert_false(captured_syslog_contains("UserInfo claim 'groups': [\"devs\",\"ops\\/infra\"]"));
     assert_false(captured_syslog_contains("UserInfo claim list truncated"));
 
     /* DEBUG (below VERBOSE): no claim name/value dump; only the PII-safe receipt. */
@@ -4362,6 +4440,7 @@ int main(void) {
         cmocka_unit_test(test_jwt_valid_metadata),
         cmocka_unit_test(test_jwt_expired_token),
         cmocka_unit_test(test_jwt_mismatch_claims),
+        cmocka_unit_test(test_jwt_claim_dump_debug_and_above),
         cmocka_unit_test(test_jwt_unconfigured_binding_fail_closed),
         cmocka_unit_test(test_jwt_audience_array),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),

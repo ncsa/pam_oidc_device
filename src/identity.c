@@ -525,8 +525,9 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
      * misses. Policy-consistent: the raw claim value is logged only at LOGLEVEL_VERBOSE,
      * never at DEBUG or below; pam_oauth_log() C-escapes every untrusted byte before
      * syslog. The compact JSON representation (no pretty-print spacing) is owned by
-     * the parsed tree and zeroed with it. */
-    const char *raw_group_claim = json_object_to_json_string_ext(j_group, 0);
+     * the parsed tree and zeroed with it. NOSLASHESCAPE keeps `/` unescaped so URN-style
+     * group names are copy-paste safe. */
+    const char *raw_group_claim = json_object_to_json_string_ext(j_group, JSON_C_TO_STRING_NOSLASHESCAPE);
     if (raw_group_claim) {
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "Group claim '%s' content: %s", target_field,
                       raw_group_claim);
@@ -701,8 +702,10 @@ int verify_userinfo_identity(pam_handle_t *pamh, const config_t *cfg, loglevel_t
             }
             /* Compact JSON representation of the value (string claims arrive JSON-quoted,
              * arrays/objects compacted, JSON null as "null"); owned by the parsed tree and
-             * zeroed with it. NULL only on serializer allocation failure. */
-            const char *value_repr = json_object_to_json_string_ext(it.val, 0);
+             * zeroed with it. NULL only on serializer allocation failure.
+             * NOSLASHESCAPE keeps `/` unescaped so URL/URN-style values are copy-paste
+             * safe. */
+            const char *value_repr = json_object_to_json_string_ext(it.val, JSON_C_TO_STRING_NOSLASHESCAPE);
             const char *value = value_repr ? value_repr : "(unserializable)";
             if (name_safe) {
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim '%s': %s", it.key, value);

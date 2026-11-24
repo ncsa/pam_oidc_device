@@ -39,9 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `verify_group_membership()` additionally records the `group_claim_field` claim
   immediately before allow/deny evaluation, so operators can see exactly what the provider
   sent when claim matching or `allow_groups`/`deny_groups` unexpectedly matches or
-  misses. Consistent with the PII redaction policy, the dumps are never emitted at
+  misses. Logged JSON values are serialized with slashes unescaped, so URL/URN-style
+   values are copy-paste safe. Consistent with the PII redaction policy, the dumps are never emitted at
   `debug` or below, untrusted bytes are C-escaped by the central logger, and claim names
   containing non-printable bytes remain withheld.
+- **Debug-and-above logging now records the inspected JWT's claims (`src/jwt.c`):** when
+  `loglevel = debug` (or `verbose`) and `verify_jwt_claims = true`, `verify_token_metadata()`
+  records the token's `iss`, `aud`, `exp`, and `nbf` claims (compact JSON representation, when
+  present) before any check runs, so an operator whose `issuer`/`audience` settings do
+  not match the provider's token can read the actual values from the log
+  (`JWT claim '<name>': <value>`) instead of the length-only mismatch line that routine
+  levels emit. These claims are tenant/client/numeric identifiers rather than PII, so the
+  value dump is allowed from `debug` upward — one level below the PII-protected UserInfo
+  claim dumps, which remain `verbose`-only.
 
 ## [0.3.6] - 2026-11-19
 

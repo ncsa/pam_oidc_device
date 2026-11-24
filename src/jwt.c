@@ -168,6 +168,12 @@ static char *base64url_decode(const char *input, size_t *out_len) {
  *
  * @note The `exp` and `nbf` claims are RFC 7519 NumericDate values and may be fractional;
  *       both integer and double JSON types are accepted, all others are rejected.
+ *
+ * @note At LOGLEVEL_DEBUG (and above) the token's `iss`, `aud`, `exp`, and `nbf` claims
+ *       (when present) are additionally logged before evaluation so operators can discover
+ *       the correct `issuer`/`audience` configuration values; these are tenant/client/
+ *       numeric identifiers rather than PII, so they are value-logged one level below the
+ *       UserInfo claim dumps. Below DEBUG only lengths are recorded on a mismatch.
  */
 int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t *pamh) {
     if (!cfg) {
@@ -238,6 +244,36 @@ int verify_token_metadata(const char *jwt_str, const config_t *cfg, pam_handle_t
 
     time_t now = time(NULL);
     int leeway = cfg->clock_skew_leeway >= 0 ? cfg->clock_skew_leeway : 60;
+
+    /* Troubleshooting level: dump the token's iss/aud/exp/nbf claims (when present) so an
+     * operator can discover the correct `issuer`/`audience` values when the configured
+     * bindings do not match. These are tenant/client/numeric identifiers, not PII, and —
+     * unlike the PII-bearing UserInfo claims, which are value-dumped only at
+     * LOGLEVEL_VERBOSE — they are emitted from LOGLEVEL_DEBUG upward; below DEBUG
+     * (none/error/info) the mismatch lines carry lengths only. Because it runs before
+     * steps 3-6 it also covers the expired/nbf/missing-claim rejection paths.
+     * pam_oauth_log() C-escapes every untrusted byte before syslog. The compact JSON
+     * representation (no pretty-print spacing) is owned by the parsed tree and zeroed
+     * with it. */
+    {
+        struct json_object *j_claim = NULL;
+        const char *claim_repr = NULL;
+        static const char *const dump_claims[] = {"iss", "aud", "exp", "nbf"};
+        for (size_t i = 0; i < sizeof(dump_claims) / sizeof(dump_claims[0]); i++) {
+            if (json_object_object_get_ex(payload_json, dump_claims[i], &j_claim)) {
+                /* NOSLASHESCAPE: `iss` values are URLs; without it json-c emits `\/`,
+                 * mangling the value an operator would copy into the config. */
+                claim_repr = json_object_to_json_string_ext(j_claim, JSON_C_TO_STRING_NOSLASHESCAPE);
+                if (claim_repr) {
+                    /* Emitted from LOGLEVEL_DEBUG up: iss/aud/exp/nbf are tenant/client/
+                     * numeric identifiers, not PII (unlike the UserInfo claim dumps, which
+                     * stay VERBOSE-only). */
+                    pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_DEBUG, LOG_DEBUG, "JWT claim '%s': %s", dump_claims[i],
+                                  claim_repr);
+                }
+            }
+        }
+    }
 
     /* Step 3: Verify Expiration Claim (exp).
      *
