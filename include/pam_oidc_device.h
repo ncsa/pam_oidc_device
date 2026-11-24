@@ -232,31 +232,35 @@ typedef struct {
     int enforce_groups;         /**< Flag: 1 to require group/role authorization when no group lists are configured. */
     char group_claim_field[64]; /**< JSON field name in UserInfo containing group/role claims (e.g., "groups", "roles").
                                  */
-    int use_pkce;               /**< Three-state PKCE gate: 0 (default) off; 1 always extend the RFC 8628 device
-                                 *  flow with RFC 7636 PKCE (fresh CSPRNG `code_verifier` per attempt, its `S256`
-                                 *  `code_challenge` sent to the device authorization endpoint, the verifier
-                                 *  presented at the token endpoint); 2 ("auto") probe `discovery_endpoint` once
-                                 *  per attempt and enable PKCE only when the provider metadata advertises S256
-                                 *  PKCE support plus a device-authorization endpoint; probe failures fail safe
-                                 *  to 0. */
-    char discovery_endpoint[512]; /**< OIDC/OAuth discovery metadata URL (e.g.,
-                                   *  `https://idp/.well-known/openid-configuration`); used only when
-                                   *  `use_pkce` is 2 ("auto"). Empty otherwise. */
-    int qr_enabled;               /**< Flag: 1 to render the verification URI as a scannable terminal QR code
-                                   *  before the text prompt (default 0). Rendering failure is non-fatal. */
-    qr_style_t qr_style;          /**< Terminal glyph style: QR_STYLE_UTF8 (compact half-blocks, default) or
-                                   *  QR_STYLE_ASCII (one block character per module; maximum font support). */
-    char qr_block_char[2];        /**< Single printable ASCII character used for dark modules in the
-                                   *  QR_STYLE_ASCII style (default "#"). */
-    int qr_scale;                 /**< Integer enlargement factor for rendered QR modules, 1-3 (default 1). */
-    int qr_vertical_quiet_zone;   /**< Light (quiet-zone) module rows rendered above and below the QR symbol,
-                                   *  0-QR_QUIET_ZONE (default QR_QUIET_ZONE = the ISO/IEC 18004 minimum).
-                                   *  Lower values shrink the terminal block at the cost of scanner
-                                   *  robustness; the horizontal quiet zone always stays QR_QUIET_ZONE. */
-    qr_ec_t qr_ec_level;          /**< QR error-correction level (default QR_EC_MEDIUM). */
-    int qr_uri_complete;          /**< Flag: 1 (default) to encode `verification_uri_complete` when the provider
-                                   *  supplies it (the code is embedded, so no typing is needed on the second
-                                   *  device); 0 to prefer the plain `verification_uri` with manual code entry. */
+    char group_claim_delimiter[2]; /**< Single printable ASCII character used to split a string-typed group claim
+                                    *  value into individual group/role entries (default `','`). JSON-array claims are
+                                    *  unaffected (each element is one group). Example: an IdP that emits a single
+                                    *  semicolon-joined string (`"grp-a;grp-b"`) is configured with `';'`. */
+    int use_pkce;                  /**< Three-state PKCE gate: 0 (default) off; 1 always extend the RFC 8628 device
+                                    *  flow with RFC 7636 PKCE (fresh CSPRNG `code_verifier` per attempt, its `S256`
+                                    *  `code_challenge` sent to the device authorization endpoint, the verifier
+                                    *  presented at the token endpoint); 2 ("auto") probe `discovery_endpoint` once
+                                    *  per attempt and enable PKCE only when the provider metadata advertises S256
+                                    *  PKCE support plus a device-authorization endpoint; probe failures fail safe
+                                    *  to 0. */
+    char discovery_endpoint[512];  /**< OIDC/OAuth discovery metadata URL (e.g.,
+                                    *  `https://idp/.well-known/openid-configuration`); used only when
+                                    *  `use_pkce` is 2 ("auto"). Empty otherwise. */
+    int qr_enabled;                /**< Flag: 1 to render the verification URI as a scannable terminal QR code
+                                    *  before the text prompt (default 0). Rendering failure is non-fatal. */
+    qr_style_t qr_style;           /**< Terminal glyph style: QR_STYLE_UTF8 (compact half-blocks, default) or
+                                    *  QR_STYLE_ASCII (one block character per module; maximum font support). */
+    char qr_block_char[2];         /**< Single printable ASCII character used for dark modules in the
+                                    *  QR_STYLE_ASCII style (default "#"). */
+    int qr_scale;                  /**< Integer enlargement factor for rendered QR modules, 1-3 (default 1). */
+    int qr_vertical_quiet_zone;    /**< Light (quiet-zone) module rows rendered above and below the QR symbol,
+                                    *  0-QR_QUIET_ZONE (default QR_QUIET_ZONE = the ISO/IEC 18004 minimum).
+                                    *  Lower values shrink the terminal block at the cost of scanner
+                                    *  robustness; the horizontal quiet zone always stays QR_QUIET_ZONE. */
+    qr_ec_t qr_ec_level;           /**< QR error-correction level (default QR_EC_MEDIUM). */
+    int qr_uri_complete;           /**< Flag: 1 (default) to encode `verification_uri_complete` when the provider
+                                    *  supplies it (the code is embedded, so no typing is needed on the second
+                                    *  device); 0 to prefer the plain `verification_uri` with manual code entry. */
 } config_t;
 
 /**

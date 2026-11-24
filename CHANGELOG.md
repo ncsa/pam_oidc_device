@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.7] - 2026-11-23
 
+### Added
+
+- **`group_claim_delimiter` configuration option (`[access]`, `src/config.c`,
+  `src/identity.c`):** a single printable ASCII character (default `,`) used to split a
+  **string-typed** group claim into individual group/role entries before allow/deny matching.
+  JSON array claims are unaffected (each element is one group). This fixes IdPs that emit the
+  group list as one delimited string instead of a JSON array — e.g., a semicolon-joined
+  `member_of` attribute (`"grp-a;grp-b;grp-c"`) now works with
+  `group_claim_field = member_of` + `group_claim_delimiter = ;`; without it the whole string
+  was treated as one unmatchable group name. Multi-character and non-printable values are
+  rejected at config load.
+
 ### Changed
 
 - **Built-in default prompt: dropped the "auto-completes on sign-in" status-line

@@ -454,11 +454,12 @@ static int group_value_allowed(const char *val, const config_t *cfg, int case_se
  *
  * Enforces the configured `allow_groups`/`deny_groups` lists against the UserInfo group/role claim
  * located under `cfg->group_claim_field`. Supports JSON arrays of strings, single strings, and
- * comma-delimited strings. Denial lists take precedence over allow lists.
+ * delimited strings (a string-typed claim is split on the configured `group_claim_delimiter`,
+ * default `,`). Denial lists take precedence over allow lists.
  *
  * Fail-closed when any group policy is active: if the UserInfo payload is unusable, the claim
  * is absent or JSON null, the claim has an unrecognized type, an array element is not a string
- * (with a deny list configured), or a comma-delimited string cannot be fully parsed, access is
+ * (with a deny list configured), or a delimited string cannot be fully parsed, access is
  * refused. Group membership that cannot be established is treated as "no match", which denies
  * under both allow-only and deny-only policies.
  *
@@ -561,7 +562,7 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
             }
         }
     }
-    /* Handle JSON String claims (e.g., "sysadmins" or comma-separated "sysadmins,devs") */
+    /* Handle JSON String claims (e.g., "sysadmins" or a delimited list such as "sysadmins;devs") */
     else if (json_object_is_type(j_group, json_type_string)) {
         const char *val = json_object_get_string(j_group);
         if (group_value_denied(val, cfg, cs)) {
@@ -584,7 +585,11 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
                 return 0;
             }
             char *saveptr = NULL;
-            char *token = strtok_r(val_copy, ",", &saveptr);
+            /* `group_claim_delimiter` is a single printable ASCII character validated at config
+             * load (default ','); fall back to ',' for config_t values that did not go through
+             * load_config() so strtok_r never receives an empty delimiter set. */
+            const char *delim = (cfg->group_claim_delimiter[0] != '\0') ? cfg->group_claim_delimiter : ",";
+            char *token = strtok_r(val_copy, delim, &saveptr);
             while (token) {
                 while (isspace((unsigned char)*token)) {
                     token++;
@@ -601,7 +606,7 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
                 } else if (group_value_allowed(token, cfg, cs)) {
                     matched_allow = 1;
                 }
-                token = strtok_r(NULL, ",", &saveptr);
+                token = strtok_r(NULL, delim, &saveptr);
             }
             free(val_copy);
         }

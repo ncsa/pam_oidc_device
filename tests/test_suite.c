@@ -2527,6 +2527,95 @@ static void test_verify_group_membership_lists(void **state) {
 }
 
 /**
+ * @brief Unit test verifying `group_claim_delimiter` splits string-typed group claims.
+ *
+ * Exercises `verify_group_membership` for IdPs that emit a single delimited string instead of a
+ * JSON array (e.g., a semicolon-joined `member_of` attribute): delimiter splitting for allow/deny
+ * matching, whitespace trimming around entries, the default comma behavior when the claim holds no
+ * delimiter character, and JSON array claims remaining unaffected by the delimiter.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_group_membership_delimiter(void **state) {
+    (void)state;
+    config_t cfg;
+    struct json_object *uinfo;
+
+    /* Semicolon-delimited claim; one entry satisfies allow_groups. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+
+    /* Deny takes precedence: a denied entry inside the delimited claim is refused. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    strncpy(cfg.deny_groups, "urn:m:grp-a", sizeof(cfg.deny_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* No entry in the claim satisfies the allow list -> denied. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:other", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* Whitespace after the delimiter is trimmed: "a; b" matches the entry "b". */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a; urn:m:grp-b\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+
+    /* Unset delimiter falls back to the default ',': semicolons are not split, so the whole
+     * string is one (unmatchable) group name and no allow entry matches. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* JSON array claims ignore the delimiter: each element is already one group. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":[\"urn:m:grp-a\",\"urn:m:grp-b\"]}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+}
+
+/**
  * @brief Test helper building a UserInfo object whose `groups` field holds `claim` as a JSON string.
  *
  * @param[in] claim NUL-terminated group claim string.
@@ -2795,6 +2884,7 @@ static void init_config_defaults(config_t *cfg) {
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
+    (void)copy_checked(cfg->group_claim_delimiter, sizeof(cfg->group_claim_delimiter), ",");
     /* Keep in sync with load_config() defaults. */
     cfg->qr_enabled = 0;
     cfg->qr_style = QR_STYLE_UTF8;
@@ -2852,6 +2942,7 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.system_uid_min, 0);
     assert_int_equal(cfg.system_uid_max, 999);
     assert_string_equal(cfg.group_claim_field, "groups");
+    assert_string_equal(cfg.group_claim_delimiter, ",");
     assert_int_equal(cfg.use_pkce, 0);
     /* QR defaults preserved when the [qr] section is absent. */
     assert_int_equal(cfg.qr_enabled, 0);
@@ -2981,6 +3072,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "deny_groups = terminated\n"
                                     "enforce_groups = yes\n"
                                     "group_claim_field = roles\n"
+                                    "group_claim_delimiter = ;\n"
                                     "[prompt]\n"
                                     "init_message = Code: %s\n"
                                     "show_expiry = false\n"
@@ -3023,6 +3115,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_string_equal(cfg.deny_groups, "terminated");
     assert_int_equal(cfg.enforce_groups, 1);
     assert_string_equal(cfg.group_claim_field, "roles");
+    assert_string_equal(cfg.group_claim_delimiter, ";");
     assert_string_equal(cfg.init_message, "Code: %s");
     assert_int_equal(cfg.show_expiry, 0);
     assert_int_equal(cfg.max_poll_seconds, 60);
@@ -3040,6 +3133,60 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.qr_vertical_quiet_zone, 2);
     assert_int_equal(cfg.qr_ec_level, QR_EC_HIGH);
     assert_int_equal(cfg.qr_uri_complete, 0);
+}
+
+/**
+ * @brief Unit test for `group_claim_delimiter` parsing: a valid single printable character
+ *        is accepted; multi-character, empty, and duplicate values fail the whole parse.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_group_claim_delimiter(void **state) {
+    (void)state;
+    config_t cfg;
+    char text[512];
+
+    snprintf(text, sizeof(text),
+             "[oauth]\n"
+             "client_id = ci\n"
+             "device_authorization_endpoint = https://idp.example.com/device\n"
+             "token_endpoint = https://idp.example.com/token\n"
+             "userinfo_endpoint = https://idp.example.com/userinfo\n"
+             "[claim]\n"
+             "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
+             "[access]\n"
+             "group_claim_delimiter = ;\n");
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_string_equal(cfg.group_claim_delimiter, ";");
+
+    /* Every malformed `group_claim_delimiter` entry must fail the whole parse. */
+    static const char *const bad_entries[] = {
+        "group_claim_delimiter = ab\n",
+        "group_claim_delimiter = \n",
+        "group_claim_delimiter = ;\ngroup_claim_delimiter = |\n",
+    };
+    for (size_t i = 0; i < sizeof(bad_entries) / sizeof(bad_entries[0]); i++) {
+        snprintf(text, sizeof(text),
+                 "[oauth]\n"
+                 "client_id = ci\n"
+                 "device_authorization_endpoint = https://idp.example.com/device\n"
+                 "token_endpoint = https://idp.example.com/token\n"
+                 "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                 "[claim]\n"
+                 "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
+                 "[access]\n"
+                 "%s",
+                 bad_entries[i]);
+        memset(&cfg, 0, sizeof(cfg));
+        f = open_config_stream(text);
+        assert_non_null(f);
+        assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+        fclose(f);
+    }
 }
 
 /**
@@ -4239,9 +4386,11 @@ int main(void) {
         cmocka_unit_test(test_verify_group_membership_deny_only_fail_closed),
         cmocka_unit_test(test_verify_group_membership_verbose_claim_log),
         cmocka_unit_test(test_verify_userinfo_identity_verbose_claim_dump),
+        cmocka_unit_test(test_verify_group_membership_delimiter),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
         cmocka_unit_test(test_parse_config_file_claim_regex_required),
         cmocka_unit_test(test_parse_config_file_full_sections),
+        cmocka_unit_test(test_parse_group_claim_delimiter),
         cmocka_unit_test(test_parse_config_file_missing_required),
         cmocka_unit_test(test_parse_config_file_duplicate_key),
         cmocka_unit_test(test_parse_config_file_key_before_section),

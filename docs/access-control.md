@@ -48,6 +48,7 @@ enforce_groups = false
 | `deny_groups` | string | `""` | Comma-separated list of provider groups/roles denying access. **Takes precedence over `allow_groups`.** |
 | `enforce_groups` | boolean | `false` | When `true`, requires group/role evaluation even if group lists are empty (denying access if no groups match). |
 | `group_claim_field` | string | `"groups"` | JSON key in the UserInfo response containing group or role claims (e.g., `groups`, `roles`, `wids`). |
+| `group_claim_delimiter` | character | `","` | Single character used to split a **string-typed** `group_claim_field` value into individual group/role entries. JSON array claims are unaffected (each array element is one group). Set it to your IdP's separator when the claim is a single delimited string, e.g. `group_claim_delimiter = ;` for `"member_of": "grp-a;grp-b;grp-c"`. Must be exactly one printable ASCII character (whitespace and multi-character values are rejected). |
 
 ---
 
@@ -109,6 +110,16 @@ The module automatically handles various JSON claim structures under `group_clai
   "roles": "sysadmins, developers, users"
 }
 ```
+
+#### 4. Delimited JSON String (Custom Separator)
+Some IdPs emit the group list as a single string joined by a separator other than a comma (for example, Active Directory / SCIM-synced attributes such as `member_of`). Set `group_claim_delimiter` to that single separator character and each entry is matched individually against `allow_groups`/`deny_groups`:
+```json
+{
+  "sub": "jdoe",
+  "member_of": "urn:example:grp-a;urn:example:grp-b;urn:example:grp-c"
+}
+```
+With `group_claim_field = member_of` and `group_claim_delimiter = ;`. Without the delimiter setting the whole string is treated as one (unmatchable) group name, so group lists never match.
 
 ---
 
