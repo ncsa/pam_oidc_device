@@ -386,17 +386,49 @@ __attribute__((weak)) void curl_slist_free_all(struct curl_slist *head) {
  * libpam.so and do not reach this override.
  */
 static char g_captured_syslog_line[8192 * 4 + 1];
+static char g_captured_syslog_prev_line[8192 * 4 + 1];
 static int g_captured_syslog_calls;
 static int g_captured_syslog_priority;
+
+/* Ring buffer of the most recent captured lines so a test can assert on ANY line of a
+ * log sequence, not just the last (g_captured_syslog_line) or second-to-last
+ * (g_captured_syslog_prev_line). */
+#define SYSLOG_CAPTURE_RING 32
+static char g_captured_syslog_ring[SYSLOG_CAPTURE_RING][8192 * 4 + 1];
+static int g_captured_syslog_ring_count;
+static int g_captured_syslog_ring_next;
 
 __attribute__((weak)) void pam_syslog(const pam_handle_t *pamh, int priority, const char *fmt, ...) {
     (void)pamh;
     va_list args;
     va_start(args, fmt);
+    (void)memcpy(g_captured_syslog_prev_line, g_captured_syslog_line, sizeof(g_captured_syslog_prev_line));
     (void)vsnprintf(g_captured_syslog_line, sizeof(g_captured_syslog_line), fmt, args);
     va_end(args);
+    (void)memcpy(g_captured_syslog_ring[g_captured_syslog_ring_next], g_captured_syslog_line,
+                 sizeof(g_captured_syslog_line));
+    g_captured_syslog_ring_next = (g_captured_syslog_ring_next + 1) % SYSLOG_CAPTURE_RING;
+    if (g_captured_syslog_ring_count < SYSLOG_CAPTURE_RING) {
+        g_captured_syslog_ring_count++;
+    }
     g_captured_syslog_calls++;
     g_captured_syslog_priority = priority;
+}
+
+/** @brief 1 when any captured ring line contains `needle` as a substring, else 0. */
+static int captured_syslog_contains(const char *needle) {
+    for (int i = 0; i < g_captured_syslog_ring_count; i++) {
+        if (strstr(g_captured_syslog_ring[i], needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @brief Clears the syslog line ring. */
+static void reset_captured_syslog_ring(void) {
+    g_captured_syslog_ring_count = 0;
+    g_captured_syslog_ring_next = 0;
 }
 
 /**
@@ -2611,6 +2643,133 @@ static void test_verify_group_membership_deny_only_fail_closed(void **state) {
 }
 
 /**
+ * @brief Unit test pinning the LOGLEVEL_VERBOSE-only raw group-claim logging.
+ *
+ * At `loglevel = verbose`, `verify_group_membership()` records the raw content of the
+ * `group_claim_field` claim (JSON representation) before evaluating the allow/deny
+ * lists so an operator can debug a mismatch. At DEBUG (below VERBOSE) the claim value
+ * must never reach the system log (redaction policy: claim values are VERBOSE-only).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_group_membership_verbose_claim_log(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    struct json_object *uinfo;
+
+    /* VERBOSE + allow-list mismatch: two lines are emitted — the VERBOSE claim-content
+     * line followed by the ERROR mismatch line. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    strncpy(cfg.allow_groups, "sysadmins", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":[\"users\",\"developers\"]}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 0);
+    assert_int_equal(g_captured_syslog_calls, 2);
+    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: [\"users\",\"developers\"]");
+    assert_string_equal(g_captured_syslog_line,
+                        "Group authorization failed: no group/role in claim 'groups' satisfies the allow list");
+    json_object_put(uinfo);
+
+    /* VERBOSE + allow-list match: the content line is emitted and the check passes. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    strncpy(cfg.allow_groups, "sysadmins, devs", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":\"users, sysadmins\"}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 1);
+    assert_int_equal(g_captured_syslog_calls, 2);
+    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: \"users, sysadmins\"");
+    assert_string_equal(g_captured_syslog_line, "Group authorization verified for claim field 'groups'");
+    json_object_put(uinfo);
+
+    /* DEBUG (below VERBOSE) + allow-list mismatch: only the ERROR line is emitted; the
+     * claim value never reaches the system log. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_DEBUG;
+    strncpy(cfg.allow_groups, "sysadmins", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":[\"users\",\"developers\"]}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 0);
+    assert_int_equal(g_captured_syslog_calls, 1);
+    assert_string_equal(g_captured_syslog_line,
+                        "Group authorization failed: no group/role in claim 'groups' satisfies the allow list");
+    json_object_put(uinfo);
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
+ * @brief Unit test pinning the LOGLEVEL_VERBOSE-only dump of every UserInfo claim.
+ *
+ * At `loglevel = verbose`, `verify_userinfo_identity()` dumps every claim returned by the
+ * provider (claim name + compact JSON value) so an operator can see exactly what the IdP
+ * sent; at DEBUG (below VERBOSE) no claim name/value dump reaches the system log — only
+ * the PII-safe payload receipt (size + configured claim field).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_userinfo_identity_verbose_claim_dump(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    (void)copy_checked(cfg.claim_field, sizeof(cfg.claim_field), "preferred_username");
+    (void)copy_checked(cfg.claim_regex, sizeof(cfg.claim_regex), "^([a-z]+)$");
+    cfg.claim_capture_group = 1;
+
+    struct json_object *uinfo =
+        json_tokener_parse("{\"preferred_username\":\"alice\",\"email\":\"alice@example.com\",\"groups\":[\"devs\"]}");
+    assert_non_null(uinfo);
+
+    /* VERBOSE: every claim is dumped (name + compact JSON value), regardless of hash order. */
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_userinfo_identity(pamh, &cfg, LOGLEVEL_VERBOSE, "alice", uinfo, 123, NULL), PAM_SUCCESS);
+    assert_true(captured_syslog_contains("UserInfo claim 'preferred_username': \"alice\""));
+    assert_true(captured_syslog_contains("UserInfo claim 'email': \"alice@example.com\""));
+    assert_true(captured_syslog_contains("UserInfo claim 'groups': [\"devs\"]"));
+    assert_false(captured_syslog_contains("UserInfo claim list truncated"));
+
+    /* DEBUG (below VERBOSE): no claim name/value dump; only the PII-safe receipt. */
+    cfg.loglevel = LOGLEVEL_DEBUG;
+    reset_captured_syslog_ring();
+    assert_int_equal(verify_userinfo_identity(pamh, &cfg, LOGLEVEL_DEBUG, "alice", uinfo, 123, NULL), PAM_SUCCESS);
+    assert_false(captured_syslog_contains("UserInfo claim '"));
+    assert_false(captured_syslog_contains("UserInfo claim ("));
+    assert_true(captured_syslog_contains("UserInfo claim payload received"));
+
+    json_object_put(uinfo);
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
  * @brief Initializes a config_t with the same defaults load_config() applies before parsing.
  *
  * parse_config_file() only writes keys present in the stream, so tests that assert on
@@ -4078,6 +4237,8 @@ int main(void) {
         cmocka_unit_test(test_verify_user_access_large_entry),
         cmocka_unit_test(test_verify_group_membership_lists),
         cmocka_unit_test(test_verify_group_membership_deny_only_fail_closed),
+        cmocka_unit_test(test_verify_group_membership_verbose_claim_log),
+        cmocka_unit_test(test_verify_userinfo_identity_verbose_claim_dump),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
         cmocka_unit_test(test_parse_config_file_claim_regex_required),
         cmocka_unit_test(test_parse_config_file_full_sections),

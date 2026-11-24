@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `README.md`, `docs/getting-started.md`, and the shipped `config/pam_oidc_device.conf`,
   plus the `show_expiry` field doc in `include/pam_oidc_device.h`, were updated to
   match.
+- **Verbose logging now records provider claim values (`src/identity.c`):** when
+  `loglevel = verbose` (maximum troubleshooting level), `verify_userinfo_identity()`
+  dumps every claim returned by the UserInfo endpoint (claim name + compact JSON value),
+  and `verify_group_membership()` additionally records the `group_claim_field` claim
+  immediately before allow/deny evaluation, so operators can see exactly what the provider
+  sent when claim matching or `allow_groups`/`deny_groups` unexpectedly matches or
+  misses. Consistent with the PII redaction policy, the dumps are never emitted at
+  `debug` or below, untrusted bytes are C-escaped by the central logger, and claim names
+  containing non-printable bytes remain withheld.
 
 ## [0.3.6] - 2026-11-19
 

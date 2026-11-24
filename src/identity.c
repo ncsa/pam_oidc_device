@@ -465,6 +465,12 @@ static int group_value_allowed(const char *val, const config_t *cfg, int case_se
  * Group authorization is active when `enforce_groups` is enabled or any group list is populated;
  * otherwise it is bypassed entirely.
  *
+ * Troubleshooting level only: when `cfg->loglevel` is `LOGLEVEL_VERBOSE`, the raw claim content
+ * (compact JSON representation of the value under `group_claim_field`) is additionally recorded to the
+ * system log so an operator can see exactly what the provider sent when an allow/deny list
+ * unexpectedly matches or misses. Below `LOGLEVEL_VERBOSE` only the claim field name and the
+ * authorization outcome are logged (redaction policy: claim values are VERBOSE-only).
+ *
  * @param[in] uinfo_json Parsed JSON payload object from provider UserInfo response.
  * @param[in] cfg        Active module configuration settings.
  * @param[in] pamh       PAM handle used for emitting system log messages.
@@ -511,6 +517,18 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
         pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_ERROR, LOG_ERR,
                       "Group authorization failed: claim field '%s' is missing or null", target_field);
         return 0;
+    }
+
+    /* Troubleshooting level: record the raw group/role claim content so an operator can
+     * see exactly what the provider sent when an allow/deny list unexpectedly matches or
+     * misses. Policy-consistent: the raw claim value is logged only at LOGLEVEL_VERBOSE,
+     * never at DEBUG or below; pam_oauth_log() C-escapes every untrusted byte before
+     * syslog. The compact JSON representation (no pretty-print spacing) is owned by
+     * the parsed tree and zeroed with it. */
+    const char *raw_group_claim = json_object_to_json_string_ext(j_group, 0);
+    if (raw_group_claim) {
+        pam_oauth_log(pamh, cfg->loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "Group claim '%s' content: %s", target_field,
+                      raw_group_claim);
     }
 
     int matched_deny = 0;
@@ -646,25 +664,27 @@ int verify_group_membership(const struct json_object *uinfo_json, const config_t
 int verify_userinfo_identity(pam_handle_t *pamh, const config_t *cfg, loglevel_t loglevel, const char *pam_user,
                              struct json_object *uinfo_json, size_t userinfo_size, const char *access_token) {
     /* PII-safe UserInfo audit logging: the raw claim payload contains personal data (emails,
-     * phone numbers, group memberships) and must never be persisted to the system log.
-     * Routine logging (DEBUG) records only the payload size and the configured claim field;
-     * the troubleshooting level (VERBOSE) additionally lists the claim NAMES returned by the
-     * provider — enough to debug claim-field configuration — without logging any claim VALUES. */
+     * phone numbers, group memberships) and is never persisted to the system log at the
+     * routine levels: `DEBUG` records only the payload size and the configured claim field.
+     * The troubleshooting level (VERBOSE) additionally dumps every claim returned by the
+     * provider (name + compact JSON value) so an operator can see exactly what the IdP sent
+     * when claim matching misbehaves; pam_oauth_log() C-escapes untrusted bytes, and a claim
+     * name containing non-printable bytes is withheld rather than logged. */
     pam_oauth_log(pamh, loglevel, LOGLEVEL_DEBUG, LOG_DEBUG,
                   "UserInfo claim payload received: %zu bytes, claim field '%s' present", userinfo_size,
                   cfg->claim_field);
     {
         struct json_object_iter it;
-        /* Cap the claim-name listing; larger payloads get a summary line instead.
+        /* Cap the claim listing; larger payloads get a summary line instead.
          * json_object_object_length() returns int on older json-c (EL8/EL9) and size_t on
          * newer releases, so capture through an explicit long and range-check it; both the
          * total and the remaining budget stay opaque runtime values, so the budget check
          * below is not statically foldable. */
         const long claims_raw = (long)json_object_object_length(uinfo_json);
         const size_t total_claims = (claims_raw > 0) ? (size_t)claims_raw : 0;
-        size_t names_left = (total_claims < 32) ? total_claims : 32;
+        size_t claims_left = (total_claims < 32) ? total_claims : 32;
         json_object_object_foreachC(uinfo_json, it) {
-            if (names_left == 0) {
+            if (claims_left == 0) {
                 break;
             }
             int name_safe = 1;
@@ -674,17 +694,22 @@ int verify_userinfo_identity(pam_handle_t *pamh, const config_t *cfg, loglevel_t
                     break;
                 }
             }
+            /* Compact JSON representation of the value (string claims arrive JSON-quoted,
+             * arrays/objects compacted, JSON null as "null"); owned by the parsed tree and
+             * zeroed with it. NULL only on serializer allocation failure. */
+            const char *value_repr = json_object_to_json_string_ext(it.val, 0);
+            const char *value = value_repr ? value_repr : "(unserializable)";
             if (name_safe) {
-                pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim present: '%s'", it.key);
+                pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG, "UserInfo claim '%s': %s", it.key, value);
             } else {
                 pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
-                              "UserInfo claim present: (name contains non-printable bytes; withheld)");
+                              "UserInfo claim (name contains non-printable bytes; withheld): %s", value);
             }
-            names_left--;
+            claims_left--;
         }
         if (total_claims > 32) {
             pam_oauth_log(pamh, loglevel, LOGLEVEL_VERBOSE, LOG_DEBUG,
-                          "UserInfo claim list truncated: 32 of %zu claim names shown", total_claims);
+                          "UserInfo claim list truncated: 32 of %zu claims shown", total_claims);
         }
     }
 

@@ -419,7 +419,7 @@ Log levels can be configured in `/etc/pam_oidc_device.conf` under `[runtime]` or
 | `error` | `1` | Logs operational failures, invalid configurations, and network errors. |
 | `info` | `2` | **Default.** Logs high-level auth success/failure lifecycle events. |
 | `debug` | `3` | Logs internal workflow steps, regex claim matches, and deadline clocks. |
-| `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status. |
+| `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status, plus the full provider claim payload: every UserInfo claim name and value (and the group claim again at the allow/deny decision), so operators can see exactly what the IdP sent. |
 
 ### Polling Timeout (`max_poll_seconds`)
 

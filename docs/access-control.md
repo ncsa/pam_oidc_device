@@ -120,6 +120,10 @@ The module automatically handles various JSON claim structures under `group_clai
 4. **Enforce Groups Guard:** If `enforce_groups = true` but no group lists are defined, authentication fails.
 5. **Fail-Closed on Unusable Claims:** With any group policy active, authentication also fails when the provider UserInfo payload is missing or invalid, the configured claim field is absent or JSON `null`, the claim has an unrecognized type (neither an array of strings nor a string), or a deny list is configured and the claim contains content that cannot be fully parsed (e.g., a non-string array element). Membership that cannot be established is treated as a non-match, which denies under both allow-only and deny-only policies — a deny list cannot be bypassed by omitting the claim or by serializing it in an unparseable form.
 
+### Troubleshooting
+
+When `allow_groups`/`deny_groups` behavior looks wrong, set `loglevel = verbose` (see [Logging & Auditing](getting-started.md#7-logging--auditing)): the module dumps **every** claim returned by the UserInfo endpoint (claim name + compact JSON value) at the start of claim verification, and additionally records the raw content of the `group_claim_field` claim (e.g. `Group claim 'groups' content: ["users","developers"]`) immediately before the allow/deny evaluation, so the log shows exactly what the provider sent. At lower log levels only the payload size, claim field names, and the evaluation outcome are logged — claim values are never logged below `verbose`.
+
 ---
 
 ## Complete Example
