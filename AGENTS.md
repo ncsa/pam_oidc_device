@@ -12,7 +12,16 @@ compliance, and reference/audit material live in [`.agents/context.md`](.agents/
 
 **Read order before any significant task:** this file → `.agents/context.md` →
 [`.agents/memory.md`](.agents/memory.md) (append-only LLM memory: prior decisions,
-gotchas, verification status).
+gotchas, verification status) →
+[`.agents/memory.local.md`](.agents/memory.local.md) (if it exists — host-local, git-ignored
+notes on *this* machine's terminal/container/tooling quirks).
+
+**Local-environment failures vs. code gotchas:** when a *persistent local-environment
+failure* occurs (mangled heredocs, flakey terminal output, containers that don't build or
+mount correctly, tool version skew), record the failure **and the working workaround** in
+`.agents/memory.local.md` (git-ignored, per-host; prune stale entries) so the next session
+starts with the workaround. Code, protocol, and verification gotchas still go in
+`.agents/memory.md` — keep the two split by *environment vs. code*.
 
 **Never edit the tool shims.** `CLAUDE.md`, `.github/copilot-instructions.md`,
 `.clinerules`, `.cursorrules`, `.roorules`, and `.windsurfrules` are all symlinks to this
@@ -80,6 +89,8 @@ macOS-only checks that *do* work.
   `getenv()` to source secrets.
 - Hand-edit `third_party/` (the vendored `qrcodegen` encoder is provenance-pinned) or the
   tool shims.
+- `git add` or otherwise commit `.agents/memory.local.md` — it is host-local and
+  git-ignored; its content belongs to one machine only.
 
 **Off-limits directories/files:** `build/`, `rpmbuild/`, `third_party/`, `config/*.secret.conf`,
 and system `/etc/`.

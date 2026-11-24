@@ -13,6 +13,11 @@
 > **Companion.** Machine-oriented memory of prior AI work (decisions, gotchas, verification
 > status) is kept separately in [`.agents/memory.md`](.agents/memory.md) and must be read before
 > starting any significant task — see [§7](#7-machine-memory-log-protocol-agentsmemorymd).
+> A host-local, git-ignored companion,
+> [`.agents/memory.local.md`](.agents/memory.local.md), tracks *this machine's* environment
+> failures (terminal/CLI quirks, container setup, tool version skew) and their workarounds;
+> read it if present, and record recurring local-environment failures there — not in
+> `memory.md` (code/protocol only).
 
 ---
 
@@ -276,6 +281,15 @@ failing native build on macOS as a code defect — it is an environment limitati
 **Preferred local workaround — a Linux container that mirrors CI** (Docker, OrbStack, colima, or
 UTM):
 
+> **Prefer an existing long-lived container when one is configured on this host** (e.g.
+> `pamed-review`: `ubuntu:24.04`, repo bind-mounted at `/work`, all gate dependencies
+> preinstalled). Verify it first — `docker inspect <name> --format '{{json .Mounts}}
+> {{.Config.Image}}'` — then drive the gates with `docker exec <name> make …` instead of
+> re-running the one-shot recipe below (which re-resolves/reinstalls packages on every
+> invocation and drifts from the pinned setup). Long-lived container specifics and any
+> host-specific container gotchas belong in `.agents/memory.local.md`, not in this file.
+> Use the recipe below only when no such container exists:
+
 ```bash
 docker run -it --rm \
   -v "$PWD:/work" -w /work \
@@ -486,6 +500,13 @@ AI-assisted work on this repo — **not** a user-facing changelog (that is `CHAN
   and promote any durable, reusable takeaway into its **Standing Invariants** section.
 - **Do NOT:** log trivial / format-only edits, or duplicate what `CHANGELOG.md` already records
   for end users.
+- **Local environment failures go in `.agents/memory.local.md`, not here:** persistent
+  *host-environment* failures — mangled heredocs, flakey terminal output, containers that
+  build/mount incorrectly, tool install or version skew — belong in
+  [`.agents/memory.local.md`](.agents/memory.local.md) (git-ignored, per-host) with the
+  working workaround recorded beside the failure; prune its stale entries. `memory.md` keeps
+  only code-, protocol-, and verification-level content, so host-specific detail never leaks
+  into the committed memory.
 - Every entry must state **verification status** explicitly — what was verified locally vs. what
   still requires the Linux gates / CI.
 

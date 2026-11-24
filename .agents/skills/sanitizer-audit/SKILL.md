@@ -28,3 +28,8 @@ the runner under `ASAN_OPTIONS=detect_leaks=1`,
 
 **Note:** `make sanitize` (compile-only) is **not** a CI gate — always use `test-sanitize`,
 which actually runs the tests. See `.agents/context.md` §3.
+
+**Local environment failures:** if the run fails for host reasons (no PAM headers, container
+not set up per `.agents/memory.local.md`, flakey terminal output), that is an environment
+limitation, not a sanitizer finding — fix/work around locally and record the workaround in
+`.agents/memory.local.md` (git-ignored), not `.agents/memory.md`.
