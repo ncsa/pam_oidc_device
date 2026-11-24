@@ -130,7 +130,7 @@ max_poll_seconds = 120
 #     https://auth.example.com/oauth2/device/code?user_code=XXXX-XXXX
 #
 #   Manual entry: https://auth.example.com/oauth2/device/code  |  Code: XXXX-XXXX
-#   Waiting for approval (expires in 2m; auto-completes on sign-in).
+#   Waiting for approval (expires in 2m).
 # (the compact URL + code block is shown when the IdP does not provide a
 # direct-link URL). Placeholders: {url} (verification URL),
 # {url_complete} (direct-link URL with the code embedded, if the IdP provides
@@ -145,7 +145,7 @@ max_poll_seconds = 120
 # init_message = Sign in at {url} with code {code}
 # Show the device-code approval window in the prompt (default: true). With the built-in
 # default template it is named in the trailing status line ("Waiting for
-# approval (expires in 15m; auto-completes on sign-in)."); in custom
+# approval (expires in 15m)."); in custom
 # templates use the {expiry} token, which works regardless of this key. Set to false to
 # hide the approval window.
 # show_expiry = false
@@ -418,8 +418,8 @@ Log levels can be configured in `/etc/pam_oidc_device.conf` under `[runtime]` or
 | `none` | `0` | Disables all module syslog output. |
 | `error` | `1` | Logs operational failures, invalid configurations, and network errors. |
 | `info` | `2` | **Default.** Logs high-level auth success/failure lifecycle events. |
-| `debug` | `3` | Logs internal workflow steps, regex claim matches, and deadline clocks. |
-| `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status. |
+| `debug` | `3` | Logs internal workflow steps, regex claim matches, deadline clocks, and — when `verify_jwt_claims` is enabled — the access token's `iss`/`aud`/`exp`/`nbf` values, so operators can discover the correct `issuer`/`audience` settings. |
+| `verbose` | `4` | Maximum tracing. Includes full HTTP transport methods, URLs, payload sizes, and header status, plus the full provider claim payload: every UserInfo claim name and value (and the group claim again at the allow/deny decision), so operators can see exactly what the IdP sent. |
 
 ### Polling Timeout (`max_poll_seconds`)
 

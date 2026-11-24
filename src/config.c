@@ -66,6 +66,7 @@ typedef enum {
     CK_DENY_GROUPS,                   /**< [access] deny_groups */
     CK_ENFORCE_GROUPS,                /**< [access] enforce_groups */
     CK_GROUP_CLAIM_FIELD,             /**< [access] group_claim_field */
+    CK_GROUP_CLAIM_DELIMITER,         /**< [access] group_claim_delimiter */
     CK_INIT_MESSAGE,                  /**< [prompt] init_message */
     CK_SHOW_EXPIRY,                   /**< [prompt] show_expiry */
     CK_MAX_POLL_SECONDS,              /**< [runtime] max_poll_seconds */
@@ -370,6 +371,31 @@ static int parse_qr_block_char(const char *val, char *out) {
 }
 
 /**
+ * @brief Parses the `group_claim_delimiter` setting (a single printable ASCII character).
+ *
+ * The character is used to split a string-typed group claim value into individual
+ * group/role entries. Values that are not exactly one printable character 0x21-0x7E are
+ * rejected: an empty or multi-character delimiter would silently mis-split group values
+ * (e.g., a `"; "` set would also split on plain spaces inside a group name).
+ *
+ * @param[in]  val Raw string setting value (e.g. ";").
+ * @param[out] out 2-byte destination buffer receiving the character plus NUL.
+ * @return 0 on success, -1 if the value is not a single printable ASCII character 0x21-0x7E.
+ */
+static int parse_group_claim_delimiter(const char *val, char *out) {
+    if (!val || !out || strlen(val) != 1) {
+        return -1;
+    }
+    unsigned char c = (unsigned char)val[0];
+    if (c < 0x21U || c > 0x7EU) {
+        return -1;
+    }
+    out[0] = (char)c;
+    out[1] = '\0';
+    return 0;
+}
+
+/**
  * @brief Parses the QR error-correction level ("L", "M", "Q", "H", case-insensitive).
  *
  * @param[in]  val Raw string setting value.
@@ -430,17 +456,18 @@ static int parse_qr_uri(const char *val, int *out) {
  * @brief Value-handler kind for one table-driven configuration key.
  */
 typedef enum {
-    CFG_VAL_STRING,        /**< copy_checked() into the member's fixed-size buffer. */
-    CFG_VAL_HTTPS_URL,     /**< is_valid_https_url() gate, then copy_checked(). */
-    CFG_VAL_PROXY,         /**< CFG_VAL_HTTPS_URL where an empty value means "no proxy". */
-    CFG_VAL_BOOL,          /**< parse_bool() into the int member. */
-    CFG_VAL_INT_RANGE,     /**< parse_int_range() within [min_val, max_val]. */
-    CFG_VAL_LOGLEVEL,      /**< parse_loglevel() into the loglevel_t member. */
-    CFG_VAL_PKCE_MODE,     /**< parse_pkce_mode() into the int member. */
-    CFG_VAL_QR_STYLE,      /**< parse_qr_style() into the qr_style_t member. */
-    CFG_VAL_QR_BLOCK_CHAR, /**< parse_qr_block_char() into the 2-byte member. */
-    CFG_VAL_QR_EC_LEVEL,   /**< parse_qr_ec_level() into the qr_ec_t member. */
-    CFG_VAL_QR_URI         /**< parse_qr_uri() into the int member. */
+    CFG_VAL_STRING,                /**< copy_checked() into the member's fixed-size buffer. */
+    CFG_VAL_HTTPS_URL,             /**< is_valid_https_url() gate, then copy_checked(). */
+    CFG_VAL_PROXY,                 /**< CFG_VAL_HTTPS_URL where an empty value means "no proxy". */
+    CFG_VAL_BOOL,                  /**< parse_bool() into the int member. */
+    CFG_VAL_INT_RANGE,             /**< parse_int_range() within [min_val, max_val]. */
+    CFG_VAL_LOGLEVEL,              /**< parse_loglevel() into the loglevel_t member. */
+    CFG_VAL_PKCE_MODE,             /**< parse_pkce_mode() into the int member. */
+    CFG_VAL_QR_STYLE,              /**< parse_qr_style() into the qr_style_t member. */
+    CFG_VAL_QR_BLOCK_CHAR,         /**< parse_qr_block_char() into the 2-byte member. */
+    CFG_VAL_GROUP_CLAIM_DELIMITER, /**< parse_group_claim_delimiter() into the 2-byte member. */
+    CFG_VAL_QR_EC_LEVEL,           /**< parse_qr_ec_level() into the qr_ec_t member. */
+    CFG_VAL_QR_URI                 /**< parse_qr_uri() into the int member. */
 } cfg_val_kind_t;
 
 /**
@@ -544,6 +571,8 @@ static const config_key_spec_t CONFIG_KEYS[] = {
      0, 0, NULL},
     {"group_claim_field", SEC_ACCESS, CFG_VAL_STRING, CFG_SEEN_BIT(CK_GROUP_CLAIM_FIELD),
      offsetof(config_t, group_claim_field), CFG_MEMBER_SIZE(group_claim_field), 0, 0, NULL},
+    {"group_claim_delimiter", SEC_ACCESS, CFG_VAL_GROUP_CLAIM_DELIMITER, CFG_SEEN_BIT(CK_GROUP_CLAIM_DELIMITER),
+     offsetof(config_t, group_claim_delimiter), CFG_MEMBER_SIZE(group_claim_delimiter), 0, 0, NULL},
 
     /* [prompt] — User-facing prompting presentation. */
     {"init_message", SEC_PROMPT, CFG_VAL_STRING, CFG_SEEN_BIT(CK_INIT_MESSAGE), offsetof(config_t, init_message),
@@ -644,6 +673,8 @@ static int parse_config_kv(config_t *cfg, config_section_t sec, config_seen_t *s
             return parse_qr_style(val, (qr_style_t *)dest);
         case CFG_VAL_QR_BLOCK_CHAR:
             return parse_qr_block_char(val, (char *)dest);
+        case CFG_VAL_GROUP_CLAIM_DELIMITER:
+            return parse_group_claim_delimiter(val, (char *)dest);
         case CFG_VAL_QR_EC_LEVEL:
             return parse_qr_ec_level(val, (qr_ec_t *)dest);
         case CFG_VAL_QR_URI:
@@ -931,6 +962,9 @@ int load_config(const char *path, config_t *cfg, pam_handle_t *pamh) {
     cfg->require_exp_claim = 0;
     cfg->use_pkce = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
+    /* Default comma keeps the historical split behavior for string-typed group claims;
+     * an IdP emitting another separator (e.g. ';') sets it explicitly in [access]. */
+    (void)copy_checked(cfg->group_claim_delimiter, sizeof(cfg->group_claim_delimiter), ",");
     /* QR terminal rendering defaults: disabled, compact UTF-8 style, single-scale, medium
      * error correction, the code-embedded complete URI when the provider offers it, and the
      * ISO/IEC 18004 4-module vertical quiet zone (lowerable via vertical_quiet_zone). */

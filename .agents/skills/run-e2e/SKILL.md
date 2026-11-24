@@ -26,3 +26,7 @@ enforced). Mirrored by the CI `e2e-sandbox` job.
 **Notes:** The harness must keep working both as root (`make sandbox`) and unprivileged (the CI
 job). See `.agents/context.md` §1 (tests/e2e layout) and the `e2e-sandbox` entry in
 `.agents/memory.md` for the root/non-root privilege gotchas.
+**Local environment failures:** if `make sandbox` fails for host reasons (Docker/OrbStack not
+running, image won't pull, bind-mount missing, flakey terminal output) rather than a scenario
+failure, that is an environment limitation — record the failure and working workaround in
+`.agents/memory.local.md` (git-ignored), not `.agents/memory.md`.

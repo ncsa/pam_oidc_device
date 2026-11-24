@@ -121,12 +121,11 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
         /* Default template: leading blank line only when QR is off; status line carries
          * the compact approval window when show_expiry is set and the window is known. */
         const char *lead = cfg->qr_enabled ? "" : "\n";
-        char status_clause[64] = "; auto-completes on sign-in.";
+        char status_clause[32] = "";
         if (cfg->show_expiry) {
             char expiry_text[32];
             if (format_expiry_seconds(expires_in, expiry_text, sizeof(expiry_text)) == 0) {
-                int elen = snprintf(status_clause, sizeof(status_clause),
-                                    " (expires in %s; auto-completes on sign-in).", expiry_text);
+                int elen = snprintf(status_clause, sizeof(status_clause), " (expires in %s)", expiry_text);
                 if (elen < 0 || (size_t)elen >= sizeof(status_clause)) {
                     return -1;
                 }
@@ -137,12 +136,12 @@ int render_prompt_message(const config_t *cfg, const char *url, const char *url_
             w = snprintf(out, out_len,
                          "%sSign in via browser:\n  %s\n\n"
                          "Manual entry: %s  |  Code: %s\n"
-                         "Waiting for approval%s\n",
+                         "Waiting for approval%s.\n",
                          lead, url_complete, url, code, status_clause);
         } else {
             w = snprintf(out, out_len,
                          "%sSign in via browser:\n  URL:  %s\n  Code: %s\n\n"
-                         "Waiting for approval%s\n",
+                         "Waiting for approval%s.\n",
                          lead, url, code, status_clause);
         }
         if (w < 0 || (size_t)w >= out_len) {

@@ -819,8 +819,8 @@ int poll_for_access_token(pam_handle_t *pamh, const config_t *cfg, loglevel_t lo
  * 6. Performs local JWT metadata verification (exp, nbf, iss, aud) if enabled.
  * 7. Queries provider UserInfo endpoint with access token.
  * 8. Logs a PII-safe UserInfo receipt record (size + claim field) at debug level; the
- *    troubleshooting (verbose) level additionally lists claim NAMES only — claim values are
- *    never logged. When local JWT inspection is enabled, the JWT `sub` claim is also
+ *    troubleshooting (verbose) level additionally dumps every UserInfo claim (name + compact
+ *    JSON value) for claim-matching troubleshooting. When local JWT inspection is enabled, the JWT `sub` claim is also
  *    cross-checked against the UserInfo `sub` claim (token-substitution defense).
  * 9. Verifies user identity claim against `PAM_USER` via `verify_claim`.
  * 10. Evaluates group membership via `verify_group_membership` if enabled and returns `PAM_PERM_DENIED` on denial.

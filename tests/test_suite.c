@@ -386,18 +386,55 @@ __attribute__((weak)) void curl_slist_free_all(struct curl_slist *head) {
  * libpam.so and do not reach this override.
  */
 static char g_captured_syslog_line[8192 * 4 + 1];
+static char g_captured_syslog_prev_line[8192 * 4 + 1];
 static int g_captured_syslog_calls;
 static int g_captured_syslog_priority;
+
+/* Ring buffer of the most recent captured lines so a test can assert on ANY line of a
+ * log sequence, not just the last (g_captured_syslog_line) or second-to-last
+ * (g_captured_syslog_prev_line). */
+#define SYSLOG_CAPTURE_RING 32
+static char g_captured_syslog_ring[SYSLOG_CAPTURE_RING][8192 * 4 + 1];
+static int g_captured_syslog_ring_count;
+static int g_captured_syslog_ring_next;
 
 __attribute__((weak)) void pam_syslog(const pam_handle_t *pamh, int priority, const char *fmt, ...) {
     (void)pamh;
     va_list args;
     va_start(args, fmt);
+    (void)memcpy(g_captured_syslog_prev_line, g_captured_syslog_line, sizeof(g_captured_syslog_prev_line));
     (void)vsnprintf(g_captured_syslog_line, sizeof(g_captured_syslog_line), fmt, args);
     va_end(args);
+    (void)memcpy(g_captured_syslog_ring[g_captured_syslog_ring_next], g_captured_syslog_line,
+                 sizeof(g_captured_syslog_line));
+    g_captured_syslog_ring_next = (g_captured_syslog_ring_next + 1) % SYSLOG_CAPTURE_RING;
+    if (g_captured_syslog_ring_count < SYSLOG_CAPTURE_RING) {
+        g_captured_syslog_ring_count++;
+    }
     g_captured_syslog_calls++;
     g_captured_syslog_priority = priority;
 }
+
+/** @brief 1 when any captured ring line contains `needle` as a substring, else 0. */
+static int captured_syslog_contains(const char *needle) {
+    for (int i = 0; i < g_captured_syslog_ring_count; i++) {
+        if (strstr(g_captured_syslog_ring[i], needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @brief Clears the syslog line ring. */
+static void reset_captured_syslog_ring(void) {
+    g_captured_syslog_ring_count = 0;
+    g_captured_syslog_ring_next = 0;
+}
+
+/* Forward declaration: defined below (near the log-drop test) but also used by the
+ * earlier JWT claim-dump test. */
+static int test_pam_noop_conv(int num_messages, const struct pam_message **message, struct pam_response **response,
+                              void *appdata_ptr);
 
 /**
  * @brief Unit test verifying cURL URL parameter encoding functionality[cite: 7].
@@ -608,13 +645,13 @@ static void test_prompt_rendering(void **state) {
      * (docs/threat-model.md §8)[cite: 7] */
     assert_string_equal(def_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                  "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                 "Waiting for approval; auto-completes on sign-in.\n");
+                                 "Waiting for approval.\n");
     char def_plain_out[512];
     assert_int_equal(render_prompt_message(&def_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0, def_plain_out,
                                            sizeof(def_plain_out)),
                      0);
     assert_string_equal(def_plain_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                       "Waiting for approval; auto-completes on sign-in.\n");
+                                       "Waiting for approval.\n");
 
     /* With show_expiry on the built-in default carries the compact "(expires in ...)" clause in
      * the trailing status line; the window is the provider's expires_in clamped by
@@ -628,21 +665,21 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_exp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                      "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                     "Waiting for approval (expires in 15m; auto-completes on sign-in).\n");
+                                     "Waiting for approval (expires in 15m).\n");
     /* Sub-minute windows render in seconds (plain-URL form, no manual-entry line) */
     char def_exp_sec_out[512];
     assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 45, def_exp_sec_out,
                                            sizeof(def_exp_sec_out)),
                      0);
     assert_string_equal(def_exp_sec_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                         "Waiting for approval (expires in 45s; auto-completes on sign-in).\n");
+                                         "Waiting for approval (expires in 45s).\n");
     /* show_expiry on but the window unknown (0): the expiry parenthetical is omitted entirely */
     char def_exp_unknown_out[512];
     assert_int_equal(render_prompt_message(&def_exp_cfg, "https://auth.edu/dev", NULL, "BCD-123", 0,
                                            def_exp_unknown_out, sizeof(def_exp_unknown_out)),
                      0);
     assert_string_equal(def_exp_unknown_out, "\nSign in via browser:\n  URL:  https://auth.edu/dev\n  Code: BCD-123\n\n"
-                                             "Waiting for approval; auto-completes on sign-in.\n");
+                                             "Waiting for approval.\n");
     /* show_expiry off with a known window: the approval window never appears in the
      * built-in default */
     char def_noexp_out[512];
@@ -651,7 +688,7 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_noexp_out, "\nSign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                        "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                       "Waiting for approval; auto-completes on sign-in.\n");
+                                       "Waiting for approval.\n");
 
     /* [qr] enabled = true: the leading blank line is omitted — the QR block's bottom vertical
      * quiet zone already separates the prompt from the rendered art */
@@ -664,7 +701,7 @@ static void test_prompt_rendering(void **state) {
                      0);
     assert_string_equal(def_qr_out, "Sign in via browser:\n  https://auth.edu/dev?c=1\n\n"
                                     "Manual entry: https://auth.edu/dev  |  Code: BCD-123\n"
-                                    "Waiting for approval; auto-completes on sign-in.\n");
+                                    "Waiting for approval.\n");
 
     /* {expiry} template token expands to the compact approval window in any template
      * (independent of show_expiry), or to an empty string when the window is unknown */
@@ -783,6 +820,77 @@ static void test_jwt_mismatch_claims(void **state) {
 }
 
 /**
+ * @brief Unit test pinning the LOGLEVEL_DEBUG-and-above JWT claim dump.
+ *
+ * At `loglevel = debug` (or `verbose`), `verify_token_metadata()` records the token's
+ * `iss`, `aud`, `exp`, and `nbf` claims (compact JSON representation) before evaluation
+ * so an operator with a misconfigured `issuer`/`audience` can see exactly what the
+ * provider's token carries. These claims are tenant/client/numeric identifiers rather
+ * than PII, so the value dump is allowed one level below the PII-protected UserInfo
+ * dumps. At `none`/`error`/`info` no claim value may reach the system log (mismatch
+ * lines carry lengths only).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_claim_dump_debug_and_above(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://sts.windows.net/tenant/", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "00000003-0000-0000-c000-000000000000", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_DEBUG;
+
+    /* Payload:
+     * {"iss":"https://sts.windows.net/tenant/","aud":"00000003-0000-0000-c000-000000000000","exp":2524608000,"nbf":1600000000}
+     */
+    const char *valid_jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJpc3MiOiJodHRwczovL3N0cy53aW5kb3dzLm5ldC90ZW5hbnQvIiwiYXVkIjoiMDAwMDAwMDMtMDAwMC0wMDAwLWMwMDAtMDAwMDAwMDAw"
+        "MDAwIiwiZXhwIjoyNTI0NjA4MDAwLCJuYmYiOjE2MDAwMDAwMDB9.sig";
+
+    /* DEBUG (the dump's new floor) + passing check: all four claim lines are recorded. */
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_true(captured_syslog_contains("JWT claim 'iss': \"https://sts.windows.net/tenant/\""));
+    assert_true(captured_syslog_contains("JWT claim 'aud': \"00000003-0000-0000-c000-000000000000\""));
+    assert_true(captured_syslog_contains("JWT claim 'exp': 2524608000"));
+    assert_true(captured_syslog_contains("JWT claim 'nbf': 1600000000"));
+
+    /* VERBOSE (above the floor): the dump is still recorded. */
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_true(captured_syslog_contains("JWT claim 'iss': \"https://sts.windows.net/tenant/\""));
+    assert_true(captured_syslog_contains("JWT claim 'aud': \"00000003-0000-0000-c000-000000000000\""));
+    assert_true(captured_syslog_contains("JWT claim 'exp': 2524608000"));
+    assert_true(captured_syslog_contains("JWT claim 'nbf': 1600000000"));
+
+    /* INFO (below the floor): the check passes but no claim value reaches the system log. */
+    cfg.loglevel = LOGLEVEL_INFO;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_false(captured_syslog_contains("JWT claim '"));
+
+    /* NONE: logging disabled — no claim value reaches the system log either. */
+    cfg.loglevel = LOGLEVEL_NONE;
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(valid_jwt, &cfg, pamh), 0);
+    assert_false(captured_syslog_contains("JWT claim '"));
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
  * @brief Unit test verifying the fail-closed iss/aud policy when verify_jwt_claims
  *        is enabled without a configured issuer or audience.
  *
@@ -853,6 +961,120 @@ static void test_jwt_audience_array(void **state) {
 
     int res = verify_token_metadata(aud_array_jwt, &cfg, NULL);
     assert_int_equal(res, 0);
+}
+
+/**
+ * @brief Unit test verifying that a comma-bearing audience (CILogon OA4MP)
+ *        matches as a single literal `audience` value.
+ *
+ * OA4MP identifiers embed a literal comma (`cilogon:oa4mp,2012:/client_id/<md5>`);
+ * `verify_token_metadata()` must first treat the entire configured value as one
+ * audience — the comma-list split alone would fragment such a value and never
+ * match the token's `aud` claim.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_comma_bearing_value(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Payload:
+     * {"iss":"https://test.cilogon.org","aud":"cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51","exp":2524608000,"nbf":1600000000}
+     */
+    const char *oa4mp_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                            "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJjaWxvZ29uOm9hNG1wLDIwMTI6L2NsaWVudF"
+                            "9pZC8zZmU4MDg3ZWU1Mzk0"
+                            "NmJhODNmZGYwNjA4OGIxZmM1MSIsImV4cCI6MjUyNDYwODAwMCwibmJmIjoxNjAwMDAwMDAwfQ.sig";
+
+    /* The whole OA4MP value is one audience: accepted. */
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, NULL), 0);
+
+    /* A different client's OA4MP identifier must still be rejected: neither the
+     * whole value nor any comma fragment of it equals the token's aud. */
+    strncpy(cfg.audience, "cilogon:oa4mp,2012:/client_id/aaaa0000bbbb1111cccc2222dddd3333", sizeof(cfg.audience) - 1);
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test pinning the comma-separated `audience` list behavior.
+ *
+ * When the whole configured value does not match the token's aud (the comma
+ * case is absent), the value is still split on commas and each whitespace-
+ * trimmed fragment is accepted as a candidate, preserving the documented
+ * multi-audience configuration.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_comma_list(void **state) {
+    (void)state;
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "aud-1, aud-2", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_NONE;
+
+    /* Payload: {"iss":"https://test.cilogon.org","aud":"aud-2","exp":2524608000} */
+    const char *jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                      "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJhdWQtMiIsImV4cCI6MjUyNDYwODAwMH0.sig";
+
+    /* aud-2 is the second comma fragment: accepted. */
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), 0);
+
+    /* An aud outside the list: rejected. */
+    strncpy(cfg.audience, "aud-1, aud-3", sizeof(cfg.audience) - 1);
+    assert_int_equal(verify_token_metadata(jwt, &cfg, NULL), -1);
+}
+
+/**
+ * @brief Unit test pinning the raw-value length reported on an audience mismatch.
+ *
+ * The PII-safe mismatch line carries only the received value's length. For a
+ * string aud claim that length must be the RAW value's length — the same text
+ * the DEBUG claim dump prints — so an operator can cross-check the two; the
+ * previous JSON-representation length (extra quotes and escaped slashes) made
+ * the number disagree with the displayed value.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_jwt_audience_mismatch_length(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.issuer, "https://test.cilogon.org", sizeof(cfg.issuer) - 1);
+    strncpy(cfg.audience, "other-client-id", sizeof(cfg.audience) - 1);
+    cfg.clock_skew_leeway = 60;
+    cfg.loglevel = LOGLEVEL_ERROR;
+
+    /* Payload:
+     * {"iss":"https://test.cilogon.org","aud":"cilogon:oa4mp,2012:/client_id/3fe8087ee53946ba83fdf06088b1fc51","exp":2524608000,"nbf":1600000000}
+     */
+    const char *oa4mp_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                            "eyJpc3MiOiJodHRwczovL3Rlc3QuY2lsb2dvbi5vcmciLCJhdWQiOiJjaWxvZ29uOm9hNG1wLDIwMTI6L2NsaWVudF"
+                            "9pZC8zZmU4MDg3ZWU1Mzk0"
+                            "NmJhODNmZGYwNjA4OGIxZmM1MSIsImV4cCI6MjUyNDYwODAwMCwibmJmIjoxNjAwMDAwMDAwfQ.sig";
+
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_token_metadata(oa4mp_jwt, &cfg, pamh), -1);
+
+    /* The 62-character aud value: the mismatch line must report 62, not the old
+     * 66 (62 + 2 JSON quotes + 2 escaped slashes). */
+    assert_true(captured_syslog_contains("Token audience mismatch"));
+    assert_true(captured_syslog_contains("received value length: 62"));
+    assert_false(captured_syslog_contains("received value length: 66"));
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
 }
 
 /**
@@ -2495,6 +2717,95 @@ static void test_verify_group_membership_lists(void **state) {
 }
 
 /**
+ * @brief Unit test verifying `group_claim_delimiter` splits string-typed group claims.
+ *
+ * Exercises `verify_group_membership` for IdPs that emit a single delimited string instead of a
+ * JSON array (e.g., a semicolon-joined `member_of` attribute): delimiter splitting for allow/deny
+ * matching, whitespace trimming around entries, the default comma behavior when the claim holds no
+ * delimiter character, and JSON array claims remaining unaffected by the delimiter.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_group_membership_delimiter(void **state) {
+    (void)state;
+    config_t cfg;
+    struct json_object *uinfo;
+
+    /* Semicolon-delimited claim; one entry satisfies allow_groups. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+
+    /* Deny takes precedence: a denied entry inside the delimited claim is refused. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    strncpy(cfg.deny_groups, "urn:m:grp-a", sizeof(cfg.deny_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* No entry in the claim satisfies the allow list -> denied. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:other", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* Whitespace after the delimiter is trimmed: "a; b" matches the entry "b". */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a; urn:m:grp-b\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+
+    /* Unset delimiter falls back to the default ',': semicolons are not split, so the whole
+     * string is one (unmatchable) group name and no allow entry matches. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":\"urn:m:grp-a;urn:m:grp-b;urn:m:grp-c\"}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 0);
+    json_object_put(uinfo);
+
+    /* JSON array claims ignore the delimiter: each element is already one group. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_NONE;
+    strncpy(cfg.group_claim_field, "member_of", sizeof(cfg.group_claim_field) - 1);
+    cfg.group_claim_delimiter[0] = ';';
+    strncpy(cfg.allow_groups, "urn:m:grp-b", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"member_of\":[\"urn:m:grp-a\",\"urn:m:grp-b\"]}");
+    assert_non_null(uinfo);
+    assert_int_equal(verify_group_membership(uinfo, &cfg, NULL), 1);
+    json_object_put(uinfo);
+}
+
+/**
  * @brief Test helper building a UserInfo object whose `groups` field holds `claim` as a JSON string.
  *
  * @param[in] claim NUL-terminated group claim string.
@@ -2611,6 +2922,135 @@ static void test_verify_group_membership_deny_only_fail_closed(void **state) {
 }
 
 /**
+ * @brief Unit test pinning the LOGLEVEL_VERBOSE-only raw group-claim logging.
+ *
+ * At `loglevel = verbose`, `verify_group_membership()` records the raw content of the
+ * `group_claim_field` claim (JSON representation) before evaluating the allow/deny
+ * lists so an operator can debug a mismatch. At DEBUG (below VERBOSE) the claim value
+ * must never reach the system log (redaction policy: claim values are VERBOSE-only).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_group_membership_verbose_claim_log(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    struct json_object *uinfo;
+
+    /* VERBOSE + allow-list mismatch: two lines are emitted — the VERBOSE claim-content
+     * line followed by the ERROR mismatch line. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    strncpy(cfg.allow_groups, "sysadmins", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":[\"users\",\"developers\"]}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 0);
+    assert_int_equal(g_captured_syslog_calls, 2);
+    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: [\"users\",\"developers\"]");
+    assert_string_equal(g_captured_syslog_line,
+                        "Group authorization failed: no group/role in claim 'groups' satisfies the allow list");
+    json_object_put(uinfo);
+
+    /* VERBOSE + allow-list match: the content line is emitted and the check passes. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    strncpy(cfg.allow_groups, "sysadmins/ops", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":\"users, sysadmins/ops\"}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 1);
+    assert_int_equal(g_captured_syslog_calls, 2);
+    assert_string_equal(g_captured_syslog_prev_line, "Group claim 'groups' content: \"users, sysadmins/ops\"");
+    assert_string_equal(g_captured_syslog_line, "Group authorization verified for claim field 'groups'");
+    json_object_put(uinfo);
+
+    /* DEBUG (below VERBOSE) + allow-list mismatch: only the ERROR line is emitted; the
+     * claim value never reaches the system log. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_DEBUG;
+    strncpy(cfg.allow_groups, "sysadmins", sizeof(cfg.allow_groups) - 1);
+    uinfo = json_tokener_parse("{\"groups\":[\"users\",\"developers\"]}");
+    assert_non_null(uinfo);
+    g_captured_syslog_calls = 0;
+    g_captured_syslog_line[0] = '\0';
+    g_captured_syslog_prev_line[0] = '\0';
+    g_captured_syslog_priority = -1;
+    assert_int_equal(verify_group_membership(uinfo, &cfg, pamh), 0);
+    assert_int_equal(g_captured_syslog_calls, 1);
+    assert_string_equal(g_captured_syslog_line,
+                        "Group authorization failed: no group/role in claim 'groups' satisfies the allow list");
+    json_object_put(uinfo);
+
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
+ * @brief Unit test pinning the LOGLEVEL_VERBOSE-only dump of every UserInfo claim.
+ *
+ * At `loglevel = verbose`, `verify_userinfo_identity()` dumps every claim returned by the
+ * provider (claim name + compact JSON value) so an operator can see exactly what the IdP
+ * sent; at DEBUG (below VERBOSE) no claim name/value dump reaches the system log — only
+ * the PII-safe payload receipt (size + configured claim field).
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_verify_userinfo_identity_verbose_claim_dump(void **state) {
+    (void)state;
+    static struct pam_conv test_pam_conv = {test_pam_noop_conv, NULL};
+    pam_handle_t *pamh = NULL;
+    assert_int_equal(pam_start("pam_oidc_device_test", "probeuser", &test_pam_conv, &pamh), PAM_SUCCESS);
+    assert_non_null(pamh);
+
+    config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.case_sensitive = 1;
+    cfg.loglevel = LOGLEVEL_VERBOSE;
+    (void)copy_checked(cfg.claim_field, sizeof(cfg.claim_field), "preferred_username");
+    (void)copy_checked(cfg.claim_regex, sizeof(cfg.claim_regex), "^([a-z]+)$");
+    cfg.claim_capture_group = 1;
+
+    struct json_object *uinfo = json_tokener_parse(
+        "{\"preferred_username\":\"alice\",\"email\":\"alice@example.com\",\"groups\":[\"devs\",\"ops/infra\"]}");
+    assert_non_null(uinfo);
+
+    /* VERBOSE: every claim is dumped (name + compact JSON value), regardless of hash order. */
+    reset_captured_syslog_ring();
+    g_captured_syslog_calls = 0;
+    assert_int_equal(verify_userinfo_identity(pamh, &cfg, LOGLEVEL_VERBOSE, "alice", uinfo, 123, NULL), PAM_SUCCESS);
+    assert_true(captured_syslog_contains("UserInfo claim 'preferred_username': \"alice\""));
+    assert_true(captured_syslog_contains("UserInfo claim 'email': \"alice@example.com\""));
+    assert_true(captured_syslog_contains("UserInfo claim 'groups': [\"devs\",\"ops/infra\"]"));
+    /* Slashes must reach the log unescaped (copy-paste safe), never backslash-slash. */
+    assert_false(captured_syslog_contains("UserInfo claim 'groups': [\"devs\",\"ops\\/infra\"]"));
+    assert_false(captured_syslog_contains("UserInfo claim list truncated"));
+
+    /* DEBUG (below VERBOSE): no claim name/value dump; only the PII-safe receipt. */
+    cfg.loglevel = LOGLEVEL_DEBUG;
+    reset_captured_syslog_ring();
+    assert_int_equal(verify_userinfo_identity(pamh, &cfg, LOGLEVEL_DEBUG, "alice", uinfo, 123, NULL), PAM_SUCCESS);
+    assert_false(captured_syslog_contains("UserInfo claim '"));
+    assert_false(captured_syslog_contains("UserInfo claim ("));
+    assert_true(captured_syslog_contains("UserInfo claim payload received"));
+
+    json_object_put(uinfo);
+    assert_int_equal(pam_end(pamh, PAM_SUCCESS), PAM_SUCCESS);
+}
+
+/**
  * @brief Initializes a config_t with the same defaults load_config() applies before parsing.
  *
  * parse_config_file() only writes keys present in the stream, so tests that assert on
@@ -2636,6 +3076,7 @@ static void init_config_defaults(config_t *cfg) {
     cfg->clock_skew_leeway = 60;
     cfg->require_exp_claim = 0;
     (void)copy_checked(cfg->group_claim_field, sizeof(cfg->group_claim_field), "groups");
+    (void)copy_checked(cfg->group_claim_delimiter, sizeof(cfg->group_claim_delimiter), ",");
     /* Keep in sync with load_config() defaults. */
     cfg->qr_enabled = 0;
     cfg->qr_style = QR_STYLE_UTF8;
@@ -2693,6 +3134,7 @@ static void test_parse_config_file_minimal_valid(void **state) {
     assert_int_equal(cfg.system_uid_min, 0);
     assert_int_equal(cfg.system_uid_max, 999);
     assert_string_equal(cfg.group_claim_field, "groups");
+    assert_string_equal(cfg.group_claim_delimiter, ",");
     assert_int_equal(cfg.use_pkce, 0);
     /* QR defaults preserved when the [qr] section is absent. */
     assert_int_equal(cfg.qr_enabled, 0);
@@ -2822,6 +3264,7 @@ static void test_parse_config_file_full_sections(void **state) {
                                     "deny_groups = terminated\n"
                                     "enforce_groups = yes\n"
                                     "group_claim_field = roles\n"
+                                    "group_claim_delimiter = ;\n"
                                     "[prompt]\n"
                                     "init_message = Code: %s\n"
                                     "show_expiry = false\n"
@@ -2864,6 +3307,7 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_string_equal(cfg.deny_groups, "terminated");
     assert_int_equal(cfg.enforce_groups, 1);
     assert_string_equal(cfg.group_claim_field, "roles");
+    assert_string_equal(cfg.group_claim_delimiter, ";");
     assert_string_equal(cfg.init_message, "Code: %s");
     assert_int_equal(cfg.show_expiry, 0);
     assert_int_equal(cfg.max_poll_seconds, 60);
@@ -2881,6 +3325,60 @@ static void test_parse_config_file_full_sections(void **state) {
     assert_int_equal(cfg.qr_vertical_quiet_zone, 2);
     assert_int_equal(cfg.qr_ec_level, QR_EC_HIGH);
     assert_int_equal(cfg.qr_uri_complete, 0);
+}
+
+/**
+ * @brief Unit test for `group_claim_delimiter` parsing: a valid single printable character
+ *        is accepted; multi-character, empty, and duplicate values fail the whole parse.
+ *
+ * @param[in,out] state CMocka test state context (unused).
+ */
+static void test_parse_group_claim_delimiter(void **state) {
+    (void)state;
+    config_t cfg;
+    char text[512];
+
+    snprintf(text, sizeof(text),
+             "[oauth]\n"
+             "client_id = ci\n"
+             "device_authorization_endpoint = https://idp.example.com/device\n"
+             "token_endpoint = https://idp.example.com/token\n"
+             "userinfo_endpoint = https://idp.example.com/userinfo\n"
+             "[claim]\n"
+             "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
+             "[access]\n"
+             "group_claim_delimiter = ;\n");
+    init_config_defaults(&cfg);
+    FILE *f = open_config_stream(text);
+    assert_non_null(f);
+    assert_int_equal(parse_config_file(f, &cfg, NULL), 0);
+    fclose(f);
+    assert_string_equal(cfg.group_claim_delimiter, ";");
+
+    /* Every malformed `group_claim_delimiter` entry must fail the whole parse. */
+    static const char *const bad_entries[] = {
+        "group_claim_delimiter = ab\n",
+        "group_claim_delimiter = \n",
+        "group_claim_delimiter = ;\ngroup_claim_delimiter = |\n",
+    };
+    for (size_t i = 0; i < sizeof(bad_entries) / sizeof(bad_entries[0]); i++) {
+        snprintf(text, sizeof(text),
+                 "[oauth]\n"
+                 "client_id = ci\n"
+                 "device_authorization_endpoint = https://idp.example.com/device\n"
+                 "token_endpoint = https://idp.example.com/token\n"
+                 "userinfo_endpoint = https://idp.example.com/userinfo\n"
+                 "[claim]\n"
+                 "claim_regex = ^([a-zA-Z0-9._-]+)$\n"
+                 "[access]\n"
+                 "%s",
+                 bad_entries[i]);
+        memset(&cfg, 0, sizeof(cfg));
+        f = open_config_stream(text);
+        assert_non_null(f);
+        assert_int_equal(parse_config_file(f, &cfg, NULL), -1);
+        fclose(f);
+    }
 }
 
 /**
@@ -4056,8 +4554,12 @@ int main(void) {
         cmocka_unit_test(test_jwt_valid_metadata),
         cmocka_unit_test(test_jwt_expired_token),
         cmocka_unit_test(test_jwt_mismatch_claims),
+        cmocka_unit_test(test_jwt_claim_dump_debug_and_above),
         cmocka_unit_test(test_jwt_unconfigured_binding_fail_closed),
         cmocka_unit_test(test_jwt_audience_array),
+        cmocka_unit_test(test_jwt_audience_comma_bearing_value),
+        cmocka_unit_test(test_jwt_audience_comma_list),
+        cmocka_unit_test(test_jwt_audience_mismatch_length),
         cmocka_unit_test(test_jwt_numeric_date_and_exp_policy),
         cmocka_unit_test(test_jwt_non_finite_claims_rejected),
         cmocka_unit_test(test_jwt_malformed_structure),
@@ -4078,9 +4580,13 @@ int main(void) {
         cmocka_unit_test(test_verify_user_access_large_entry),
         cmocka_unit_test(test_verify_group_membership_lists),
         cmocka_unit_test(test_verify_group_membership_deny_only_fail_closed),
+        cmocka_unit_test(test_verify_group_membership_verbose_claim_log),
+        cmocka_unit_test(test_verify_userinfo_identity_verbose_claim_dump),
+        cmocka_unit_test(test_verify_group_membership_delimiter),
         cmocka_unit_test(test_parse_config_file_minimal_valid),
         cmocka_unit_test(test_parse_config_file_claim_regex_required),
         cmocka_unit_test(test_parse_config_file_full_sections),
+        cmocka_unit_test(test_parse_group_claim_delimiter),
         cmocka_unit_test(test_parse_config_file_missing_required),
         cmocka_unit_test(test_parse_config_file_duplicate_key),
         cmocka_unit_test(test_parse_config_file_key_before_section),

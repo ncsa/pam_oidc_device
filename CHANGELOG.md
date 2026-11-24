@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-23
+
+### Added
+
+- **`group_claim_delimiter` configuration option (`[access]`, `src/config.c`,
+  `src/identity.c`):** a single printable ASCII character (default `,`) used to split a
+  **string-typed** group claim into individual group/role entries before allow/deny matching.
+  JSON array claims are unaffected (each element is one group). This fixes IdPs that emit the
+  group list as one delimited string instead of a JSON array — e.g., a semicolon-joined
+  `member_of` attribute (`"grp-a;grp-b;grp-c"`) now works with
+  `group_claim_field = member_of` + `group_claim_delimiter = ;`; without it the whole string
+  was treated as one unmatchable group name. Multi-character and non-printable values are
+  rejected at config load.
+
+### Changed
+
+- **Built-in default prompt: dropped the "auto-completes on sign-in" status-line
+  clause (`src/message.c`):** the trailing status line of the built-in default
+  prompt no longer carries the "auto-completes on sign-in" note — the phrasing was
+  ambiguous (browser sign-in vs. terminal sign-in) and redundant with the "Sign in
+  via browser" instruction and the "Press [Enter] to begin..." confirmation. The
+  status line now reads `Waiting for approval.` (approval window unknown, or
+  `show_expiry = false`) or `Waiting for approval (expires in 2m).` (known
+  window). `show_expiry` and the `{expiry}` template token semantics are unchanged,
+  and custom `init_message` templates are unaffected. The rendered-prompt samples in
+  `README.md`, `docs/getting-started.md`, and the shipped `config/pam_oidc_device.conf`,
+  plus the `show_expiry` field doc in `include/pam_oidc_device.h`, were updated to
+  match.
+- **Verbose logging now records provider claim values (`src/identity.c`):** when
+  `loglevel = verbose` (maximum troubleshooting level), `verify_userinfo_identity()`
+  dumps every claim returned by the UserInfo endpoint (claim name + compact JSON value),
+  and `verify_group_membership()` additionally records the `group_claim_field` claim
+  immediately before allow/deny evaluation, so operators can see exactly what the provider
+  sent when claim matching or `allow_groups`/`deny_groups` unexpectedly matches or
+  misses. Logged JSON values are serialized with slashes unescaped, so URL/URN-style
+   values are copy-paste safe. Consistent with the PII redaction policy, the dumps are never emitted at
+  `debug` or below, untrusted bytes are C-escaped by the central logger, and claim names
+  containing non-printable bytes remain withheld.
+- **Debug-and-above logging now records the inspected JWT's claims (`src/jwt.c`):** when
+  `loglevel = debug` (or `verbose`) and `verify_jwt_claims = true`, `verify_token_metadata()`
+  records the token's `iss`, `aud`, `exp`, and `nbf` claims (compact JSON representation, when
+  present) before any check runs, so an operator whose `issuer`/`audience` settings do
+  not match the provider's token can read the actual values from the log
+  (`JWT claim '<name>': <value>`) instead of the length-only mismatch line that routine
+  levels emit. These claims are tenant/client/numeric identifiers rather than PII, so the
+  value dump is allowed from `debug` upward — one level below the PII-protected UserInfo
+  claim dumps, which remain `verbose`-only.
+
+### Fixed
+
+- **JWT audience check now accepts comma-bearing literal audiences (`src/jwt.c`):**
+  `verify_token_metadata()` matched the configured `audience` only as a
+  comma-separated list, so an audience value that itself contains a comma —
+  CILogon's OA4MP identifier
+  `cilogon:oa4mp,2012:/client_id/<client-id-md5>`, where the comma is part of the
+  versioned namespace, not a delimiter — was fragmented and could never match,
+  failing every device-flow sign-in at `verify_jwt_claims = true`. The configured
+  value is now matched as a single literal audience (whitespace-trimmed, exact)
+  first, falling back to the comma-separated list semantics only when the whole
+  value does not match; ordinary multi-audience lists behave exactly as before.
+  The PII-safe `Token audience mismatch` log line was also made consistent with
+  the `debug`/`verbose` claim dump: for a string `aud` claim it now reports the
+  received value's raw length (the same unescaped text the dump prints), instead
+  of the JSON-representation length (quotes + escaped slashes), which made the
+  two disagree.
+
 ## [0.3.6] - 2026-11-19
 
 ### Changed

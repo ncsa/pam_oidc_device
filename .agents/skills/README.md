@@ -17,6 +17,13 @@ descriptions precise about *when* the skill applies.
 
 Skills in this repo (one directory each, frontmatter `name` + `description` + procedure):
 
+> **Local environment failures are not skill defects.** When a skill's gate fails for a
+> *host-environment* reason (terminal/CLI mangles commands, container won't build or mount
+> the repo, tool version skew, missing host deps), do not log it in `.agents/memory.md` as a
+> code finding — record the failure **and the working workaround** in
+> `.agents/memory.local.md` (git-ignored, host-local; see `.agents/context.md` §7) and check
+> it before rerunning a gate that already "failed" for environmental reasons.
+
 | Skill | What it does | Ported from |
 |---|---|---|
 | `security-audit` | Security & defensive-engineering pass over `src/` + `include/` | `context.md` §10.1 |

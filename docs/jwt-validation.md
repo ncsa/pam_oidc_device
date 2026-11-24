@@ -60,7 +60,7 @@ require_exp_claim = false
 | --- | --- | --- | --- |
 | `verify_jwt_claims` | boolean | `false` | Enables local pre-flight claims parsing (`exp`, `nbf`, `iss`, `aud`). **Requires both `issuer` and `audience` to be configured** (rejected at load time otherwise). |
 | `issuer` | string | `""` | Expected issuer string (`iss`). If set, incoming tokens must match exactly. |
-| `audience` | string | `""` | Expected audience string or comma-separated list (`aud`). |
+| `audience` | string | `""` | Expected audience string or comma-separated list (`aud`). A value containing a comma is matched as one literal audience first (comma-bearing URNs, e.g. CILogon's `cilogon:oa4mp,2012:/client_id/<client-id>`). |
 | `clock_skew_leeway` | integer | `60` | Time window leeway (in seconds) permitted during `exp` and `nbf` timestamp validation. |
 | `require_exp_claim` | boolean | `false` | When `true`, tokens missing an `exp` claim are rejected immediately. |
 
@@ -102,6 +102,13 @@ clock_skew_leeway = 60
 > You can specify multiple acceptable audiences using a comma-separated list:
 > `audience = 00000003-0000-0000-c000-000000000000, https://graph.microsoft.com, <YOUR-CLIENT-ID>`
 
+> [!NOTE]
+> The comma acts as the list separator **only when the whole configured value
+> does not match the token's `aud` claim exactly**. Audience URNs that
+> themselves contain a comma — most notably CILogon's OA4MP identifier
+> (`cilogon:oa4mp,2012:/client_id/<client-id-md5>`) — are therefore simply
+> configured as a single value: `audience = cilogon:oa4mp,2012:/client_id/<client-id-md5>`.
+
 ### Standard OIDC Providers (Okta, Keycloak, Auth0)
 
 ```ini
@@ -127,15 +134,18 @@ Per RFC 7519 §2, `exp` and `nbf` claims are **NumericDate** values (seconds sin
 
 If local JWT validation fails:
 
-1. Enable debug logging by setting `loglevel = debug` in `/etc/pam_oidc_device.conf`.
+1. Enable debug-level logging by setting `loglevel = debug` (or `verbose`) in `/etc/pam_oidc_device.conf`.
 2. Inspect syslog output:
    ```bash
    sudo journalctl -f -u sshd | grep pam_oidc_device
    ```
+   At `debug` (or `verbose`), the token's `iss`, `aud`, `exp`, and `nbf` claims (when present) are
+   recorded as `JWT claim '<name>': <value>` lines before any check runs — use them to
+   copy the correct `issuer`/`audience` values into your configuration.
 3. Common mismatch log messages and fixes:
    * **`verify_jwt_claims = true requires both issuer and audience to be configured`** — Add both `issuer` and `audience` to the `[oauth]` section, or disable `verify_jwt_claims`.
    * **`JWT issuer (iss) check required but no issuer is configured`** / **`JWT audience (aud) check required but no audience is configured`** — Same fix as above (normally caught at load time).
-   * **`Token issuer mismatch (expected: '...', received: '...')`** — Copy the `received:` value into your `issuer` setting.
-   * **`Token audience mismatch (expected: '...', received: '...')`** — Copy the `received:` value into your `audience` setting.
+   * **`Token issuer mismatch (expected: '...', received value length: N)`** — The log shows the expected value and only the length of what the token carried. At `debug` or `verbose`, the `JWT claim 'iss'` line above carries the actual received value — copy it into your `issuer` setting.
+   * **`Token audience mismatch (expected: '...', received value length: N)`** — Same: at `debug` or `verbose`, the `JWT claim 'aud'` line carries the actual received audience (a string or a JSON array); copy the matching entry into your `audience` setting. N is the received value's length — for a string audience, the length of that exact value; for a JSON array audience, the length of its compact JSON representation.
    * **`JWT subject does not match UserInfo subject ... (token substitution suspected)`** — The access token's `sub` claim differs from the `sub` the provider's UserInfo endpoint returned for the same Bearer token. If this is unexpected, contact your identity provider administrator; do not disable the check to work around it.
    * **`Invalid token structure: missing header/payload delimiter`** — The IdP returned an opaque access token instead of a 3-part JWT. Set `verify_jwt_claims = false`.

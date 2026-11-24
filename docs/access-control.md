@@ -48,6 +48,7 @@ enforce_groups = false
 | `deny_groups` | string | `""` | Comma-separated list of provider groups/roles denying access. **Takes precedence over `allow_groups`.** |
 | `enforce_groups` | boolean | `false` | When `true`, requires group/role evaluation even if group lists are empty (denying access if no groups match). |
 | `group_claim_field` | string | `"groups"` | JSON key in the UserInfo response containing group or role claims (e.g., `groups`, `roles`, `wids`). |
+| `group_claim_delimiter` | character | `","` | Single character used to split a **string-typed** `group_claim_field` value into individual group/role entries. JSON array claims are unaffected (each array element is one group). Set it to your IdP's separator when the claim is a single delimited string, e.g. `group_claim_delimiter = ;` for `"member_of": "grp-a;grp-b;grp-c"`. Must be exactly one printable ASCII character (whitespace and multi-character values are rejected). |
 
 ---
 
@@ -110,6 +111,16 @@ The module automatically handles various JSON claim structures under `group_clai
 }
 ```
 
+#### 4. Delimited JSON String (Custom Separator)
+Some IdPs emit the group list as a single string joined by a separator other than a comma (for example, Active Directory / SCIM-synced attributes such as `member_of`). Set `group_claim_delimiter` to that single separator character and each entry is matched individually against `allow_groups`/`deny_groups`:
+```json
+{
+  "sub": "jdoe",
+  "member_of": "urn:example:grp-a;urn:example:grp-b;urn:example:grp-c"
+}
+```
+With `group_claim_field = member_of` and `group_claim_delimiter = ;`. Without the delimiter setting the whole string is treated as one (unmatchable) group name, so group lists never match.
+
 ---
 
 ### Evaluation Precedence & Rules
@@ -119,6 +130,10 @@ The module automatically handles various JSON claim structures under `group_clai
 3. **Allow List Validation:** If `allow_groups` is configured, at least one user group must match an allowed group entry.
 4. **Enforce Groups Guard:** If `enforce_groups = true` but no group lists are defined, authentication fails.
 5. **Fail-Closed on Unusable Claims:** With any group policy active, authentication also fails when the provider UserInfo payload is missing or invalid, the configured claim field is absent or JSON `null`, the claim has an unrecognized type (neither an array of strings nor a string), or a deny list is configured and the claim contains content that cannot be fully parsed (e.g., a non-string array element). Membership that cannot be established is treated as a non-match, which denies under both allow-only and deny-only policies — a deny list cannot be bypassed by omitting the claim or by serializing it in an unparseable form.
+
+### Troubleshooting
+
+When `allow_groups`/`deny_groups` behavior looks wrong, set `loglevel = verbose` (see [Logging & Auditing](getting-started.md#7-logging--auditing)): the module dumps **every** claim returned by the UserInfo endpoint (claim name + compact JSON value) at the start of claim verification, and additionally records the raw content of the `group_claim_field` claim (e.g. `Group claim 'groups' content: ["users","developers"]`) immediately before the allow/deny evaluation, so the log shows exactly what the provider sent. At lower log levels only the payload size, claim field names, and the evaluation outcome are logged — claim values are never logged below `verbose`.
 
 ---
 
